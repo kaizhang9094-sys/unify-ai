@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-receipt-missing-body-004",
+      "id": "fixture-receipt-missing-body-004",
+      "nodeID": "fixture-inbox-contract-d-recipient-local",
+      "inboxNodeID": "fixture-inbox-contract-d-recipient-local",
+      "envelopeID": "env-fixture-missing-body-stable",
+      "senderNodeID": "fixture-inbox-contract-d-sender-local",
+      "recipientNodeID": "fixture-inbox-contract-d-recipient-local",
+      "parentEnvelopeID": null,
+      "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "subject": "No body column",
+        "body": ""
+      },
+      "metadata": {
+        "note": "no_body_fixture"
+      },
+      "receivedAt": "2026-01-02T03:04:05.012Z",
+      "createdAt": "2026-01-02T03:04:05.012Z",
+      "envelope": {
+        "id": "env-fixture-missing-body-stable",
+        "envelopeID": "env-fixture-missing-body-stable",
+        "senderNodeID": "fixture-inbox-contract-d-sender-local",
+        "recipientNodeID": "fixture-inbox-contract-d-recipient-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+        "protocolVersion": "exchange.v1",
+        "payload": {
+          "kind": "message",
+          "subject": "No body column",
+          "body": ""
+        },
+        "metadata": {
+          "note": "no_body_fixture"
+        },
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": "eyJ2IjoxLCJyZWNlaXZlZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4wMTJaIiwicmVjZWlwdElEIjoiZml4dHVyZS1yZWNlaXB0LW1pc3NpbmctYm9keS0wMDQifQ",
+  "hasMore": false,
+  "syncedAt": "2026-01-02T03:04:05.067Z",
+  "note": "Missing payload.body fixture — inbox normalizes to body \"\"."
+}

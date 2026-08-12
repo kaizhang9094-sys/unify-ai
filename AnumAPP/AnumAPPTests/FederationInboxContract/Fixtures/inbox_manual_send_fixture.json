@@ -1,0 +1,62 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-receipt-manual-send-001",
+      "id": "fixture-receipt-manual-send-001",
+      "nodeID": "fixture-inbox-contract-a-recipient-local",
+      "inboxNodeID": "fixture-inbox-contract-a-recipient-local",
+      "envelopeID": "env-fixture-manual-send-stable",
+      "senderNodeID": "fixture-inbox-contract-a-sender-local",
+      "recipientNodeID": "fixture-inbox-contract-a-recipient-local",
+      "parentEnvelopeID": null,
+      "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "subject": "User approved outbound",
+        "body": "Manual human-approved send fixture body.",
+        "disclosureLevel": "balanced",
+        "intentTitle": "Fixture intent",
+        "mode": "conversation",
+        "localThreadID": "local-thread-manual-send"
+      },
+      "metadata": {
+        "channel": "exchange",
+        "send_class": "manual_approved",
+        "reviewer": "self"
+      },
+      "receivedAt": "2026-01-02T03:04:05.012Z",
+      "createdAt": "2026-01-02T03:04:05.012Z",
+      "envelope": {
+        "id": "env-fixture-manual-send-stable",
+        "envelopeID": "env-fixture-manual-send-stable",
+        "senderNodeID": "fixture-inbox-contract-a-sender-local",
+        "recipientNodeID": "fixture-inbox-contract-a-recipient-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+        "protocolVersion": "exchange.v1",
+        "payload": {
+          "kind": "message",
+          "subject": "User approved outbound",
+          "body": "Manual human-approved send fixture body.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Fixture intent",
+          "mode": "conversation",
+          "localThreadID": "local-thread-manual-send"
+        },
+        "metadata": {
+          "channel": "exchange",
+          "send_class": "manual_approved",
+          "reviewer": "self"
+        },
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": "eyJ2IjoxLCJyZWNlaXZlZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4wMTJaIiwicmVjZWlwdElEIjoiZml4dHVyZS1yZWNlaXB0LW1hbnVhbC1zZW5kLTAwMSJ9",
+  "hasMore": false,
+  "syncedAt": "2026-01-02T03:04:05.067Z",
+  "note": "Contract fixture snapshot (deterministic syncedAt)."
+}

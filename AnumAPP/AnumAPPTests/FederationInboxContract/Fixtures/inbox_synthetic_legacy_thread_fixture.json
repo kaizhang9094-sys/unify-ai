@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-receipt-synthetic-legacy-006",
+      "id": "fixture-receipt-synthetic-legacy-006",
+      "nodeID": "fixture-synthetic-recipient",
+      "inboxNodeID": "fixture-synthetic-recipient",
+      "envelopeID": "env-synthetic-legacy-fixture-1",
+      "senderNodeID": "fixture-synthetic-sender",
+      "recipientNodeID": "fixture-synthetic-recipient",
+      "parentEnvelopeID": null,
+      "threadID": "c2c43a34-5b80-5962-a2c0-7e9d2b24334a",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "body": "Synthetic legacy thread fixture body."
+      },
+      "metadata": {
+        "threadResolution": "syntheticLegacy"
+      },
+      "receivedAt": "2026-01-02T03:04:05.012Z",
+      "createdAt": "2026-01-02T03:04:05.012Z",
+      "envelope": {
+        "id": "env-synthetic-legacy-fixture-1",
+        "envelopeID": "env-synthetic-legacy-fixture-1",
+        "senderNodeID": "fixture-synthetic-sender",
+        "recipientNodeID": "fixture-synthetic-recipient",
+        "parentEnvelopeID": null,
+        "threadID": "c2c43a34-5b80-5962-a2c0-7e9d2b24334a",
+        "protocolVersion": "exchange.v1",
+        "payload": {
+          "kind": "message",
+          "body": "Synthetic legacy thread fixture body."
+        },
+        "metadata": {
+          "threadResolution": "syntheticLegacy"
+        },
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": "eyJ2IjoxLCJyZWNlaXZlZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4wMTJaIiwicmVjZWlwdElEIjoiZml4dHVyZS1yZWNlaXB0LXN5bnRoZXRpYy1sZWdhY3ktMDA2In0",
+  "hasMore": false,
+  "syncedAt": "2026-01-02T03:04:05.067Z",
+  "note": "Synthetic legacy thread: deterministic UUID v5 from envelope_id + fixed namespace."
+}

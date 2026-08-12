@@ -1,0 +1,80 @@
+{
+  "label": "requester_autonomous_shape",
+  "postBody": {
+    "envelopeID": "env-send-contract-req-auto-002",
+    "threadID": "550e8400-e29b-41d4-a716-446655440099",
+    "senderNodeID": "fixture-send-contract-reqauto-alpha-local",
+    "recipientNodeID": "fixture-send-contract-reqauto-beta-local",
+    "payload": {
+      "kind": "followUp",
+      "subject": "Requester autonomous outbound (agency gate analogue)",
+      "body": "Eligible requester autonomy send body.",
+      "disclosureLevel": "balanced",
+      "intentTitle": "Autonomous planner suggestion",
+      "mode": "secretary",
+      "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+    }
+  },
+  "sendResponse": {
+    "ok": true,
+    "envelopeID": "env-send-contract-req-auto-002",
+    "status": "accepted",
+    "acceptedAt": "2026-05-01T21:33:30.817Z",
+    "externalReference": "env-send-contract-req-auto-002",
+    "routeSummary": "federation-relay"
+  },
+  "inboxResponse": {
+    "ok": true,
+    "receipts": [
+      {
+        "receiptID": "78f58684-f631-41c6-9703-dad02a9078b8",
+        "id": "78f58684-f631-41c6-9703-dad02a9078b8",
+        "nodeID": "fixture-send-contract-reqauto-beta-local",
+        "inboxNodeID": "fixture-send-contract-reqauto-beta-local",
+        "envelopeID": "env-send-contract-req-auto-002",
+        "senderNodeID": "fixture-send-contract-reqauto-alpha-local",
+        "recipientNodeID": "fixture-send-contract-reqauto-beta-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-446655440099",
+        "protocolVersion": "exchange.v1",
+        "status": "accepted",
+        "payload": {
+          "kind": "followUp",
+          "subject": "Requester autonomous outbound (agency gate analogue)",
+          "body": "Eligible requester autonomy send body.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Autonomous planner suggestion",
+          "mode": "secretary",
+          "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+        },
+        "metadata": {},
+        "receivedAt": "2026-05-01T21:33:30.817Z",
+        "createdAt": "2026-05-01T21:33:30.817Z",
+        "envelope": {
+          "id": "env-send-contract-req-auto-002",
+          "envelopeID": "env-send-contract-req-auto-002",
+          "senderNodeID": "fixture-send-contract-reqauto-alpha-local",
+          "recipientNodeID": "fixture-send-contract-reqauto-beta-local",
+          "parentEnvelopeID": null,
+          "threadID": "550e8400-e29b-41d4-a716-446655440099",
+          "protocolVersion": "exchange.v1",
+          "payload": {
+            "kind": "followUp",
+            "subject": "Requester autonomous outbound (agency gate analogue)",
+            "body": "Eligible requester autonomy send body.",
+            "disclosureLevel": "balanced",
+            "intentTitle": "Autonomous planner suggestion",
+            "mode": "secretary",
+            "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+          },
+          "metadata": {},
+          "status": "accepted"
+        }
+      }
+    ],
+    "nextCursor": null,
+    "hasMore": false,
+    "syncedAt": "2026-05-01T21:33:30.818Z",
+    "note": "Inbox sync completed."
+  }
+}

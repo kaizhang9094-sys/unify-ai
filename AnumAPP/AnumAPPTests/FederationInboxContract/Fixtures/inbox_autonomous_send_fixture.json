@@ -1,0 +1,64 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-receipt-autonomous-send-002",
+      "id": "fixture-receipt-autonomous-send-002",
+      "nodeID": "fixture-inbox-contract-b-recipient-local",
+      "inboxNodeID": "fixture-inbox-contract-b-recipient-local",
+      "envelopeID": "env-fixture-autonomous-send-stable",
+      "senderNodeID": "fixture-inbox-contract-b-sender-local",
+      "recipientNodeID": "fixture-inbox-contract-b-recipient-local",
+      "parentEnvelopeID": null,
+      "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "subject": "Autonomous outbound",
+        "body": "Autonomous secretary fixture body.",
+        "disclosureLevel": "balanced",
+        "intentTitle": "Fixture autonomous intent",
+        "mode": "secretary",
+        "localThreadID": "local-thread-autonomous-send"
+      },
+      "metadata": {
+        "autonomy_origin": "secretary",
+        "agency_mode": "user_preauthorized",
+        "autonomous": "true",
+        "autonomy_class": "fixtures_only"
+      },
+      "receivedAt": "2026-01-02T03:04:05.012Z",
+      "createdAt": "2026-01-02T03:04:05.012Z",
+      "envelope": {
+        "id": "env-fixture-autonomous-send-stable",
+        "envelopeID": "env-fixture-autonomous-send-stable",
+        "senderNodeID": "fixture-inbox-contract-b-sender-local",
+        "recipientNodeID": "fixture-inbox-contract-b-recipient-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-4466554400aa",
+        "protocolVersion": "exchange.v1",
+        "payload": {
+          "kind": "message",
+          "subject": "Autonomous outbound",
+          "body": "Autonomous secretary fixture body.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Fixture autonomous intent",
+          "mode": "secretary",
+          "localThreadID": "local-thread-autonomous-send"
+        },
+        "metadata": {
+          "autonomy_origin": "secretary",
+          "agency_mode": "user_preauthorized",
+          "autonomous": "true",
+          "autonomy_class": "fixtures_only"
+        },
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": "eyJ2IjoxLCJyZWNlaXZlZEF0IjoiMjAyNi0wMS0wMlQwMzowNDowNS4wMTJaIiwicmVjZWlwdElEIjoiZml4dHVyZS1yZWNlaXB0LWF1dG9ub21vdXMtc2VuZC0wMDIifQ",
+  "hasMore": false,
+  "syncedAt": "2026-01-02T03:04:05.067Z",
+  "note": "Contract fixture snapshot (deterministic syncedAt)."
+}

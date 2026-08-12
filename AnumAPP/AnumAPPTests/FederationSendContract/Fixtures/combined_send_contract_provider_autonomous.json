@@ -1,0 +1,96 @@
+{
+  "label": "provider_auto_response_metadata_probe",
+  "postBody": {
+    "envelopeID": "env-send-contract-provider-auto-003",
+    "threadID": "550e8400-e29b-41d4-a716-446655440099",
+    "senderNodeID": "fixture-send-contract-proauto-alpha-local",
+    "recipientNodeID": "fixture-send-contract-proauto-beta-local",
+    "metadata": {
+      "second_half_generated": "true",
+      "second_half_auto_response": "true",
+      "agency_source_stub": "queueSecondHalfAutoResponseIfEligible",
+      "autonomy_numeric_probe": "1"
+    },
+    "payload": {
+      "kind": "negotiation",
+      "subject": "Provider auto-response analogue",
+      "body": "Surface auto-respond acknowledgement body.",
+      "disclosureLevel": "balanced",
+      "intentTitle": "Second-half outbound",
+      "mode": "secretary",
+      "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+    }
+  },
+  "sendResponse": {
+    "ok": true,
+    "envelopeID": "env-send-contract-provider-auto-003",
+    "status": "accepted",
+    "acceptedAt": "2026-05-01T21:33:30.820Z",
+    "externalReference": "env-send-contract-provider-auto-003",
+    "routeSummary": "federation-relay"
+  },
+  "inboxResponse": {
+    "ok": true,
+    "receipts": [
+      {
+        "receiptID": "4b2757bf-d11b-4506-a472-80fdf5bd389c",
+        "id": "4b2757bf-d11b-4506-a472-80fdf5bd389c",
+        "nodeID": "fixture-send-contract-proauto-beta-local",
+        "inboxNodeID": "fixture-send-contract-proauto-beta-local",
+        "envelopeID": "env-send-contract-provider-auto-003",
+        "senderNodeID": "fixture-send-contract-proauto-alpha-local",
+        "recipientNodeID": "fixture-send-contract-proauto-beta-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-446655440099",
+        "protocolVersion": "exchange.v1",
+        "status": "accepted",
+        "payload": {
+          "kind": "negotiation",
+          "subject": "Provider auto-response analogue",
+          "body": "Surface auto-respond acknowledgement body.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Second-half outbound",
+          "mode": "secretary",
+          "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+        },
+        "metadata": {
+          "second_half_generated": "true",
+          "second_half_auto_response": "true",
+          "agency_source_stub": "queueSecondHalfAutoResponseIfEligible",
+          "autonomy_numeric_probe": "1"
+        },
+        "receivedAt": "2026-05-01T21:33:30.820Z",
+        "createdAt": "2026-05-01T21:33:30.820Z",
+        "envelope": {
+          "id": "env-send-contract-provider-auto-003",
+          "envelopeID": "env-send-contract-provider-auto-003",
+          "senderNodeID": "fixture-send-contract-proauto-alpha-local",
+          "recipientNodeID": "fixture-send-contract-proauto-beta-local",
+          "parentEnvelopeID": null,
+          "threadID": "550e8400-e29b-41d4-a716-446655440099",
+          "protocolVersion": "exchange.v1",
+          "payload": {
+            "kind": "negotiation",
+            "subject": "Provider auto-response analogue",
+            "body": "Surface auto-respond acknowledgement body.",
+            "disclosureLevel": "balanced",
+            "intentTitle": "Second-half outbound",
+            "mode": "secretary",
+            "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+          },
+          "metadata": {
+            "second_half_generated": "true",
+            "second_half_auto_response": "true",
+            "agency_source_stub": "queueSecondHalfAutoResponseIfEligible",
+            "autonomy_numeric_probe": "1"
+          },
+          "status": "accepted"
+        }
+      }
+    ],
+    "nextCursor": null,
+    "hasMore": false,
+    "syncedAt": "2026-05-01T21:33:30.821Z",
+    "note": "Inbox sync completed."
+  }
+}

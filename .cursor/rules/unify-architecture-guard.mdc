@@ -1,0 +1,81 @@
+---
+description: "Unify architecture guardrails. Must be followed for all code edits, bug fixes, tests, and refactors."
+alwaysApply: true
+---
+
+# Unify Architecture Guardrails
+
+## Prime directive
+
+Do not optimize for making a single failing test pass. Optimize for preserving source-of-truth ownership, production behavior, and long-term architecture.
+
+Before editing code, identify:
+1. The source-of-truth owner.
+2. The producer of the missing/wrong data.
+3. The consumer/evaluator/reporting layer.
+4. Whether the failure is production behavior, DEBUG-only validation, or a test assertion mismatch.
+
+## No fake patch jobs
+
+Never fix a failure by adding downstream fallback logic unless the downstream layer is the correct owner.
+
+Do not:
+- Hide production bugs in evaluators.
+- Make tests pass by weakening assertions without proving the assertion is wrong.
+- Add fixture-specific logic.
+- Add hardcoded IDs, offer IDs, node IDs, vendor names, scenario names, or exact expected values.
+- Parse from UI/display/debug text when structured state should already exist.
+- Patch DEBUG E2E helpers to compensate for missing production fields.
+- Change ranking/discovery/FitEngine to fix evaluator or fixture issues unless ranking is proven to be the source.
+
+## Ownership rules
+
+If structured data is missing, fix the producer.
+
+Examples:
+- Budget belongs in canonical search intent / structured commercial constraints, not only in E2E evaluator recovery.
+- Selected offer belongs in canonical selectedOfferID/thread selectedOfferID, not UI projection guessing.
+- Provider English retrieval carrier belongs in indexed provider surface / retrieval document builder, not only in evaluation bypass.
+- Federation ownership errors must not be fixed by bypassing auth.
+
+## Required workflow for non-trivial fixes
+
+For any failing E2E, retrieval, federation, second-half, or UI projection issue:
+
+1. Inspect first.
+2. Produce a failure map.
+3. State the source-of-truth owner.
+4. State whether the proposed change is production behavior, DEBUG-only test logic, or test assertion normalization.
+5. Only then edit.
+
+If uncertain, stop after inspection and return a patch plan.
+
+## Test rules
+
+Tests must prove general behavior, not the current fixture only.
+
+Every fix should include at least one negative or adjacent test showing the patch is not overfit.
+
+Avoid tests that only prove:
+- exact fixture ID
+- exact vendor name
+- exact offer ID
+- exact scenario string
+- exact debug artifact wording
+
+Prefer tests that prove:
+- structured field ownership
+- source-of-truth propagation
+- invariant preservation
+- generic parsing behavior
+- correct failure classification
+
+## Reporting rules
+
+After edits, report:
+- files changed
+- source-of-truth owner changed
+- what was intentionally not changed
+- whether any evaluator/test assertion was weakened
+- what tests were added
+- what behavior remains out of scope

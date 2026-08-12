@@ -1,0 +1,415 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "..." : {
+
+    },
+    "(Not used in normal app flow)" : {
+
+    },
+    "%@ copied to clipboard." : {
+
+    },
+    "%lld" : {
+
+    },
+    "%lld/%lld" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld/%2$lld"
+          }
+        }
+      }
+    },
+    "%lldms" : {
+
+    },
+    "• %@" : {
+
+    },
+    "• AI-generated responses may be incorrect or incomplete." : {
+
+    },
+    "• Clear recent chat" : {
+
+    },
+    "• Delete Companion Data" : {
+
+    },
+    "• Export my data (a .zip created locally)" : {
+
+    },
+    "• Identity & preferences: your onboarding answers and your Prologue text (if you set one)." : {
+
+    },
+    "• No account is required. There is no sign-in and no user database." : {
+
+    },
+    "• No account, phone number, or identity verification required." : {
+
+    },
+    "• No ads. We do not run ad networks." : {
+
+    },
+    "• No background uploads. Nothing silently syncs to a cloud service." : {
+
+    },
+    "• No cross‑app or cross‑website tracking." : {
+
+    },
+    "• No third‑party analytics SDKs. We do not track taps, sessions, or usage events." : {
+
+    },
+    "• No uploading your chat content for training or server-side analysis." : {
+
+    },
+    "• On-device memory database: memories created through normal use." : {
+
+    },
+    "• Recent chat transcript: your visible conversation history." : {
+
+    },
+    "• Room assets: avatar/background images you choose." : {
+
+    },
+    "• Sexual content involving minors is not allowed." : {
+
+    },
+    "• The AI model runs on-device. Your messages are generated locally on your phone." : {
+
+    },
+    "• This app is designed to be supportive and respectful." : {
+
+    },
+    "• This app is not a replacement for professional medical, legal, or emergency services." : {
+
+    },
+    "• Use your judgment. For important decisions, consult a qualified professional." : {
+
+    },
+    "• You can use the app offline after installation (except for optional features like App Store purchases)." : {
+
+    },
+    "• Your chats are not sent to our servers—because we don’t run chat servers." : {
+
+    },
+    "All of the above is stored locally inside this app’s sandbox on your device. We cannot see or access it." : {
+
+    },
+    "Apache License 2.0" : {
+
+    },
+    "Avatar" : {
+
+    },
+    "Avatar & Presence" : {
+
+    },
+    "Buy Us a Beer" : {
+
+    },
+    "Buy Us a Coffee" : {
+
+    },
+    "Cancel" : {
+
+    },
+    "Change Photo" : {
+
+    },
+    "Chat UI moved to ChatView.swift" : {
+
+    },
+    "Choose an amount" : {
+
+    },
+    "Choose Photo" : {
+
+    },
+    "Clear" : {
+
+    },
+    "Clear recent chat?" : {
+
+    },
+    "Companion Avatar" : {
+
+    },
+    "Companion identity" : {
+
+    },
+    "Companion identity (optional)" : {
+
+    },
+    "Companion name" : {
+
+    },
+    "Copied" : {
+
+    },
+    "Custom" : {
+
+    },
+    "Custom identity" : {
+
+    },
+    "Delete" : {
+
+    },
+    "Companion reset removes Companion chat, on-device memory, and room avatars on this device. It does not delete Secretary threads, DMs, public profiles, federation data, or remote data." : {
+
+    },
+    "Delete Companion Data?" : {
+
+    },
+    "Deleting…" : {
+
+    },
+    "Details" : {
+
+    },
+    "Done" : {
+
+    },
+    "Edit" : {
+
+    },
+    "Error: %@" : {
+
+    },
+    "Everything stays on this device." : {
+
+    },
+    "Everything stays on this device. Nothing is sent to servers." : {
+
+    },
+    "Export and deletion are performed on-device. Sharing an export is optional and controlled by you through iOS." : {
+
+    },
+    "Export failed" : {
+
+    },
+    "Feedback: %@" : {
+
+    },
+    "For best privacy, use a device passcode/Face ID and review your backup settings." : {
+
+    },
+    "Help" : {
+
+    },
+    "If you are in immediate danger or need urgent help, contact local emergency services or a trusted adult." : {
+
+    },
+    "If you export data, you choose where to save or share it. If you send feedback, your email app sends it using your own email provider." : {
+
+    },
+    "If you share your device or your Apple ID backup, others with access may be able to restore this app’s data." : {
+
+    },
+    "In Room Options → Memory, you can:" : {
+
+    },
+    "iOS may include app data in device backups (such as iCloud Backup) depending on your system settings." : {
+
+    },
+    "Last updated: January 2026" : {
+
+    },
+    "LegacyContentView" : {
+
+    },
+    "Licenses" : {
+
+    },
+    "Llama" : {
+
+    },
+    "Loading" : {
+
+    },
+    "Man" : {
+
+    },
+    "Many cloud apps send your messages to company servers for processing. That can enable server-side logging, analytics, and policy enforcement—and it may mean your data is stored outside your device." : {
+
+    },
+    "Memory" : {
+
+    },
+    "Memory Injection" : {
+
+    },
+    "MIT License" : {
+
+    },
+    "Name your companion" : {
+
+    },
+    "No traces yet." : {
+
+    },
+    "Non-binary" : {
+
+    },
+    "OK" : {
+
+    },
+    "Pinch to zoom • Drag to reposition" : {
+
+    },
+    "Prefer not to say" : {
+
+    },
+    "Preparing export…" : {
+
+    },
+    "Private by design" : {
+
+    },
+    "Prologue" : {
+
+    },
+    "Prompt Preview" : {
+
+    },
+    "Provided \"as is\" without warranties. To the extent permitted by law, we are not liable for decisions you make based on AI-generated responses." : {
+
+    },
+    "Qwen LLM" : {
+
+    },
+    "Remove Photo" : {
+
+    },
+    "Reset" : {
+
+    },
+    "Reset onboarding?" : {
+
+    },
+    "Room Options" : {
+
+    },
+    "Safety & Privacy" : {
+
+    },
+    "Saved" : {
+
+    },
+    "Say something…" : {
+
+    },
+    "Send Feedback" : {
+
+    },
+    "Sending feedback opens your email app. Your message is sent by your email provider, not by this app. Please don’t include private info you wouldn’t want in your email outbox." : {
+
+    },
+    "Special Thanks" : {
+
+    },
+    "Summary" : {
+
+    },
+    "Support Us" : {
+
+    },
+    "Tap to copy the email address." : {
+
+    },
+    "Thank You" : {
+
+    },
+    "There is no built-in analytics, ad tracking, or behavioral profiling in the app." : {
+
+    },
+    "Third-Party Licenses" : {
+
+    },
+    "This app includes software and model weights. Licenses are provided for attribution." : {
+
+    },
+    "This app runs entirely on your device. Your chats, memories, and identity settings stay on this device." : {
+
+    },
+    "This removes the visible conversation in this room." : {
+
+    },
+    "This will bring back the intro pages and clear the saved names on this device." : {
+
+    },
+    "This will remove chats, memory, and room assets from this device." : {
+
+    },
+    "Tips and subscriptions unlock nothing—this is purely to keep the project alive and improving." : {
+
+    },
+    "To the open-source and research communities, especially the teams behind Qwen and ChatGPT. No affiliation or endorsement implied." : {
+
+    },
+    "Trace" : {
+
+    },
+    "Trace not found" : {
+
+    },
+    "Typing" : {
+
+    },
+    "Uninstalling the app removes its local data. Device backups may include app data depending on your iOS backup settings." : {
+
+    },
+    "Use" : {
+
+    },
+    "Use this to set the starting environment: roles, relationship, setting, current moment and more. Short phrases work best." : {
+
+    },
+    "User Text" : {
+
+    },
+    "View Photo" : {
+
+    },
+    "Warnings" : {
+
+    },
+    "We are different: the model runs locally, so your conversations are not uploaded for inference." : {
+
+    },
+    "We do not operate chat servers. There is no account, no cloud inbox, and no place where your messages are uploaded for processing." : {
+
+    },
+    "We’re building personal intelligence that belongs to the person using it. Private by default, shaped by real life, not by ads or surveillance. We believe the path forward should be user-owned: intelligence that lives with you, grows with you, and answers to you." : {
+
+    },
+    "What should I call you?" : {
+
+    },
+    "Why Support?" : {
+
+    },
+    "Woman" : {
+
+    },
+    "Your avatar stays on this device." : {
+
+    },
+    "Your identity" : {
+
+    },
+    "Your identity (optional)" : {
+
+    },
+    "Your name (optional)" : {
+
+    },
+    "Your prologue has been saved." : {
+
+    }
+  },
+  "version" : "1.1"
+}

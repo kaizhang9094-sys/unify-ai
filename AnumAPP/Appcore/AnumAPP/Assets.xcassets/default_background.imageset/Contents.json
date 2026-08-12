@@ -1,0 +1,21 @@
+{
+  "images" : [
+    {
+      "filename" : "u1997683948_cinematic_anime-inspired_painting_dusk-to-night_sky_90d42e71-19d7-4a57-bb3d-207ca28bcd1e.png",
+      "idiom" : "universal",
+      "scale" : "1x"
+    },
+    {
+      "idiom" : "universal",
+      "scale" : "2x"
+    },
+    {
+      "idiom" : "universal",
+      "scale" : "3x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

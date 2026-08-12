@@ -1,0 +1,73 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-pagination-tie-a",
+      "id": "fixture-pagination-tie-a",
+      "nodeID": "fixture-pagination-recipient",
+      "inboxNodeID": "fixture-pagination-recipient",
+      "envelopeID": "env-pagination-tie-a",
+      "senderNodeID": "fixture-pagination-sender",
+      "recipientNodeID": "fixture-pagination-recipient",
+      "parentEnvelopeID": null,
+      "threadID": "550e8400-e29b-41d4-a716-4466554400bb",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "body": "page1-a"
+      },
+      "metadata": {},
+      "receivedAt": "2026-03-01T12:00:00.000Z",
+      "createdAt": "2026-03-01T12:00:00.000Z",
+      "envelope": {
+        "id": "env-pagination-tie-a",
+        "envelopeID": "env-pagination-tie-a",
+        "senderNodeID": "fixture-pagination-sender",
+        "recipientNodeID": "fixture-pagination-recipient",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-4466554400bb",
+        "protocolVersion": "exchange.v1",
+        "payload": { "kind": "message", "body": "page1-a" },
+        "metadata": {},
+        "status": "accepted"
+      }
+    },
+    {
+      "receiptID": "fixture-pagination-tie-b",
+      "id": "fixture-pagination-tie-b",
+      "nodeID": "fixture-pagination-recipient",
+      "inboxNodeID": "fixture-pagination-recipient",
+      "envelopeID": "env-pagination-tie-b",
+      "senderNodeID": "fixture-pagination-sender",
+      "recipientNodeID": "fixture-pagination-recipient",
+      "parentEnvelopeID": null,
+      "threadID": "550e8400-e29b-41d4-a716-4466554400bb",
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "body": "page1-b"
+      },
+      "metadata": {},
+      "receivedAt": "2026-03-01T12:00:00.000Z",
+      "createdAt": "2026-03-01T12:00:00.000Z",
+      "envelope": {
+        "id": "env-pagination-tie-b",
+        "envelopeID": "env-pagination-tie-b",
+        "senderNodeID": "fixture-pagination-sender",
+        "recipientNodeID": "fixture-pagination-recipient",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-4466554400bb",
+        "protocolVersion": "exchange.v1",
+        "payload": { "kind": "message", "body": "page1-b" },
+        "metadata": {},
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": "eyJ2IjoxLCJyZWNlaXZlZEF0IjoiMjAyNi0wMy0wMVQxMjowMDowMC4wMDBaIiwicmVjZWlwdElEIjoiZml4dHVyZS1wYWdpbmF0aW9uLXRpZS1iIn0",
+  "hasMore": true,
+  "syncedAt": "2026-03-01T12:00:00.100Z",
+  "note": "Pagination contract: two receipts same receivedAt; cursor encodes last row (tie-b)."
+}

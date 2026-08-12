@@ -1,0 +1,110 @@
+# Xcode build output
+DerivedData/
+build/
+*.xcarchive
+*.ipa
+*.dSYM
+*.app
+
+# Swift Package / dependency noise
+.swiftpm/
+.build/
+Package.resolved
+
+# macOS / Xcode noise
+.DS_Store
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+
+# Large model/runtime assets
+*.gguf
+*.bin
+*.onnx
+*.mlmodel
+*.mlpackage
+*.safetensors
+*.pt
+*.pth
+*.tflite
+
+# Logs / traces / generated debug dumps
+*.log
+logs/
+trace/
+traces/
+crash_logs/
+debug_dumps/
+
+# Databases / local private state
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Server/dependency noise
+node_modules/
+dist/
+.next/
+.vite/
+coverage/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p8
+*.mobileprovision
+# Git history / submodules
+.git/
+.git/modules/
+
+# Vendored dependencies / submodules
+vendor/
+
+# Compiled Apple frameworks
+*.xcframework/
+*.framework/
+
+# Xcode app data / simulator exports / cache blobs
+*.xcappdata/
+**/AppData/
+**/Library/Caches/
+**/com.apple.metal/
+
+# Test files / test targets
+Tests/
+*/Tests/
+*Tests/
+*Test.swift
+*Tests.swift
+AnumAPP/AnumAPPTests/
+
+# Local Xcode UI state
+*.xcuserstate
+**/xcuserdata/
+
+# Runtime dylibs Cursor does not need to read
+Packages/LlamaCppBridge/Resources/dylibs/
+*.dylib
+
+# Embedding tokenizer assets Cursor does not need
+AnumCore/Sources/AnumCore/EmbeddingAssets/tokenizer.json
+AnumCore/Sources/AnumCore/EmbeddingAssets/vocab.txt
+
+# Cursor internal planning/rules
+.cursor/plans/
+.cursor/rules/
+
+# Xcode per-user workspace state
+**/xcuserdata/
+**/*.xcuserdatad/
+**/Bookmarks/
+**/IDEFindNavigatorScopes.plist
+**/xcschememanagement.plist
+
+# Duplicate package lock files inside Xcode workspace
+**/xcshareddata/swiftpm/Package.resolved

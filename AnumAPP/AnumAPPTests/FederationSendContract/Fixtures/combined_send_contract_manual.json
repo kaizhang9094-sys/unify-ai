@@ -1,0 +1,80 @@
+{
+  "label": "manual_user_approved_shape",
+  "postBody": {
+    "envelopeID": "env-send-contract-manual-001",
+    "threadID": "550e8400-e29b-41d4-a716-446655440099",
+    "senderNodeID": "fixture-send-contract-manual-alpha-local",
+    "recipientNodeID": "fixture-send-contract-manual-beta-local",
+    "payload": {
+      "kind": "inquiry",
+      "subject": "User-approved manual send (contract probe)",
+      "body": "Queued via userApproved permit path analogue.",
+      "disclosureLevel": "balanced",
+      "intentTitle": "Fixture manual inquiry",
+      "mode": "conversation",
+      "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+    }
+  },
+  "sendResponse": {
+    "ok": true,
+    "envelopeID": "env-send-contract-manual-001",
+    "status": "accepted",
+    "acceptedAt": "2026-05-01T21:33:30.811Z",
+    "externalReference": "env-send-contract-manual-001",
+    "routeSummary": "federation-relay"
+  },
+  "inboxResponse": {
+    "ok": true,
+    "receipts": [
+      {
+        "receiptID": "8869f086-ac31-4b8a-aef3-856db4d06c18",
+        "id": "8869f086-ac31-4b8a-aef3-856db4d06c18",
+        "nodeID": "fixture-send-contract-manual-beta-local",
+        "inboxNodeID": "fixture-send-contract-manual-beta-local",
+        "envelopeID": "env-send-contract-manual-001",
+        "senderNodeID": "fixture-send-contract-manual-alpha-local",
+        "recipientNodeID": "fixture-send-contract-manual-beta-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-446655440099",
+        "protocolVersion": "exchange.v1",
+        "status": "accepted",
+        "payload": {
+          "kind": "inquiry",
+          "subject": "User-approved manual send (contract probe)",
+          "body": "Queued via userApproved permit path analogue.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Fixture manual inquiry",
+          "mode": "conversation",
+          "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+        },
+        "metadata": {},
+        "receivedAt": "2026-05-01T21:33:30.811Z",
+        "createdAt": "2026-05-01T21:33:30.811Z",
+        "envelope": {
+          "id": "env-send-contract-manual-001",
+          "envelopeID": "env-send-contract-manual-001",
+          "senderNodeID": "fixture-send-contract-manual-alpha-local",
+          "recipientNodeID": "fixture-send-contract-manual-beta-local",
+          "parentEnvelopeID": null,
+          "threadID": "550e8400-e29b-41d4-a716-446655440099",
+          "protocolVersion": "exchange.v1",
+          "payload": {
+            "kind": "inquiry",
+            "subject": "User-approved manual send (contract probe)",
+            "body": "Queued via userApproved permit path analogue.",
+            "disclosureLevel": "balanced",
+            "intentTitle": "Fixture manual inquiry",
+            "mode": "conversation",
+            "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+          },
+          "metadata": {},
+          "status": "accepted"
+        }
+      }
+    ],
+    "nextCursor": null,
+    "hasMore": false,
+    "syncedAt": "2026-05-01T21:33:30.813Z",
+    "note": "Inbox sync completed."
+  }
+}

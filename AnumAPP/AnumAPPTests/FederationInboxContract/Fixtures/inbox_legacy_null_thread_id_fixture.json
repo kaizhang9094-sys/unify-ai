@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "receipts": [
+    {
+      "receiptID": "fixture-receipt-null-thread-005",
+      "id": "fixture-receipt-null-thread-005",
+      "nodeID": "fixture-inbox-contract-e-recipient-local",
+      "inboxNodeID": "fixture-inbox-contract-e-recipient-local",
+      "envelopeID": "env-fixture-null-thread-stable",
+      "senderNodeID": "fixture-inbox-contract-e-sender-local",
+      "recipientNodeID": "fixture-inbox-contract-e-recipient-local",
+      "parentEnvelopeID": null,
+      "threadID": null,
+      "protocolVersion": "exchange.v1",
+      "status": "accepted",
+      "payload": {
+        "kind": "message",
+        "body": "Fixture with null DB thread column."
+      },
+      "metadata": {
+        "thread_fixture": "null_thread"
+      },
+      "receivedAt": "2026-01-02T03:04:05.012Z",
+      "createdAt": "2026-01-02T03:04:05.012Z",
+      "envelope": {
+        "id": "env-fixture-null-thread-stable",
+        "envelopeID": "env-fixture-null-thread-stable",
+        "senderNodeID": "fixture-inbox-contract-e-sender-local",
+        "recipientNodeID": "fixture-inbox-contract-e-recipient-local",
+        "parentEnvelopeID": null,
+        "threadID": null,
+        "protocolVersion": "exchange.v1",
+        "payload": {
+          "kind": "message",
+          "body": "Fixture with null DB thread column."
+        },
+        "metadata": {
+          "thread_fixture": "null_thread"
+        },
+        "status": "accepted"
+      }
+    }
+  ],
+  "nextCursor": null,
+  "hasMore": false,
+  "syncedAt": "2026-01-02T03:04:05.067Z",
+  "note": "LEGACY only: older relays could expose threadID null with no usable payload UUID. Current server rejects POST /v1/envelopes/send missing a valid canonical thread UUID. Swift may drop such receipts at sync-map time."
+}

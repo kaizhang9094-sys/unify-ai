@@ -1,0 +1,18427 @@
+import Foundation
+import CryptoKit
+
+#if DEBUG
+@inline(__always)
+private func exchFacadeLog(_ message: @autoclosure () -> String) {
+    Swift.print("[ExchangeFacade] \(message())")
+}
+
+@inline(__always)
+private func discoveryChildSecondHalfLog(_ message: @autoclosure () -> String) {
+    Swift.print("[DiscoveryChildSecondHalf] \(message())")
+}
+
+@inline(__always)
+private func exchFacadeTTFT(_ stage: String, start: CFAbsoluteTime) {
+    let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+    Swift.print("[ExchangeFacade][TTFT] \(stage) | elapsed=\(elapsedMs)ms")
+}
+#else
+@inline(__always)
+private func exchFacadeLog(_ message: @autoclosure () -> String) {}
+
+@inline(__always)
+private func discoveryChildSecondHalfLog(_ message: @autoclosure () -> String) {}
+
+@inline(__always)
+private func exchFacadeTTFT(_ stage: String, start: CFAbsoluteTime) {}
+#endif
+
+#if DEBUG
+@inline(__always)
+private func secSendBridgeLog(_ message: @autoclosure () -> String) {
+    Swift.print("[SEC][SendBridge] \(message())")
+}
+
+@inline(__always)
+private func secTrustedLog(_ message: @autoclosure () -> String) {
+    Swift.print("[SEC][Trusted] \(message())")
+}
+#else
+@inline(__always)
+private func secSendBridgeLog(_ message: @autoclosure () -> String) {}
+
+@inline(__always)
+private func secTrustedLog(_ message: @autoclosure () -> String) {}
+#endif
+
+// MARK: - For You directory filter (DEBUG diagnostics / local retrieval tests)
+
+/// Local DEBUG builds only: flip `includeActiveThreadCounterpartiesInForYouDebug` to `true` to retain directory
+/// matches whose counterparties already have active unresolved threads, so client rerank / vector lanes can be exercised.
+/// Release builds always behave as `false`.
+private enum ForYouActiveThreadDiscoveryDebug {
+    #if DEBUG
+    static let includeActiveThreadCounterpartiesInForYouDebug = true
+    #else
+    static let includeActiveThreadCounterpartiesInForYouDebug = false
+    #endif
+}
+
+#if DEBUG
+/// Single-line safe preview for autonomous outbound body inspection (DEBUG only).
+private func exchangeDebugAuditBodyPrefix(_ text: String, maxLen: Int = 220) -> String {
+    var t = text
+    t = t.replacingOccurrences(of: "\n", with: " ")
+    t = t.replacingOccurrences(of: "\r", with: " ")
+    t = t.replacingOccurrences(of: "\t", with: " ")
+    t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+    while t.contains("  ") {
+        t = t.replacingOccurrences(of: "  ", with: " ")
+    }
+    if t.count > maxLen {
+        return String(t.prefix(maxLen))
+    }
+    return t
+}
+
+/// Deterministic short fingerprint for DEBUG draft/body alignment (FNV-1a 64-bit).
+private func exchangeDebugBodyShortHash(_ text: String) -> String {
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash &*= 1_099_511_628_211
+    }
+    return String(format: "%016llx", hash)
+}
+
+private func secondHalfLogProbeLine(
+    threadID: UUID,
+    probeDetected: Bool,
+    anchorOk: Bool,
+    blobPreview: String,
+    wantsPrice: Bool,
+    wantsSchedule: Bool,
+    wantsPlace: Bool,
+    wantsLead: Bool,
+    wantsPolicy: Bool,
+    emittedFollowUps: [String]
+) {
+    let theme =
+        "price=\(wantsPrice ? 1 : 0)|availabilityOrSchedule=\(wantsSchedule ? 1 : 0)|location=\(wantsPlace ? 1 : 0)|leadTime=\(wantsLead ? 1 : 0)|policy=\(wantsPolicy ? 1 : 0)"
+    let emittedPreview = exchangeDebugAuditBodyPrefix(
+        emittedFollowUps.joined(separator: " || "),
+        maxLen: 200
+    )
+    exchFacadeLog(
+        "[SecondHalfProbe] thread=\(threadID.uuidString) probeDetected=\(probeDetected) anchorStrongEnough=\(anchorOk) blobPreview=\(exchangeDebugAuditBodyPrefix(blobPreview, maxLen: 200)) requestedThemeFlags=\(theme) emittedFollowUpIssuesCount=\(emittedFollowUps.count) emittedPreview=\(emittedPreview)"
+    )
+}
+
+/// Last successful agency materialization per thread (DEBUG-only queue alignment).
+private enum ExchangeAgencyOutboundMaterializeDebugAnchor {
+    nonisolated(unsafe) static var lastByThreadID: [UUID: (draftID: UUID, bodyHash: String)] = [:]
+
+    static func record(threadID: UUID, draftID: UUID, bodyHash: String) {
+        lastByThreadID[threadID] = (draftID, bodyHash)
+    }
+
+    static func logIfQueueReloadMismatchesMaterialization(
+        threadID: UUID,
+        draftID: UUID,
+        bodyHash: String,
+        context: String
+    ) {
+        guard let anchor = lastByThreadID[threadID] else { return }
+        if anchor.draftID != draftID || anchor.bodyHash != bodyHash {
+            exchFacadeLog(
+                "[AgencyOutboundBody] stale_or_wrong_draft_selected thread=\(threadID.uuidString) context=\(context) expectedDraft=\(anchor.draftID.uuidString) expectedBodyHash=\(anchor.bodyHash) actualDraft=\(draftID.uuidString) actualBodyHash=\(bodyHash)"
+            )
+        }
+    }
+}
+#endif
+
+/// Snapshot of provider-native inbound intent extraction for compare logging + fact gating.
+private struct ProviderInboundIntentSnapshot {
+    let extraction: ProviderInboundIntentExtraction?
+    let source: String
+    let askHash: String
+    let decodeSucceeded: Bool
+    let fallbackReason: String?
+    let rawChars: Int?
+    let cleanedChars: Int?
+}
+
+/// DEBUG-only: parallel compare channels gated independently from structured seller block.
+private struct ProviderCompareChannelGatingFlags: Sendable {
+    let gatedOfferSummary: Bool
+    let gatedProfileSummary: Bool
+    let gatedCommercialFacts: Bool
+    let gatedUsefulDetails: Bool
+    let gatedOSM: Bool
+}
+
+/// In-memory latest provider inbound intent extraction (not persisted).
+private enum ProviderInboundIntentExtractionCache {
+    struct Key: Hashable {
+        let threadID: UUID
+        let envelopeID: String
+        let askHash: String
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var storage: [Key: ProviderInboundIntentExtraction] = [:]
+
+    static func cached(_ key: Key) -> ProviderInboundIntentExtraction? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[key]
+    }
+
+    static func store(_ key: Key, value: ProviderInboundIntentExtraction) {
+        lock.lock()
+        defer { lock.unlock() }
+        storage[key] = value
+    }
+}
+
+/// Single read path for `providerFactSurfaceGatingEnabled` (explicit UserDefaults wins; else DEBUG defaults on).
+private enum ProviderFactSurfaceGatingResolution {
+    static let userDefaultsKey = "providerFactSurfaceGatingEnabled"
+
+    nonisolated(unsafe) private static var didLogFirstReadInDebug = false
+
+    static func resolvedBool() -> Bool {
+        let ud = UserDefaults.standard
+        let hasExplicit = ud.object(forKey: userDefaultsKey) != nil
+        let value: Bool
+        let source: String
+        if hasExplicit {
+            value = ud.bool(forKey: userDefaultsKey)
+            source = "explicit"
+        } else {
+            #if DEBUG
+            value = true
+            source = "debugDefault"
+            #else
+            value = false
+            source = "releaseDefault"
+            #endif
+        }
+
+        #if DEBUG
+        if !didLogFirstReadInDebug {
+            didLogFirstReadInDebug = true
+            Swift.print(
+                "[DEBUG] providerFactSurfaceGatingEnabled default/resolved = \(value) source=\(source)"
+            )
+        }
+        #endif
+
+        return value
+    }
+}
+
+@inline(__always)
+private func exchangeDebugProviderFactSurfaceGatingEnabled() -> Bool {
+    ProviderFactSurfaceGatingResolution.resolvedBool()
+}
+
+/// Bounds for folding `ExchangeTurn.detail` from inbound provider-style turns into second-half known facts.
+private enum ExchangeFacadeSecondHalfInboundFacts {
+    static let replyDetailMaxCharacters = 800
+    static let replyDetailMaxTurnsContributingFullBody = 3
+}
+
+public struct ExchangeFacade: Sendable {
+    public struct ThreadConnectTarget: Sendable, Hashable {
+        public let nodeID: String
+        public let displayName: String?
+        public let publicProfileID: String?
+        public let offerID: String?
+        public let reason: String
+
+        public init(
+            nodeID: String,
+            displayName: String?,
+            publicProfileID: String?,
+            offerID: String?,
+            reason: String
+        ) {
+            self.nodeID = nodeID
+            self.displayName = displayName
+            self.publicProfileID = publicProfileID
+            self.offerID = offerID
+            self.reason = reason
+        }
+    }
+
+    public enum OutboundQueuePermit: Sendable {
+        case userApproved(source: String)
+        case agencyAutonomy(source: String, gate: ExchangeAgencyAutonomousOutboundGateResult)
+    }
+
+    private let orchestrator: ExchangeOrchestrator
+    private let federationService: any ExchangeFederationService
+    /// Persistence boundary exposed for focused subsystems split across extensions (notifications, tooling).
+    let store: any ExchangeStore
+    private let summaryEngine: ExchangeSummaryEngine
+    private let sellerSurfaceService: any ExchangeSellerSurfaceService
+    private let publicationService: any ExchangePublicationService
+    private let publicationCoordinator: (any ExchangeSellerPublicationCoordinating)?
+    private let sellerWorkspaceBuilder: ExchangeSellerWorkspaceBuilder
+    private let secondHalfFacade: ExchangeSecondHalfFacade
+    private let secondHalfActionExecutor: ExchangeSecondHalfActionExecutor
+    private let intelligenceProvider: any ExchangeIntelligenceProvider
+    private let secretaryConstitutionProvider: (@Sendable () -> String?)?
+    private let secretaryStyleTextProvider: (@Sendable () -> String?)?
+    private let directoryClient: (any ExchangeDirectoryClient)?
+    /// When enabled, provider inbound uses `providerInquiryCompare` + governor before coordinator (single compare LLM per inbound).
+    private let enableCompareFirstProviderInbound: Bool
+    private let forYouStandingInterestService: ForYouStandingInterestService
+    /// Same ONNX instance as retrieval / publication / ``ExchangeDiscoveryEngine`` when wired from bootstrap.
+    private let forYouDirectoryEmbeddingProvider: (any MemoryEmbeddingProvider)?
+    private let contactSignalSendService: ContactSignalSendService
+    private let directMessageSendService: DirectMessageSendService
+    private let dmAttachmentClient: ExchangeHTTPDMAttachmentClient?
+
+    public init(
+        orchestrator: ExchangeOrchestrator,
+        federationService: any ExchangeFederationService,
+        store: any ExchangeStore,
+        summaryEngine: ExchangeSummaryEngine,
+        sellerSurfaceService: any ExchangeSellerSurfaceService,
+        publicationService: any ExchangePublicationService,
+        publicationCoordinator: (any ExchangeSellerPublicationCoordinating)? = nil,
+        sellerWorkspaceBuilder: ExchangeSellerWorkspaceBuilder = .init(),
+        secondHalfFacade: ExchangeSecondHalfFacade? = nil,
+        secondHalfActionExecutor: ExchangeSecondHalfActionExecutor = .init(),
+        intelligenceProvider: any ExchangeIntelligenceProvider = ExchangeFallbackIntelligenceProvider(),
+        secretaryConstitutionProvider: (@Sendable () -> String?)? = nil,
+        secretaryStyleTextProvider: (@Sendable () -> String?)? = nil,
+        directoryClient: (any ExchangeDirectoryClient)? = nil,
+        enableCompareFirstProviderInbound: Bool = true,
+        forYouStandingInterestService: ForYouStandingInterestService = ForYouStandingInterestService(),
+        forYouDirectoryEmbeddingProvider: (any MemoryEmbeddingProvider)? = nil,
+        contactSignalSendService: ContactSignalSendService,
+        directMessageSendService: DirectMessageSendService,
+        dmAttachmentClient: ExchangeHTTPDMAttachmentClient? = nil
+    ) {
+        self.orchestrator = orchestrator
+        self.federationService = federationService
+        self.store = store
+        self.summaryEngine = summaryEngine
+        self.sellerSurfaceService = sellerSurfaceService
+        self.publicationService = publicationService
+        self.publicationCoordinator = publicationCoordinator
+        self.sellerWorkspaceBuilder = sellerWorkspaceBuilder
+        self.secondHalfFacade = secondHalfFacade ?? ExchangeSecondHalfFacade(exchangeStore: store)
+        self.secondHalfActionExecutor = secondHalfActionExecutor
+        self.intelligenceProvider = intelligenceProvider
+        self.secretaryConstitutionProvider = secretaryConstitutionProvider
+        self.secretaryStyleTextProvider = secretaryStyleTextProvider
+        self.directoryClient = directoryClient
+        self.enableCompareFirstProviderInbound = enableCompareFirstProviderInbound
+        self.forYouStandingInterestService = forYouStandingInterestService
+        self.forYouDirectoryEmbeddingProvider = forYouDirectoryEmbeddingProvider
+        self.contactSignalSendService = contactSignalSendService
+        self.directMessageSendService = directMessageSendService
+        self.dmAttachmentClient = dmAttachmentClient
+    }
+
+    /// Resolves a private DM attachment to a local file URL (cache-first, then signed federation download).
+    public func resolveDirectMessageAttachmentFile(
+        _ descriptor: DirectMessageAttachmentDescriptor
+    ) async throws -> URL {
+        if DirectMessageAttachmentCache.isCached(storageKey: descriptor.storageKey, filename: descriptor.filename),
+           let cached = try? DirectMessageAttachmentCache.cachedFileURL(
+               storageKey: descriptor.storageKey,
+               filename: descriptor.filename
+           ) {
+            return cached
+        }
+        guard let dmAttachmentClient else {
+            throw ExchangeStoreError.storageFailure(reason: "DM attachment download is not configured.")
+        }
+        return try await dmAttachmentClient.downloadDMAttachment(descriptor: descriptor)
+    }
+
+    // MARK: - Core exchange
+
+    public func submit(
+        _ userText: String,
+        threadID: ExchangeThread.ID? = nil,
+        progressContext: DiscoveryHeroProgressContext? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let start = CFAbsoluteTimeGetCurrent()
+
+        exchFacadeLog(
+            "submit start | threadID=\(threadID?.uuidString ?? "nil") | chars=\(trimmed.count)"
+        )
+
+        do {
+            let response = try await orchestrator.handleUserRequest(
+                userText,
+                existingThreadID: threadID,
+                progressContext: progressContext,
+                now: now
+            )
+
+            exchFacadeTTFT("submit.orchestratorReturned", start: start)
+
+            if !response.isTransientNonPersistent {
+                await runSecondHalfAfterDiscoveryResponse(
+                    response,
+                    source: "submit",
+                    now: now
+                )
+            } else {
+                #if DEBUG
+                exchFacadeLog(
+                    "submit skip runSecondHalfAfterThreadMutation | transientNonPersistent=true threadID=\(response.thread.id.uuidString)"
+                )
+                #endif
+            }
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "submit done | elapsed=\(elapsedMs)ms | responseThread=\(response.thread.id.uuidString) | transientNonPersistent=\(response.isTransientNonPersistent) | state=\(response.thread.state.phaseTitle) | handoff=\(String(describing: response.handoff.latestAction)) | summary=\(response.summary)"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "submit failed | elapsed=\(elapsedMs)ms | threadID=\(threadID?.uuidString ?? "nil") | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func saveOffer(
+        _ offer: ExchangeOffer,
+        now: Date = Date()
+    ) async throws {
+        let trimmedNodeID = offer.nodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Offer node ID is missing.")
+        }
+
+        guard let publicProfileID = offer.publicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !publicProfileID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Offer must belong to a public profile.")
+        }
+
+        guard let profile = try await store.fetchPublicProfile(id: publicProfileID) else {
+            throw ExchangeStoreError.publicProfileNotFound(publicProfileID)
+        }
+
+        guard profile.nodeID == trimmedNodeID else {
+            throw ExchangeStoreError.conflict(
+                reason: "Offer node ID does not match the owning public profile node ID."
+            )
+        }
+
+        let existingOffers = try await store.listOffers(
+            filter: .init(
+                publicProfileID: publicProfileID,
+                limit: 100
+            )
+        )
+
+        let distinctOfferCount = Set(existingOffers.map(\.id)).count
+        let isExistingOffer = existingOffers.contains(where: { $0.id == offer.id })
+
+        if !isExistingOffer && distinctOfferCount >= 5 {
+            throw ExchangeStoreError.conflict(
+                reason: "Only up to 5 offers are allowed per node/profile."
+            )
+        }
+
+        var offerToSave = offer
+        ExchangeRemoteDiscoveryCacheMetadata.tagLocalOwnedOffer(&offerToSave, now: now)
+        try await store.saveOffer(offerToSave)
+
+        let current = try await store.fetchPublicationState(
+            forPublicProfileID: publicProfileID
+        ) ?? publicationService.makeDefaultPublicationState(
+            publicProfileID: publicProfileID,
+            now: now
+        )
+
+        let nextState = current.markingLocalMutation(at: now)
+
+        try await store.savePublicationState(
+            nextState,
+            forPublicProfileID: publicProfileID
+        )
+    }
+
+    public func savePublicProfile(
+        _ profile: ExchangePublicNodeProfile,
+        now: Date = Date()
+    ) async throws {
+        let trimmedNodeID = profile.nodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Public profile node ID is missing.")
+        }
+
+        let existingProfiles = try await store.listPublicProfiles(
+            filter: .init(
+                nodeID: trimmedNodeID,
+                limit: 10
+            )
+        )
+
+        if let conflicting = existingProfiles.first(where: { $0.id != profile.id }) {
+            throw ExchangeStoreError.conflict(
+                reason: "Only one public profile is allowed per node. Existing profile \(conflicting.id) already owns node \(trimmedNodeID)."
+            )
+        }
+
+        var profileToSave = profile
+        ExchangeRemoteDiscoveryCacheMetadata.tagLocalOwnedProfile(&profileToSave, now: now)
+        try await store.savePublicProfile(profileToSave)
+
+        let current = try await store.fetchPublicationState(
+            forPublicProfileID: profile.id
+        ) ?? publicationService.makeDefaultPublicationState(
+            publicProfileID: profile.id,
+            now: now
+        )
+
+        let nextState = current.markingLocalMutation(at: now)
+
+        try await store.savePublicationState(
+            nextState,
+            forPublicProfileID: profile.id
+        )
+    }
+
+    public func getSellerWorkspace(
+        ownerNodeID: String,
+        ownerDisplayName: String? = nil
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "getSellerWorkspace start | ownerNodeID=\(ownerNodeID) | ownerDisplayName=\(ownerDisplayName ?? "nil")"
+        )
+
+        let profiles = try await store.listPublicProfiles(
+            filter: .init(
+                nodeID: ownerNodeID,
+                limit: 1
+            )
+        )
+        exchFacadeTTFT("getSellerWorkspace.afterListPublicProfiles", start: start)
+
+        let publicProfile = profiles.first
+
+        let publicationState: ExchangePublicationState?
+        if let publicProfile {
+            publicationState = try await store.fetchPublicationState(
+                forPublicProfileID: publicProfile.id
+            )
+        } else {
+            publicationState = nil
+        }
+        exchFacadeTTFT("getSellerWorkspace.afterPublicationState", start: start)
+
+        let offers: [ExchangeOffer]
+        if let publicProfile {
+            offers = try await store.listOffers(
+                filter: .init(
+                    publicProfileID: publicProfile.id,
+                    limit: 100
+                )
+            )
+        } else {
+            offers = []
+        }
+        exchFacadeTTFT("getSellerWorkspace.afterListOffers", start: start)
+
+        _ = try await sellerSurfaceService.buildLocalSellerSurface(
+            ownerDisplayName: ownerDisplayName,
+            publicProfile: publicProfile,
+            offers: offers,
+            publicationState: publicationState
+        )
+        exchFacadeTTFT("getSellerWorkspace.afterBuildSellerSurface", start: start)
+
+        let summary = sellerWorkspaceBuilder.buildWorkspaceSummary(
+            ownerDisplayName: ownerDisplayName,
+            publicProfile: publicProfile,
+            offers: offers,
+            publicationState: publicationState
+        )
+        exchFacadeTTFT("getSellerWorkspace.afterBuildSummary", start: start)
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "getSellerWorkspace done | elapsed=\(elapsedMs)ms | hasProfile=\(publicProfile != nil) | offers=\(offers.count)"
+        )
+
+        return summary
+    }
+
+    public func validateSellerWorkspace(
+        ownerNodeID: String
+    ) async throws -> [ExchangeSellerValidationIssue] {
+        let profiles = try await store.listPublicProfiles(
+            filter: .init(
+                nodeID: ownerNodeID,
+                limit: 1
+            )
+        )
+
+        let publicProfile = profiles.first
+
+        let offers: [ExchangeOffer]
+        if let publicProfile {
+            offers = try await store.listOffers(
+                filter: .init(
+                    publicProfileID: publicProfile.id,
+                    limit: 100
+                )
+            )
+        } else {
+            offers = []
+        }
+
+        return sellerSurfaceService.validateSurface(
+            publicProfile: publicProfile,
+            offers: offers
+        )
+    }
+
+    public func ensureSellerSurface(
+        ownerNodeID: String,
+        ownerDisplayName: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        let profiles = try await store.listPublicProfiles(
+            filter: .init(
+                nodeID: trimmedNodeID,
+                limit: 1
+            )
+        )
+
+        let publicProfile: ExchangePublicNodeProfile
+        if let existing = profiles.first {
+            publicProfile = existing
+        } else {
+            publicProfile = try await createSellerProfile(
+                ownerNodeID: trimmedNodeID,
+                ownerDisplayName: ownerDisplayName,
+                now: now
+            )
+        }
+
+        let publicationState = try await store.fetchPublicationState(
+            forPublicProfileID: publicProfile.id
+        )
+
+        if publicationState == nil {
+            let initial = publicationService.makeDefaultPublicationState(
+                publicProfileID: publicProfile.id,
+                now: now
+            )
+
+            try await store.savePublicationState(
+                initial,
+                forPublicProfileID: publicProfile.id
+            )
+        }
+
+        return try await getSellerWorkspace(
+            ownerNodeID: trimmedNodeID,
+            ownerDisplayName: ownerDisplayName
+        )
+    }
+
+    public func createSellerProfile(
+        ownerNodeID: String,
+        ownerDisplayName: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangePublicNodeProfile {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        let existingProfiles = try await store.listPublicProfiles(
+            filter: .init(
+                nodeID: trimmedNodeID,
+                limit: 10
+            )
+        )
+
+        if let canonical = existingProfiles.first(where: { $0.id == "profile-\(trimmedNodeID)" }) {
+            return canonical
+        }
+
+        if let existing = existingProfiles.first {
+            return existing
+        }
+
+        let displayName = ownerDisplayName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        let profile = ExchangePublicNodeProfile(
+            id: "profile-\(trimmedNodeID)",
+            nodeID: trimmedNodeID,
+            counterpartyID: nil,
+            displayName: displayName,
+            headline: nil,
+            summary: nil,
+            visibility: .discoverable,
+            interests: [],
+            offers: [],
+            openTo: [],
+            excludedTopics: [],
+            activityTags: [],
+            regionTags: [],
+            semantic: .init(
+                domains: [],
+                intentKinds: [],
+                audienceKinds: [.person, .business, .secretaryNode],
+                fulfillmentModes: [],
+                notes: nil
+            ),
+            reachability: .init(
+                accessMode: .direct,
+                acceptingInbound: true,
+                allowedModes: [],
+                allowedIntentKinds: ["offer", "quote_request", "inquiry"],
+                allowedAudienceKinds: [.person, .business, .secretaryNode],
+                minimumTrustLevel: nil,
+                requiresCategoryMatch: false,
+                requiresMutualFit: false,
+                intentCategoryPolicy: .permissive,
+                disclosureCeiling: .balanced,
+                routeableOnly: false
+            ),
+            approach: .init(
+                preferredStyle: .lowPressure,
+                preferredFirstContactKinds: [.inquiry, .quoteRequest, .introduction],
+                note: nil
+            ),
+            availability: .open,
+            createdAt: now,
+            updatedAt: now,
+            metadata: [:]
+        )
+
+        try await savePublicProfile(profile, now: now)
+        return profile
+    }
+
+    public func createDraftOffer(
+        ownerNodeID: String,
+        publicProfileID: String,
+        title: String = "New Offer",
+        summary: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeOffer {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        let trimmedProfileID = publicProfileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedProfileID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Public profile ID is missing.")
+        }
+
+        guard let profile = try await store.fetchPublicProfile(id: trimmedProfileID) else {
+            throw ExchangeStoreError.publicProfileNotFound(trimmedProfileID)
+        }
+
+        guard profile.nodeID == trimmedNodeID else {
+            throw ExchangeStoreError.conflict(
+                reason: "The public profile does not belong to the provided owner node."
+            )
+        }
+
+        let existingOffers = try await store.listOffers(
+            filter: .init(
+                publicProfileID: trimmedProfileID,
+                limit: 100
+            )
+        )
+
+        if existingOffers.count >= 5 {
+            throw ExchangeStoreError.conflict(
+                reason: "Only up to 5 offers are allowed per node/profile."
+            )
+        }
+
+        let cleanedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "New Offer"
+            : title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let offer = ExchangeOffer(
+            id: "offer-\(UUID().uuidString.lowercased())",
+            nodeID: trimmedNodeID,
+            publicProfileID: trimmedProfileID,
+            title: cleanedTitle,
+            summary: summary?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+            category: nil,
+            tags: [],
+            regionTags: [],
+            semantic: .init(),
+            fulfillment: .init(
+                pricingMode: .quoteRequired,
+                commitmentMode: .exploratory,
+                remoteFriendly: false
+            ),
+            status: .draft,
+            visibility: .publicDiscoverable,
+            createdAt: now,
+            updatedAt: now,
+            metadata: [:]
+        )
+
+        try await saveOffer(offer, now: now)
+        return offer
+    }
+
+    public func publishSellerSurface(
+        ownerNodeID: String,
+        ownerDisplayName: String? = nil,
+        publicSupporterPresentation: ExchangeSupporterPresentation? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        guard let publicationCoordinator else {
+            throw ExchangeDirectoryClientError.unavailable(
+                reason: "Seller publication coordinator is not configured."
+            )
+        }
+
+        #if DEBUG
+        GuardianCrownDebugLog.log(
+            "PublishFacade",
+            "nodeID=\(trimmedNodeID) presentation=\(GuardianCrownDebugLog.presentationLabel(publicSupporterPresentation))"
+        )
+        #endif
+
+        _ = try await publicationCoordinator.publishSellerSurface(
+            ownerNodeID: trimmedNodeID,
+            ownerDisplayName: ownerDisplayName,
+            publicSupporterPresentation: publicSupporterPresentation,
+            now: now
+        )
+
+        return try await getSellerWorkspace(
+            ownerNodeID: trimmedNodeID,
+            ownerDisplayName: ownerDisplayName
+        )
+    }
+
+    public func unpublishSellerSurface(
+        ownerNodeID: String,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        guard let publicationCoordinator else {
+            throw ExchangeDirectoryClientError.unavailable(
+                reason: "Seller publication coordinator is not configured."
+            )
+        }
+
+        _ = try await publicationCoordinator.unpublishSellerSurface(
+            ownerNodeID: trimmedNodeID,
+            now: now
+        )
+
+        return try await getSellerWorkspace(ownerNodeID: trimmedNodeID)
+    }
+
+    public func reconcileSellerSurfacePublication(
+        ownerNodeID: String,
+        ownerDisplayName: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        let trimmedNodeID = ownerNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Owner node ID is missing.")
+        }
+
+        guard let publicationCoordinator else {
+            return try await getSellerWorkspace(
+                ownerNodeID: trimmedNodeID,
+                ownerDisplayName: ownerDisplayName
+            )
+        }
+
+        _ = try await publicationCoordinator.reconcileSellerSurfacePublication(
+            ownerNodeID: trimmedNodeID,
+            ownerDisplayName: ownerDisplayName,
+            now: now
+        )
+
+        return try await getSellerWorkspace(
+            ownerNodeID: trimmedNodeID,
+            ownerDisplayName: ownerDisplayName
+        )
+    }
+
+    @available(*, unavailable, message: "Use publishSellerSurface(ownerNodeID:ownerDisplayName:now:) instead.")
+    public func markSellerSurfacePublished(
+        ownerNodeID: String,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.SellerWorkspaceSummary {
+        fatalError("Unavailable. Use publishSellerSurface instead.")
+    }
+
+    public func answerClarification(
+        threadID: ExchangeThread.ID,
+        answer: String,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let start = CFAbsoluteTimeGetCurrent()
+
+        exchFacadeLog(
+            "answerClarification start | threadID=\(threadID.uuidString) | chars=\(trimmed.count)"
+        )
+
+        do {
+            let response = try await orchestrator.answerClarification(
+                threadID: threadID,
+                answer: trimmed,
+                now: now
+            )
+
+            exchFacadeTTFT("answerClarification.orchestratorReturned", start: start)
+
+            await runSecondHalfAfterThreadMutation(
+                threadID: response.thread.id,
+                source: "answerClarification",
+                now: now
+            )
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "answerClarification done | elapsed=\(elapsedMs)ms | responseThread=\(response.thread.id.uuidString) | state=\(response.thread.state.phaseTitle) | handoff=\(String(describing: response.handoff.latestAction)) | summary=\(response.summary)"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "answerClarification failed | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString) | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func approve(
+        threadID: ExchangeThread.ID,
+        approvalID: ExchangeApproval.ID,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "approve start | threadID=\(threadID.uuidString) | approvalID=\(approvalID.uuidString) | note=\(note ?? "nil")"
+        )
+
+        do {
+            let response = try await orchestrator.approve(
+                threadID: threadID,
+                approvalID: approvalID,
+                note: note,
+                now: now
+            )
+
+            exchFacadeTTFT("approve.orchestratorReturned", start: start)
+
+            await runSecondHalfAfterThreadMutation(
+                threadID: response.thread.id,
+                source: "approve",
+                now: now
+            )
+
+            await recordApprovalTrustEvidenceIfNeeded(
+                thread: response.thread,
+                approvalID: approvalID,
+                approved: true,
+                now: now
+            )
+            await recordThreadCompletedTrustEvidenceIfNeeded(
+                thread: response.thread,
+                now: now
+            )
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "approve done | elapsed=\(elapsedMs)ms | state=\(response.thread.state.phaseTitle) | handoff=\(String(describing: response.handoff.latestAction)) | eligible=\(response.handoff.federationExecutionEligible)"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "approve failed | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString) | approvalID=\(approvalID.uuidString) | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func reject(
+        threadID: ExchangeThread.ID,
+        approvalID: ExchangeApproval.ID,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "reject start | threadID=\(threadID.uuidString) | approvalID=\(approvalID.uuidString) | note=\(note ?? "nil")"
+        )
+
+        do {
+            let response = try await orchestrator.reject(
+                threadID: threadID,
+                approvalID: approvalID,
+                note: note,
+                now: now
+            )
+
+            exchFacadeTTFT("reject.orchestratorReturned", start: start)
+
+            await runSecondHalfAfterThreadMutation(
+                threadID: response.thread.id,
+                source: "reject",
+                now: now
+            )
+
+            await recordApprovalTrustEvidenceIfNeeded(
+                thread: response.thread,
+                approvalID: approvalID,
+                approved: false,
+                now: now
+            )
+            await recordThreadCompletedTrustEvidenceIfNeeded(
+                thread: response.thread,
+                now: now
+            )
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "reject done | elapsed=\(elapsedMs)ms | state=\(response.thread.state.phaseTitle) | handoff=\(String(describing: response.handoff.latestAction))"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "reject failed | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString) | approvalID=\(approvalID.uuidString) | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func markOutboundConfirmed(
+        threadID: ExchangeThread.ID,
+        externalReference: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "markOutboundConfirmed start | threadID=\(threadID.uuidString) | externalReference=\(externalReference ?? "nil")"
+        )
+
+        do {
+            let response = try await orchestrator.markOutboundConfirmed(
+                threadID: threadID,
+                externalReference: externalReference,
+                now: now
+            )
+
+            exchFacadeTTFT("markOutboundConfirmed.orchestratorReturned", start: start)
+
+            await runSecondHalfAfterThreadMutation(
+                threadID: response.thread.id,
+                source: "markOutboundConfirmed",
+                now: now
+            )
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "markOutboundConfirmed done | elapsed=\(elapsedMs)ms | state=\(response.thread.state.phaseTitle)"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "markOutboundConfirmed failed | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString) | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func refreshSearch(
+        threadID: ExchangeThread.ID,
+        now: Date = Date()
+    ) async throws -> ExchangeOrchestrator.Response {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("refreshSearch start | threadID=\(threadID.uuidString)")
+
+        do {
+            let response = try await orchestrator.refreshSearch(
+                threadID: threadID,
+                now: now
+            )
+
+            exchFacadeTTFT("refreshSearch.orchestratorReturned", start: start)
+
+            await runSecondHalfAfterDiscoveryResponse(
+                response,
+                source: "refreshSearch",
+                now: now
+            )
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "refreshSearch done | elapsed=\(elapsedMs)ms | responseThread=\(response.thread.id.uuidString) | state=\(response.thread.state.phaseTitle)"
+            )
+
+            return response
+        } catch {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "refreshSearch failed | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString) | error=\(error)"
+            )
+            throw error
+        }
+    }
+
+    public func approveAndQueue(
+        threadID: ExchangeThread.ID,
+        approvalID: ExchangeApproval.ID,
+        permit: OutboundQueuePermit,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel? = nil,
+        priority: ExchangeDeliveryState.Priority = .userInitiated,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ApprovalQueueResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "approveAndQueue start | threadID=\(threadID.uuidString) | approvalID=\(approvalID.uuidString) | priority=\(priority)"
+        )
+
+        let response = try await approve(
+            threadID: threadID,
+            approvalID: approvalID,
+            note: note,
+            now: now
+        )
+
+        exchFacadeTTFT("approveAndQueue.afterApprove", start: start)
+
+        guard response.handoff.federationExecutionEligible else {
+            exchFacadeLog(
+                "approveAndQueue notEligibleAfterApprove | threadID=\(threadID.uuidString) | reason=\(response.handoff.federationExecutionReason ?? "nil")"
+            )
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: threadID,
+                        draftID: response.handoff.latestDraft?.id,
+                        selectedOfferID: response.thread.selectedOfferID,
+                        selectedPublicProfileID: response.thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: response.thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: nil,
+                        eligibilityReason: nil,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "federation_execution_not_eligible",
+                        errorSummary: nil
+                    )
+                )
+            }
+            return ApprovalQueueResult(
+                response: response,
+                queued: nil,
+                queueStatus: .notEligible(
+                    reason: response.handoff.federationExecutionReason
+                        ?? "Federation execution is not currently eligible."
+                )
+            )
+        }
+
+        guard let counterparty = response.handoff.selectedCounterparty,
+              let draft = response.handoff.latestDraft,
+              let approval = response.handoff.latestApproval else {
+            exchFacadeLog(
+                "approveAndQueue notReady | threadID=\(threadID.uuidString) | missing handoff pieces | counterparty=\(response.handoff.selectedCounterparty != nil) | draft=\(response.handoff.latestDraft != nil) | approval=\(response.handoff.latestApproval != nil)"
+            )
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: threadID,
+                        draftID: response.handoff.latestDraft?.id,
+                        selectedOfferID: response.thread.selectedOfferID,
+                        selectedPublicProfileID: response.thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: response.thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: nil,
+                        eligibilityReason: nil,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "handoff_incomplete",
+                        errorSummary: nil
+                    )
+                )
+            }
+            return ApprovalQueueResult(
+                response: response,
+                queued: nil,
+                queueStatus: .notReady(
+                    reason: "Approval completed, but the required draft/counterparty/approval handoff was incomplete."
+                )
+            )
+        }
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: response.thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        exchFacadeTTFT("approveAndQueue.afterEligibility", start: start)
+
+        exchFacadeLog(
+            "approveAndQueue eligibility | threadID=\(threadID.uuidString) | eligible=\(eligibility.isEligible) | reason=\(eligibility.reason)"
+        )
+
+        guard eligibility.isEligible else {
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: threadID,
+                        draftID: draft.id,
+                        selectedOfferID: response.thread.selectedOfferID,
+                        selectedPublicProfileID: response.thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: response.thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: false,
+                        eligibilityReason: eligibility.reason,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "send_eligibility_denied",
+                        errorSummary: nil
+                    )
+                )
+            }
+            if eligibility.trustFloorMismatch || eligibility.postureBlocked {
+                await recordTrustEvidenceIfNeeded(
+                    thread: response.thread,
+                    type: .policyConcern,
+                    weight: -0.25,
+                    internalSummary: "Policy posture prevented direct outbound progression.",
+                    userSafeSummary: "This profile requires a stronger relationship before direct contact.",
+                    sourceEventKey: "thread:\(threadID.uuidString):policyConcern:\(approvalID.uuidString)",
+                    now: now
+                )
+            }
+            return ApprovalQueueResult(
+                response: response,
+                queued: nil,
+                queueStatus: .notEligible(reason: eligibility.reason)
+            )
+        }
+
+        let queued = try await queueApprovedOutboundWithPermit(
+            thread: response.thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: permit,
+            disclosureLevel: disclosureLevel ?? .balanced,
+            priority: priority,
+            now: now
+        )
+
+        exchFacadeTTFT("approveAndQueue.afterQueue", start: start)
+
+        // Flush in the background so callers (approval sheet, inline Send) return as soon as the
+        // outbox row exists locally — network ACK must not block UI dismissal.
+        let facade = self
+        let flushAt = now
+        Task {
+            do {
+                let flushResult = try await facade.flushOutbox(now: flushAt)
+                exchFacadeLog(
+                    "approveAndQueue.flush done | " +
+                        "attempted=\(flushResult.attempted) " +
+                        "acknowledged=\(flushResult.acknowledged) " +
+                        "failed=\(flushResult.failed) | " +
+                        "threadID=\(threadID.uuidString)"
+                )
+            } catch {
+                exchFacadeLog(
+                    "approveAndQueue.flush error (non-fatal) | " +
+                        "error=\(error) | threadID=\(threadID.uuidString)"
+                )
+            }
+        }
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "approveAndQueue queued | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString)"
+        )
+
+        return ApprovalQueueResult(
+            response: response,
+            queued: queued,
+            queueStatus: .queued
+        )
+    }
+
+    /// Queues outbound for a prepared second-half draft using the same `queueApprovedOutbound` path as
+    /// `approveAndQueue`, without requiring a pending `ExchangeApproval` row (e.g. decision-ready UI).
+    public func queuePreparedSecondHalfOutboundSend(
+        threadID: ExchangeThread.ID,
+        draftID: ExchangeMessageDraft.ID? = nil,
+        userInitiatedOverride: Bool,
+        now: Date = Date()
+    ) async throws -> SecondHalfPreparedDraftSendResult {
+        secSendBridgeLog(
+            "user directed send | thread=\(threadID.uuidString) | draftID=\(draftID?.uuidString ?? "nil") | userInitiatedOverride=\(userInitiatedOverride)"
+        )
+
+        let detail: ExchangeModels.ThreadDetail
+        do {
+            detail = try await getThread(threadID: threadID)
+        } catch {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=missingThread | error=\(error)"
+            )
+            return .missingThread
+        }
+
+        guard let counterparty = detail.selectedCounterparty else {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=missingCounterparty"
+            )
+            return .missingCounterparty
+        }
+
+        if let boundary = detail.secondHalfDisplay?.boundary,
+           boundary.requiresHumanApproval,
+           !userInitiatedOverride {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=boundaryBlocked | requiresHumanApproval=true"
+            )
+            return .boundaryBlocked
+        }
+
+        guard let draft = Self.pickUserDirectedOutboundDraftForPreparedSend(
+            drafts: detail.drafts,
+            preferredDraftID: draftID,
+            thread: detail.thread
+        ) else {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=missingDraft"
+            )
+            return .missingDraft
+        }
+
+        let signature = Self.secondHalfOutboundQueueSignature(
+            threadID: threadID,
+            draftID: draft.id,
+            counterpartyID: counterparty.id
+        )
+
+        if draft.metadata["second_half_outbound_queue_signature"] == signature,
+           draft.metadata["second_half_outbound_queued"] == "true" {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=alreadyQueued | draft=\(draft.id.uuidString)"
+            )
+            return .alreadyQueued
+        }
+
+        if draft.metadata["second_half_auto_response_queued"] == "true" {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=alreadyQueued | draft=\(draft.id.uuidString) | key=second_half_auto_response_queued"
+            )
+            return .alreadyQueued
+        }
+
+        var draftCopy = draft
+        if draftCopy.status != .approved {
+            draftCopy = draftCopy.approving(at: now)
+            draftCopy.metadata["second_half_user_directed_outbound_approved"] = "true"
+            draftCopy.metadata["second_half_user_directed_outbound_approved_at"] = ISO8601DateFormatter().string(from: now)
+            try await store.saveDraft(draftCopy)
+        }
+
+        let thread = detail.thread
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draftCopy
+        )
+
+        guard eligibility.isEligible else {
+            secSendBridgeLog(
+                "user directed send | thread=\(threadID.uuidString) | earlyReturn=notEligible | reason=\(eligibility.reason)"
+            )
+            return .notEligible
+        }
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draftCopy.id,
+            summary: "User-approved second-half prepared outbound.",
+            rationale: firstNonBlank(
+                detail.secondHalfDisplay?.nextMove?.rationale,
+                detail.secondHalfDisplay?.recommendation,
+                "User confirmed send for a prepared second-half draft."
+            ) ?? "User confirmed send for a prepared second-half draft.",
+            decidedAt: now,
+            decisionNote: userInitiatedOverride
+                ? "User-directed send including past an approval boundary where applicable."
+                : "User-directed send for a prepared second-half draft.",
+            metadata: {
+                var meta: [String: String] = [
+                    "second_half_user_directed_outbound": "true",
+                    "second_half_user_initiated_override": userInitiatedOverride ? "true" : "false"
+                ]
+                if draftCopy.metadata["second_half_generated"] == "true" {
+                    meta["second_half_generated"] = "true"
+                }
+                return meta
+            }()
+        )
+
+        try await store.saveApproval(approval)
+
+        _ = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draftCopy,
+            approval: approval,
+            permit: .userApproved(source: "queuePreparedSecondHalfOutboundSend"),
+            disclosureLevel: .balanced,
+            priority: .userInitiated,
+            now: now
+        )
+
+        draftCopy.metadata["second_half_outbound_queued"] = "true"
+        draftCopy.metadata["second_half_outbound_queue_signature"] = signature
+        draftCopy.metadata["second_half_outbound_queued_at"] = ISO8601DateFormatter().string(from: now)
+        try await store.saveDraft(draftCopy)
+
+        let facade = self
+        let flushAt = now
+        Task {
+            do {
+                let flushResult = try await facade.flushOutbox(now: flushAt)
+                secSendBridgeLog(
+                    "queued outbox flush | thread=\(threadID.uuidString) | userDirected=1 | attempted=\(flushResult.attempted) acknowledged=\(flushResult.acknowledged) failed=\(flushResult.failed)"
+                )
+            } catch {
+                secSendBridgeLog(
+                    "queued outbox flush error non-fatal | thread=\(threadID.uuidString) | userDirected=1 | error=\(error)"
+                )
+            }
+        }
+
+        secSendBridgeLog(
+            "user directed send | thread=\(threadID.uuidString) | queuedOutbound=success | draft=\(draftCopy.id.uuidString) | counterparty=\(counterparty.id)"
+        )
+
+        return .queued
+    }
+
+    /// Re-runs the second-half coordinator outbound bridges (provider auto-respond + requester bridge).
+    public func attemptRequesterSecondHalfAutonomousOutbound(
+        threadID: ExchangeThread.ID,
+        now: Date = Date()
+    ) async {
+        secSendBridgeLog(
+            "user let secretary handle | thread=\(threadID.uuidString) | invoking=runSecondHalfAfterThreadMutation"
+        )
+        await runSecondHalfAfterThreadMutation(
+            threadID: threadID,
+            source: "user_let_secretary_handle",
+            now: now
+        )
+    }
+
+    // MARK: - Threads / views
+
+    /// Lightweight row load for routing/metadata (no second-half, coordination index, or global listThreads).
+    public func loadThreadRow(threadID: ExchangeThread.ID) async throws -> ExchangeThread {
+        try await store.requireThread(id: threadID)
+    }
+
+    public func getThread(
+        threadID: ExchangeThread.ID,
+        hydrationMode: ExchangeThreadHydrationMode = .full
+    ) async throws -> ExchangeModels.ThreadDetail {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "getThread start | threadID=\(threadID.uuidString) hydration=\(hydrationMode.rawValue)"
+        )
+
+        let thread = try await store.requireThread(id: threadID)
+        exchFacadeTTFT("getThread.afterRequireThread", start: start)
+
+        let turns = try await store.listTurns(
+            threadID: threadID,
+            limit: nil,
+            ascending: true
+        )
+        exchFacadeTTFT("getThread.afterListTurns", start: start)
+
+        let approvals = try await loadApprovals(threadID: threadID)
+        let drafts = try await store.listDrafts(threadID: threadID)
+        let matches: [ExchangeMatch]
+        let artifacts: [ExchangeArtifact]
+        let auditRecords: [ExchangeAuditRecord]
+        if hydrationMode == .directMessage {
+            matches = []
+            artifacts = []
+            auditRecords = []
+        } else {
+            matches = try await store.listMatches(threadID: threadID, status: nil)
+            artifacts = try await store.listArtifacts(threadID: threadID)
+            auditRecords = try await store.listAuditRecords(
+                filter: .init(threadID: threadID)
+            )
+        }
+        exchFacadeTTFT("getThread.afterCoreLists", start: start)
+
+        let outboxItems = try await store.listOutboxItems(
+            filter: .init(threadID: threadID)
+        )
+
+        let inboxItems = try await store.listInboxItems(
+            filter: .init(threadID: threadID)
+        )
+        exchFacadeTTFT("getThread.afterTransportLists", start: start)
+
+        let rankedCounterpartyIDs: [ExchangeCounterparty.ID]
+        if hydrationMode == .directMessage {
+            rankedCounterpartyIDs =
+                thread.candidateCounterpartyIDs +
+                drafts.compactMap(\.targetCounterpartyID) +
+                [thread.selectedCounterpartyID].compactMap { $0 }
+        } else {
+            rankedCounterpartyIDs =
+                matches.map(\.counterpartyID) +
+                thread.candidateCounterpartyIDs +
+                drafts.compactMap(\.targetCounterpartyID) +
+                [thread.selectedCounterpartyID].compactMap { $0 }
+        }
+
+        let counterparties = try await loadCounterparties(ids: rankedCounterpartyIDs)
+        exchFacadeTTFT("getThread.afterLoadCounterparties", start: start)
+
+        let latestTurn = turns.last
+
+        let latestApproval = approvals.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }.first
+
+        let latestDraft = drafts.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }.first
+
+        let selectedCounterparty: ExchangeCounterparty?
+        if let sid = thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sid.isEmpty {
+            if let fromList = counterparties.first(where: { $0.id == sid }) {
+                selectedCounterparty = fromList
+            } else {
+                // Note: `??` RHS is `@autoclosure`; do not `await` inside it (non-async context).
+                selectedCounterparty = try? await store.fetchCounterparty(id: sid)
+            }
+        } else if let tid = try await resolveThreadTrustLinkingCounterpartyID(thread: thread) {
+            if let fromList = counterparties.first(where: { $0.id == tid }) {
+                selectedCounterparty = fromList
+            } else {
+                selectedCounterparty = try? await store.fetchCounterparty(id: tid)
+            }
+        } else {
+            selectedCounterparty = nil
+        }
+
+        let selectedMatch: ExchangeMatch?
+        let opportunityHydration: OpportunityHydrationLines
+        let timelineItems: [ExchangeModels.ThreadTimelineItem]
+        var secondHalfDisplay: ExchangeSecondHalfUIAdapter.DisplayModel?
+        let coordinationChildren: [ExchangeModels.CoordinationChildThreadSummary]
+
+        if hydrationMode == .directMessage {
+            selectedMatch = nil
+            let dmAnchor = thread.intent.resolvedOpportunitySurfaceAnchor(
+                selectedOfferID: thread.canonicalCommercialOfferAnchor,
+                selectedPublicProfileID: thread.selectedPublicProfileID,
+                selectedCounterpartyID: thread.selectedCounterpartyID
+            )
+            opportunityHydration = OpportunityHydrationLines(
+                hydratedVisibleLine: nil,
+                hydratedMatchSummary: nil,
+                anchor: dmAnchor,
+                resolvedTitle: nil
+            )
+            timelineItems = []
+            secondHalfDisplay = nil
+            coordinationChildren = []
+            #if DEBUG
+            Swift.print(
+                "[ExchangeFacade.getThread] hydration=directMessage threadID=\(thread.id.uuidString) " +
+                "skipped=secondHalf,coordinationIndex,globalListThreads"
+            )
+            #endif
+        } else {
+            selectedMatch = preferredMatch(
+                for: thread,
+                matches: matches,
+                selectedCounterparty: selectedCounterparty
+            )
+
+            opportunityHydration = await hydrateOpportunitySurfaceLines(
+                thread: thread,
+                bestMatch: selectedMatch,
+                selectedCounterparty: selectedCounterparty
+            )
+
+            timelineItems = makeThreadTimelineItems(
+                thread: thread,
+                turns: turns,
+                approvals: approvals,
+                drafts: drafts,
+                inboxItems: inboxItems,
+                outboxItems: outboxItems
+            )
+
+            secondHalfDisplay = await makeSecondHalfDisplayIfAvailable(
+                thread: thread,
+                turns: turns,
+                matches: matches,
+                selectedCounterparty: selectedCounterparty,
+                latestDraft: latestDraft,
+                latestApproval: latestApproval,
+                projectionPolicy: .cachedOnly
+            )
+
+            if var display = secondHalfDisplay,
+               display.agencyAssessment == nil {
+                let role: ExchangeSecondHalfRole?
+                if let detailRole = detailRoleForSecondHalf(thread: thread) {
+                    role = detailRole
+                } else {
+                    role = await secondHalfFacade.loadFirstEstablishedRole(for: thread.id)
+                }
+
+                if let role,
+                   let agencySnapshot = try? await secondHalfFacade.loadSecondHalfAgencySnapshot(
+                       forThreadID: thread.id,
+                       role: role
+                   ) {
+                    display.agencyAssessment = agencySnapshot.toAssessment()
+                    secondHalfDisplay = display
+                }
+            }
+
+            exchFacadeTTFT("getThread.afterSecondHalfDisplay", start: start)
+
+            if thread.threadRole == .candidateCoordination {
+                coordinationChildren = []
+            } else {
+                let indexedThreads = try await store.listThreads(filter: ExchangeThreadFilter(limit: 500))
+                let coordinationIndex = ExchangeCoordinationThreadIndex(threads: indexedThreads)
+                let childThreads = coordinationIndex.coordinationChildThreads(
+                    forWorkbench: thread.id,
+                    rootThreadID: thread.rootThreadID ?? thread.id
+                )
+                coordinationChildren = try await hydrateCoordinationChildSummaries(childThreads)
+                #if DEBUG
+                Swift.print(
+                    "[ExchangeFacade.getThread] threadID=\(thread.id.uuidString) " +
+                    "threadRole=\(thread.threadRole.rawValue) " +
+                    "childSummaryCount=\(coordinationChildren.count)"
+                )
+                #endif
+            }
+        }
+
+        let hasRenderableOutboundDraft = ExchangeMessageDraft.hasUserFacingRenderableExternalOutboundDraft(
+            in: drafts,
+            thread: thread,
+            turns: turns
+        )
+
+        let summary = threadDetailSummary(
+            for: thread,
+            latestTurn: latestTurn,
+            latestApproval: latestApproval,
+            selectedCounterparty: selectedCounterparty,
+            hydratedSearchSurfaceLine: opportunityHydration.hydratedVisibleLine,
+            hasUserFacingRenderableOutboundDraft: hasRenderableOutboundDraft
+        )
+
+        if hydrationMode == .directMessage {
+            exchFacadeTTFT("getThread.afterDirectMessageLightPath", start: start)
+        }
+
+        let detail = ExchangeModels.ThreadDetail(
+            thread: thread,
+            turns: turns,
+            approvals: approvals,
+            drafts: drafts,
+            matches: matches,
+            counterparties: counterparties,
+            artifacts: artifacts,
+            outboxItems: outboxItems,
+            inboxItems: inboxItems,
+            auditRecords: auditRecords,
+            timelineItems: timelineItems,
+            summary: summary,
+            interpretationSummary: thread.interpretation?.userSummary,
+            interpretationQuestion: thread.interpretation?.userQuestion,
+            interpretationNextStep: thread.interpretation?.userNextStep,
+            semanticTags: thread.interpretation?.semanticTags ?? [],
+            discoveryKeywords: thread.interpretation?.discoveryKeywords ?? [],
+            targetTags: thread.interpretation?.targetTags ?? [],
+            shouldFederate: thread.interpretation?.shouldFederate ?? false,
+            selectedCounterparty: selectedCounterparty,
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedOfferID: thread.selectedOfferID,
+            selectedMatch: selectedMatch,
+            workTrace: makeWorkTraceCard(for: thread),
+            secondHalfDisplay: secondHalfDisplay,
+            coordinationChildren: coordinationChildren
+        )
+
+        exchFacadeTTFT("getThread.detailBuilt", start: start)
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "getThread done | elapsed=\(elapsedMs)ms | state=\(thread.state.phaseTitle) | turns=\(turns.count) | approvals=\(approvals.count) | drafts=\(drafts.count) | matches=\(matches.count) | inbox=\(inboxItems.count) | outbox=\(outboxItems.count) | secondHalf=\(secondHalfDisplay != nil)"
+        )
+
+        return detail
+    }
+
+    // MARK: - Thread situation (read-only canonical substrate)
+
+    /// Resolved seller-surface lookups plus `ExchangeModels.ThreadDetail` assembly.
+    /// Does not mutate the store beyond read paths used for offer/profile fetch.
+    public func threadSituation(
+        from detail: ExchangeModels.ThreadDetail
+    ) async throws -> ExchangeThreadSituation {
+        let resolvedOffer: ExchangeOffer?
+        if let offerID = detail.selectedOfferID {
+            resolvedOffer = try await store.fetchOffer(id: offerID)
+        } else {
+            resolvedOffer = nil
+        }
+
+        let resolvedProfile: ExchangePublicNodeProfile?
+        if let profileID = detail.selectedPublicProfileID {
+            resolvedProfile = try await store.fetchPublicProfile(id: profileID)
+        } else {
+            resolvedProfile = nil
+        }
+
+        var situ = ExchangeThreadSituationBuilder.build(
+            detail: detail,
+            resolvedOffer: resolvedOffer,
+            resolvedPublicProfile: resolvedProfile
+        )
+        
+        var enrichedDisplay = detail.secondHalfDisplay
+
+        if var display = enrichedDisplay,
+           display.agencyAssessment == nil {
+            let role: ExchangeSecondHalfRole?
+            if let detailRole = detailRoleForSecondHalf(thread: detail.thread) {
+                role = detailRole
+            } else {
+                role = await secondHalfFacade.loadFirstEstablishedRole(for: detail.thread.id)
+            }
+
+            if let role,
+               let agencySnapshot = try? await secondHalfFacade.loadSecondHalfAgencySnapshot(
+                   forThreadID: detail.thread.id,
+                   role: role
+               ) {
+                display.agencyAssessment = agencySnapshot.toAssessment()
+                enrichedDisplay = display
+            }
+        }
+
+        if let display = enrichedDisplay,
+           let agency = display.agencyAssessment {
+            situ = ExchangeThreadSituationBuilder.applyingPass2Assessment(
+                situ,
+                assessment: agency,
+                roleLabel: display.roleLabel
+            )
+        }
+
+        if let display = enrichedDisplay {
+            let outboundGate = ExchangeAgencyPlanner.evaluateAutonomousOutboundGate(display: display)
+            if outboundGate.allowed == false {
+                let hold = ExchangeAgencyPlanner.userFacingAutonomyHold(from: outboundGate)
+                situ.autonomyHoldLine = hold.line
+                situ.autonomyHoldReason = hold.reason
+            }
+        }
+
+        if detail.thread.metadata["inbound_requires_verified_context_hold"] == "true" {
+            situ.autonomyHoldLine = "Secretary held back because it did not have enough verified context to send safely."
+            situ.autonomyHoldReason = "Reason: missing verified context."
+        }
+
+        if let posture = try await deriveLocalTrustPosture(detail: detail, fallbackRouteLabel: situ.trustLine) {
+            situ.trustPostureTitle = posture.title
+            situ.trustPostureSummary = posture.summary
+            situ.trustEvidenceLines = posture.evidenceLines
+            situ.trustCautionLines = posture.cautionLines
+            situ.trustRouteLabel = posture.routeLabel
+            situ.trustIsLedgerBacked = posture.isLedgerBacked
+        }
+
+        return situ
+    }
+
+    /// Canonical provider-authored Details card sections for thread / profile inspection surfaces.
+    public func providerDetailsCard(
+        from detail: ExchangeModels.ThreadDetail,
+        contextTitle: String? = nil
+    ) async throws -> ExchangeProviderDetailsCardDisplay {
+        let resolvedOffer: ExchangeOffer?
+        if let offerID = detail.selectedOfferID {
+            resolvedOffer = try await store.fetchOffer(id: offerID)
+        } else {
+            resolvedOffer = nil
+        }
+
+        let resolvedProfile: ExchangePublicNodeProfile?
+        if let profileID = detail.selectedPublicProfileID {
+            resolvedProfile = try await store.fetchPublicProfile(id: profileID)
+        } else {
+            resolvedProfile = nil
+        }
+
+        let thread = detail.thread
+        let presentationContext = ExchangeProviderDetailsPresentationContextResolver.derive(from: thread)
+        let surfaceLead = ExchangePresentationSurfaceLead.resolve(
+            selectedOfferID: thread.selectedOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID
+        )
+
+        ExchangeProviderDetailsCardDebugLog.logFacadeRequest(
+            source: "threadFacade",
+            threadID: detail.thread.id.uuidString,
+            selectedOfferID: detail.selectedOfferID,
+            selectedProfileID: detail.selectedPublicProfileID,
+            contextTitle: contextTitle
+        )
+        ExchangeProviderDetailsCardDebugLog.logPresentationContext(
+            source: "threadFacade",
+            presentationContext: presentationContext,
+            lane: ExchangeThreadLaneResolver.lane(for: thread),
+            queryIntentClass: thread.facets?.queryIntentClass ?? thread.intent.queryIntentClass,
+            surfacePreference: thread.facets?.surfacePreference ?? thread.intent.surfacePreference,
+            surfaceLead: surfaceLead,
+            selectedOfferID: detail.selectedOfferID,
+            selectedProfileID: detail.selectedPublicProfileID,
+            threadID: detail.thread.id.uuidString
+        )
+
+        return ExchangeProviderDetailsCardBuilder.build(
+            ExchangeProviderDetailsCardBuildInput(
+                profile: resolvedProfile,
+                offer: resolvedOffer,
+                selectedOfferID: detail.selectedOfferID,
+                contextTitle: contextTitle,
+                presentationContext: presentationContext
+            ),
+            debugSource: "threadFacade"
+        )
+    }
+
+    /// Convenience: fetch thread snapshot then assemble situation (includes offer/profile lookups when IDs exist).
+    public func getThreadSituation(
+        threadID: ExchangeThread.ID
+    ) async throws -> ExchangeThreadSituation {
+        let detail = try await getThread(threadID: threadID)
+        return try await threadSituation(from: detail)
+    }
+
+    /// Shared list-row assembly for inbox cards and secretary exchange projections.
+    private struct SecretaryListRowAssembly: Sendable {
+        let inboxItem: ExchangeModels.InboxItem
+        let rowSource: SecretaryExchangeListRowSource
+        let turns: [ExchangeTurn]
+    }
+
+    /// Turn loading policy for secretary list row assembly (`listThreads` vs desk snapshot).
+    private enum SecretaryListRowTurnLoading: Sendable {
+        case fullHistoryAscending
+        case deskSnapshotBoundedRecent(limit: Int)
+
+        func fetchTurns(
+            store: any ExchangeStore,
+            threadID: ExchangeThread.ID
+        ) async throws -> [ExchangeTurn] {
+            switch self {
+            case .fullHistoryAscending:
+                return try await store.listTurns(
+                    threadID: threadID,
+                    limit: nil,
+                    ascending: true
+                )
+            case .deskSnapshotBoundedRecent(let limit):
+                let recentDescending = try await store.listTurns(
+                    threadID: threadID,
+                    limit: limit,
+                    ascending: false
+                )
+                return Array(recentDescending.reversed())
+            }
+        }
+
+        var listTurnsLogContext: String {
+            switch self {
+            case .fullHistoryAscending:
+                return "listThreads/fullHistory"
+            case .deskSnapshotBoundedRecent(let limit):
+                return "deskSnapshot/listDeskThreads limit=\(limit) ascending=false"
+            }
+        }
+    }
+
+    /// Top-level secretary desk list eligibility (DM / child coordination / contact-signal lanes excluded).
+    private func isEligibleSecretaryDeskListThread(_ thread: ExchangeThread) -> Bool {
+        if thread.isArchived { return false }
+        if thread.threadRole == .candidateCoordination { return false }
+
+        if thread.metadata["direct_message_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true" {
+            return false
+        }
+
+        if ExchangeContactSignalClassifier.isContactSignalDeskThread(thread) {
+            return false
+        }
+
+        return true
+    }
+
+    private func buildSecretaryListRowAssembly(
+        thread: ExchangeThread,
+        profileTrustLinkHits: inout [String: String],
+        profileTrustLinkMissesNoResolution: inout Set<String>,
+        turnLoading: SecretaryListRowTurnLoading = .fullHistoryAscending
+    ) async throws -> SecretaryListRowAssembly? {
+        if !isEligibleSecretaryDeskListThread(thread) {
+            #if DEBUG
+            if thread.isArchived {
+                let filterReason = "archived_hidden_from_top_level"
+                if ExchangeDebugProjectionLogDedupe.shouldLogThreadsViewFilter(
+                    threadID: thread.id.uuidString,
+                    reason: filterReason
+                ) {
+                    Swift.print(
+                        "[ThreadsViewFilter] threadID=\(thread.id.uuidString) archived=true included=false reason=\(filterReason)"
+                    )
+                }
+            } else if thread.threadRole == .candidateCoordination {
+                let filterReason = "child_coordination_hidden_from_top_level"
+                if ExchangeDebugProjectionLogDedupe.shouldLogThreadsViewFilter(
+                    threadID: thread.id.uuidString,
+                    reason: filterReason
+                ) {
+                    Swift.print(
+                        "[ThreadsViewFilter] threadID=\(thread.id.uuidString) threadRole=candidateCoordination included=false reason=\(filterReason)"
+                    )
+                }
+            } else if thread.metadata["direct_message_thread"] == "true" {
+                let filterReason = "dm_thread_hidden_from_exchange_desk"
+                if ExchangeDebugProjectionLogDedupe.shouldLogThreadsViewFilter(
+                    threadID: thread.id.uuidString,
+                    reason: filterReason
+                ) {
+                    Swift.print(
+                        "[ThreadsViewFilter] threadID=\(thread.id.uuidString) directMessageThread=true included=false reason=\(filterReason)"
+                    )
+                }
+            } else {
+                let filterReason = "contact_signal_hidden_from_exchange_desk"
+                if ExchangeDebugProjectionLogDedupe.shouldLogThreadsViewFilter(
+                    threadID: thread.id.uuidString,
+                    reason: filterReason
+                ) {
+                    Swift.print(
+                        "[ThreadsViewFilter] threadID=\(thread.id.uuidString) contactRequestThread=true included=false reason=\(filterReason)"
+                    )
+                }
+            }
+            #endif
+            return nil
+        }
+
+        #if DEBUG
+        exchFacadeLog(
+            "[ExchangeFacade] buildSecretaryListRowAssembly turnLoad context=\(turnLoading.listTurnsLogContext) thread=\(thread.id.uuidString)"
+        )
+        #endif
+
+        let allTurns = try await turnLoading.fetchTurns(store: store, threadID: thread.id)
+
+        _ = allTurns.last
+        let requestTurnOnly: String? = {
+            if thread.threadRole == .candidateCoordination,
+               let query = ExchangeThreadSearchQueryDisplay.displaySearchQuery(for: thread, turns: allTurns)?.text {
+                return query
+            }
+            if thread.threadRole == .umbrellaSearch {
+                return ExchangeThreadCardTitleProjection.latestRequestCapturedText(from: allTurns)
+                    ?? capturedRequestText(from: allTurns)
+            }
+            return capturedRequestText(from: allTurns)
+        }()
+        let clarificationQuestion = currentClarificationQuestion(for: thread)
+
+        let latestApproval = try await store.fetchLatestApproval(threadID: thread.id)
+        let drafts = try await store.listDrafts(threadID: thread.id)
+        let matches = try await store.listMatches(threadID: thread.id, status: nil)
+
+        let projectedTrustLinkingCounterpartyID = try await projectedInboxTrustLinkingCounterpartyID(
+            thread: thread,
+            profileLinkHits: &profileTrustLinkHits,
+            profileLinkMissesNoResolution: &profileTrustLinkMissesNoResolution
+        )
+
+        let selectedCounterparty = try await loadSelectedCounterparty(for: thread)
+        let counterpartyForInboxUI: ExchangeCounterparty?
+        if let selectedCounterparty {
+            counterpartyForInboxUI = selectedCounterparty
+        } else if let linkID = projectedTrustLinkingCounterpartyID {
+            counterpartyForInboxUI = try await store.fetchCounterparty(id: linkID)
+        } else {
+            counterpartyForInboxUI = nil
+        }
+
+        // Latest draft row for ordering, delivery/subtitle helpers, and non-user-facing metadata only.
+        // User-facing “draft ready / review” truth is `hasActionableExternalOutboundDraft`, not `latestDraft != nil`.
+        let latestDraft = drafts.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }.first
+
+        let hasActionableExternalOutboundDraft = ExchangeMessageDraft.hasUserFacingRenderableExternalOutboundDraft(
+            in: drafts,
+            thread: thread,
+            turns: allTurns
+        )
+
+        let bestMatch = preferredMatch(
+            for: thread,
+            matches: matches,
+            selectedCounterparty: counterpartyForInboxUI
+        )
+
+        let opportunityHydration = await hydrateOpportunitySurfaceLines(
+            thread: thread,
+            bestMatch: bestMatch,
+            selectedCounterparty: counterpartyForInboxUI
+        )
+
+        let interpretation = thread.interpretation
+
+        let isProviderInboundDesk =
+            thread.metadata["inbound_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "true"
+        let inboundRequesterPreview = latestInboundRequesterPreview(from: allTurns)
+        let inboundSenderLabel = inboundSenderDisplayLabel(counterparty: counterpartyForInboxUI)
+
+        let titlePick: ExchangeThreadCardTitleProjection.TitlePick = {
+            if isProviderInboundDesk {
+                return ExchangeThreadCardTitleProjection.inboundProviderInquiryTitlePick(
+                    inboundRequesterAsk: inboundRequesterPreview,
+                    inquirySummary: providerInboundInquirySummary(for: thread),
+                    hydratedOpportunityTitle: opportunityHydration.resolvedTitle,
+                    inboundSenderDisplay: inboundSenderLabel,
+                    threadStoredTitle: thread.title,
+                    threadID: thread.id,
+                    surface: "threads"
+                )
+            }
+            return ExchangeThreadCardTitleProjection.inboxCardTitle(
+                requestCapturedFromTurn: requestTurnOnly,
+                interpretationUserQuestion: interpretation?.userQuestion,
+                threadStoredTitle: thread.title,
+                draftedSubject: hasActionableExternalOutboundDraft ? draftedSubject(from: latestDraft) : nil,
+                hydratedOpportunityTitle: opportunityHydration.resolvedTitle,
+                prioritizeHydratedOpportunityTitle: false,
+                threadID: thread.id,
+                surface: "threads"
+            )
+        }()
+
+        let opportunityShortForSubtitle = inboxOpportunityShortLine(
+            hydratedVisible: opportunityHydration.hydratedVisibleLine,
+            primaryCardTitle: titlePick.title
+        )
+
+        let secondHalfDisplay = await makeSecondHalfDisplayIfAvailable(
+            thread: thread,
+            turns: allTurns,
+            matches: matches,
+            selectedCounterparty: counterpartyForInboxUI,
+            latestDraft: latestDraft,
+            latestApproval: latestApproval,
+            projectionPolicy: .cachedOnly
+        )
+
+        let stateTitle = inboxStateTitle(
+            for: thread,
+            latestApproval: latestApproval,
+            hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+            inboundPreviewLine: inboundRequesterPreview,
+            secondHalfDisplay: secondHalfDisplay
+        )
+
+        let subtitle = ExchangeThreadCardTitleProjection.inboxCardSubtitle(
+            primaryTitle: titlePick.title,
+            primaryStatusLine: stateTitle,
+            deliveryStatusText: deliveryStatusText(
+                for: thread,
+                latestApproval: latestApproval,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+                secondHalfDisplay: secondHalfDisplay
+            ),
+            outcomeStatusText: outcomeStatusText(for: thread),
+            opportunityShortLine: opportunityShortForSubtitle,
+            requesterMessagePreview: inboundRequesterPreview,
+            threadID: thread.id,
+            surface: "threads"
+        )
+
+        let requiresHumanDecision =
+            thread.requiresHumanDecision ||
+            latestApproval?.status == .pending
+
+        let clarificationPromptValue = clarificationPrompt(
+            for: thread,
+            clarificationQuestion: clarificationQuestion
+        )
+
+        let nextStepTextValue = nextStepText(
+            for: thread,
+            latestApproval: latestApproval,
+            hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+            clarificationQuestion: clarificationQuestion
+        )
+
+        let dedicatedApprovalSheetFromSecondHalf: Bool = {
+            guard let sh = secondHalfDisplay else { return false }
+            if sh.hasDecisionPacket { return true }
+            if sh.boundary.requiresHumanApproval { return true }
+            if sh.escalationReason?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil {
+                return true
+            }
+            return false
+        }()
+
+        let prefersPreparedUserDirectedOutboundSend =
+            latestApproval?.status != .pending &&
+            hasActionableExternalOutboundDraft &&
+            !dedicatedApprovalSheetFromSecondHalf &&
+            Self.pickUserDirectedOutboundDraftForPreparedSend(
+                drafts: drafts,
+                preferredDraftID: nil,
+                thread: thread
+            ) != nil
+
+        async let offerForListRow: ExchangeOffer? = {
+            guard let oid = thread.selectedOfferID else { return nil }
+            return try await store.fetchOffer(id: oid)
+        }()
+        async let profileForListRow: ExchangePublicNodeProfile? = {
+            guard let pid = thread.selectedPublicProfileID else { return nil }
+            return try await store.fetchPublicProfile(id: pid)
+        }()
+        let (resolvedOfferForSurfaceList, resolvedPublicProfileForSurfaceList) = try await (offerForListRow, profileForListRow)
+        let surfaceListImageURLCandidates = ExchangeInboxItemSurfaceImageCandidates.build(
+            resolvedOffer: resolvedOfferForSurfaceList,
+            resolvedPublicProfile: resolvedPublicProfileForSurfaceList,
+            counterpartyProfilePrimaryImageURL: counterpartyForInboxUI?.publicProfile?.primaryImageURL,
+            matchMetadata: bestMatch?.metadata ?? [:],
+            selectedOfferID: thread.selectedOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID
+        )
+
+        let alternateCandidateHeadlines = alternateCandidateHeadlinesForListProjection(
+            matches: matches,
+            thread: thread,
+            limit: 3
+        )
+
+        let inboxItem = ExchangeModels.InboxItem(
+            threadID: thread.id,
+            title: titlePick.title,
+            capturedRequestText: requestTurnOnly,
+            subtitle: subtitle,
+            state: thread.state,
+            stateTitle: stateTitle,
+            updatedAt: thread.updatedAt,
+            requiresHumanDecision: requiresHumanDecision,
+            hasFailure: thread.hasFailure,
+            visibleSummary: inboxVisibleSummary(
+                for: thread,
+                latestApproval: latestApproval,
+                selectedCounterparty: counterpartyForInboxUI,
+                hydratedSearchSurfaceLine: opportunityHydration.hydratedVisibleLine,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft
+            ),
+            selectedCounterpartyID: projectedTrustLinkingCounterpartyID,
+            selectedCounterpartyName: {
+                if let cp = counterpartyForInboxUI {
+                    if let t = opportunityHydration.resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !t.isEmpty {
+                        return t
+                    }
+                    return counterpartyPublicSurfaceHeadline(cp) ?? cp.bestDisplayLine
+                }
+                if let t = opportunityHydration.resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !t.isEmpty {
+                    return t
+                }
+                return nil
+            }(),
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedOfferID: thread.selectedOfferID,
+            latestMatchID: bestMatch?.id,
+            latestMatch: bestMatch,
+            candidateCount: thread.candidateCounterpartyIDs.count,
+            alternateCandidateHeadlines: alternateCandidateHeadlines,
+            hasPendingApproval: latestApproval?.status == .pending,
+            // Row-presence only (`listDrafts` non-empty after sort); use `hasActionableExternalOutboundDraft` for UI draft truth.
+            hasDraft: latestDraft != nil,
+            hasActionableExternalOutboundDraft: hasActionableExternalOutboundDraft,
+            awaitingReply: isAwaitingReply(thread.state),
+            latestFailureSummary: thread.latestFailure?.summary,
+            deliveryStatusText: deliveryStatusText(
+                for: thread,
+                latestApproval: latestApproval,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+                secondHalfDisplay: secondHalfDisplay
+            ),
+            outcomeStatusText: outcomeStatusText(for: thread),
+            trustPathSummary: trustPathSummary(
+                for: thread,
+                selectedCounterparty: counterpartyForInboxUI
+            ),
+            requiresAttentionReason: requiresAttentionReason(
+                for: thread,
+                latestApproval: latestApproval,
+                clarificationQuestion: clarificationQuestion,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft
+            ),
+            nextStepText: nextStepTextValue,
+            selectedMatchSummary: opportunityHydration.hydratedMatchSummary
+                ?? selectedMatchSummary(
+                    for: thread,
+                    bestMatch: bestMatch,
+                    selectedCounterparty: counterpartyForInboxUI
+                ),
+            selectedMatchWhy: selectedMatchWhy(
+                for: thread,
+                bestMatch: bestMatch,
+                selectedCounterparty: counterpartyForInboxUI
+            ),
+            draftedSubject: hasActionableExternalOutboundDraft ? draftedSubject(from: latestDraft) : nil,
+            draftedBodyPreview: hasActionableExternalOutboundDraft ? draftedBodyPreview(from: latestDraft) : nil,
+            clarificationPrompt: clarificationPromptValue,
+            failureWhatHappened: failureWhatHappened(for: thread),
+            failureWhatDidNotHappen: failureWhatDidNotHappen(for: thread),
+            failureNextMove: failureNextMove(for: thread),
+            interpretationSummary: interpretation?.userSummary,
+            interpretationQuestion: interpretation?.userQuestion,
+            interpretationNextStep: interpretation?.userNextStep,
+            needsClarification: interpretation?.needsClarification ?? false,
+            shouldDiscover: interpretation?.shouldDiscover ?? false,
+            shouldDraft: interpretation?.shouldDraft ?? false,
+            shouldFederate: interpretation?.shouldFederate ?? false,
+            semanticTags: interpretation?.semanticTags ?? [],
+            discoveryKeywords: interpretation?.discoveryKeywords ?? [],
+            targetTags: interpretation?.targetTags ?? [],
+            workTrace: makeWorkTraceCard(for: thread),
+            secondHalfDisplay: secondHalfDisplay,
+            surfaceListImageURLCandidates: surfaceListImageURLCandidates,
+            prefersInboundProviderCardTitleRewrite: isProviderInboundDesk,
+            cardInboundSenderLabel: inboundSenderLabel,
+            cardInboundRequesterPreview: inboundRequesterPreview,
+            isInboundProviderDesk: thread.metadata["inbound_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true",
+            hasFederatedInboundEnvelope: thread.lastInboundEnvelopeID?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil,
+            prefersPreparedUserDirectedOutboundSend: prefersPreparedUserDirectedOutboundSend
+        )
+
+        let rowSource = SecretaryExchangeListRowSource(
+            id: thread.id,
+            updatedAt: thread.updatedAt,
+            titlePick: titlePick,
+            subtitle: subtitle,
+            inboxPhaseTitle: stateTitle,
+            requestCaptured: requestTurnOnly,
+            threadStoredTitle: thread.title,
+            interpretationUserQuestion: interpretation?.userQuestion,
+            clarificationPrompt: clarificationPromptValue,
+            nextStepText: nextStepTextValue,
+            latestDraft: latestDraft,
+            display: secondHalfDisplay,
+            hydrationResolvedTitle: opportunityHydration.resolvedTitle,
+            hydrationVisibleLine: opportunityHydration.hydratedVisibleLine,
+            hydrationMatchSummary: opportunityHydration.hydratedMatchSummary,
+            matchWhy: selectedMatchWhy(
+                for: thread,
+                bestMatch: bestMatch,
+                selectedCounterparty: counterpartyForInboxUI
+            ),
+            thread: thread
+        )
+
+        return SecretaryListRowAssembly(
+            inboxItem: inboxItem,
+            rowSource: rowSource,
+            turns: allTurns
+        )
+    }
+
+    /// Desk snapshot list rows: persisted thread fields + bounded turns only when title/request is missing.
+    /// Skips second-half projection, opportunity hydration fetches, match/draft/approval store walks, and trust-link resolution.
+    private func buildSecretaryDeskListRowAssembly(
+        thread: ExchangeThread
+    ) async throws -> ExchangeModels.InboxItem? {
+        if !isEligibleSecretaryDeskListThread(thread) {
+            return nil
+        }
+
+        let interpretation = thread.interpretation
+        let clarificationQuestion = currentClarificationQuestion(for: thread)
+
+        var turns: [ExchangeTurn] = []
+        var requestTurnOnly: String?
+        var inboundRequesterPreview: String?
+
+        let needsTurnLoad = deskSnapshotTitleNeedsTurnLoad(thread: thread)
+        if needsTurnLoad {
+            turns = try await SecretaryListRowTurnLoading.deskSnapshotBoundedRecent(limit: 5)
+                .fetchTurns(store: store, threadID: thread.id)
+            inboundRequesterPreview = latestInboundRequesterPreview(from: turns)
+        }
+
+        let isProviderInboundDesk =
+            thread.metadata["inbound_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "true"
+
+        let deskRequestResolution: DeskSnapshotUserRequestResolution? = {
+            if isProviderInboundDesk { return nil }
+            return deskSnapshotResolvedUserRequestText(thread: thread, turns: turns)
+        }()
+        requestTurnOnly = deskRequestResolution?.text
+
+        let opportunityHydration = deskLightweightOpportunityLines(thread: thread)
+
+        var counterpartyForInboxUI: ExchangeCounterparty?
+        if let counterpartyID = thread.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            counterpartyForInboxUI = try await store.fetchCounterparty(id: counterpartyID)
+        }
+
+        let hasActionableExternalOutboundDraft = deskSnapshotHasActionableExternalOutboundDraft(thread: thread)
+        let hasDraft = deskSnapshotHasDraftRow(thread: thread)
+        let hasPendingApproval: Bool = {
+            if thread.approval?.status == .pending { return true }
+            if case .awaitingApproval = thread.state { return true }
+            return false
+        }()
+
+        let inboundSenderLabel = inboundSenderDisplayLabel(counterparty: counterpartyForInboxUI)
+
+        let titlePick: ExchangeThreadCardTitleProjection.TitlePick = {
+            if isProviderInboundDesk {
+                return ExchangeThreadCardTitleProjection.inboundProviderInquiryTitlePick(
+                    inboundRequesterAsk: inboundRequesterPreview,
+                    inquirySummary: providerInboundInquirySummary(for: thread),
+                    hydratedOpportunityTitle: opportunityHydration.resolvedTitle,
+                    inboundSenderDisplay: inboundSenderLabel,
+                    threadStoredTitle: thread.title,
+                    threadID: thread.id,
+                    surface: "deskSnapshot"
+                )
+            }
+            return ExchangeThreadCardTitleProjection.inboxCardTitle(
+                requestCapturedFromTurn: requestTurnOnly,
+                interpretationUserQuestion: interpretation?.userQuestion,
+                threadStoredTitle: thread.title,
+                draftedSubject: nil,
+                hydratedOpportunityTitle: opportunityHydration.resolvedTitle,
+                prioritizeHydratedOpportunityTitle: false,
+                threadID: thread.id,
+                surface: "deskSnapshot"
+            )
+        }()
+
+        #if DEBUG
+        logDeskSnapshotTitlePick(
+            thread: thread,
+            storedTitle: thread.title,
+            capturedRequestTextPresent: requestTurnOnly != nil,
+            titlePickSource: isProviderInboundDesk ? titlePick.titleSource : (deskRequestResolution?.source ?? titlePick.titleSource),
+            finalTitle: titlePick.title
+        )
+        #endif
+
+        let opportunityShortForSubtitle = inboxOpportunityShortLine(
+            hydratedVisible: opportunityHydration.hydratedVisibleLine,
+            primaryCardTitle: titlePick.title
+        )
+
+        let stateTitle = inboxStateTitle(
+            for: thread,
+            latestApproval: nil,
+            hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+            inboundPreviewLine: inboundRequesterPreview,
+            secondHalfDisplay: nil
+        )
+
+        let subtitle = ExchangeThreadCardTitleProjection.inboxCardSubtitle(
+            primaryTitle: titlePick.title,
+            primaryStatusLine: stateTitle,
+            deliveryStatusText: deliveryStatusText(
+                for: thread,
+                latestApproval: nil,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+                secondHalfDisplay: nil
+            ),
+            outcomeStatusText: outcomeStatusText(for: thread),
+            opportunityShortLine: opportunityShortForSubtitle,
+            requesterMessagePreview: inboundRequesterPreview,
+            threadID: thread.id,
+            surface: "deskSnapshot"
+        )
+
+        let requiresHumanDecision = thread.requiresHumanDecision || hasPendingApproval
+
+        let clarificationPromptValue = clarificationPrompt(
+            for: thread,
+            clarificationQuestion: clarificationQuestion
+        )
+
+        let nextStepTextValue = nextStepText(
+            for: thread,
+            latestApproval: nil,
+            hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+            clarificationQuestion: clarificationQuestion
+        )
+
+        let selectedCounterpartyName: String? = {
+            if let cp = counterpartyForInboxUI {
+                if let t = opportunityHydration.resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !t.isEmpty {
+                    return t
+                }
+                return counterpartyPublicSurfaceHeadline(cp) ?? cp.bestDisplayLine
+            }
+            if let t = opportunityHydration.resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !t.isEmpty {
+                return t
+            }
+            return nil
+        }()
+
+        return ExchangeModels.InboxItem(
+            threadID: thread.id,
+            title: titlePick.title,
+            capturedRequestText: requestTurnOnly,
+            subtitle: subtitle,
+            state: thread.state,
+            stateTitle: stateTitle,
+            updatedAt: thread.updatedAt,
+            requiresHumanDecision: requiresHumanDecision,
+            hasFailure: thread.hasFailure,
+            visibleSummary: inboxVisibleSummary(
+                for: thread,
+                latestApproval: nil,
+                selectedCounterparty: counterpartyForInboxUI,
+                hydratedSearchSurfaceLine: opportunityHydration.hydratedVisibleLine,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft
+            ),
+            selectedCounterpartyID: thread.selectedCounterpartyID,
+            selectedCounterpartyName: selectedCounterpartyName,
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedOfferID: thread.selectedOfferID,
+            latestMatchID: nil,
+            latestMatch: nil,
+            candidateCount: thread.candidateCounterpartyIDs.count,
+            alternateCandidateHeadlines: [],
+            hasPendingApproval: hasPendingApproval,
+            hasDraft: hasDraft,
+            hasActionableExternalOutboundDraft: hasActionableExternalOutboundDraft,
+            awaitingReply: isAwaitingReply(thread.state),
+            latestFailureSummary: thread.latestFailure?.summary,
+            deliveryStatusText: deliveryStatusText(
+                for: thread,
+                latestApproval: nil,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft,
+                secondHalfDisplay: nil
+            ),
+            outcomeStatusText: outcomeStatusText(for: thread),
+            trustPathSummary: trustPathSummary(
+                for: thread,
+                selectedCounterparty: counterpartyForInboxUI
+            ),
+            requiresAttentionReason: requiresAttentionReason(
+                for: thread,
+                latestApproval: nil,
+                clarificationQuestion: clarificationQuestion,
+                hasUserFacingRenderableOutboundDraft: hasActionableExternalOutboundDraft
+            ),
+            nextStepText: nextStepTextValue,
+            selectedMatchSummary: opportunityHydration.hydratedMatchSummary,
+            selectedMatchWhy: thread.selectedMatchRationale,
+            draftedSubject: nil,
+            draftedBodyPreview: nil,
+            clarificationPrompt: clarificationPromptValue,
+            failureWhatHappened: failureWhatHappened(for: thread),
+            failureWhatDidNotHappen: failureWhatDidNotHappen(for: thread),
+            failureNextMove: failureNextMove(for: thread),
+            interpretationSummary: interpretation?.userSummary,
+            interpretationQuestion: interpretation?.userQuestion,
+            interpretationNextStep: interpretation?.userNextStep,
+            needsClarification: interpretation?.needsClarification ?? false,
+            shouldDiscover: interpretation?.shouldDiscover ?? false,
+            shouldDraft: interpretation?.shouldDraft ?? false,
+            shouldFederate: interpretation?.shouldFederate ?? false,
+            semanticTags: interpretation?.semanticTags ?? [],
+            discoveryKeywords: interpretation?.discoveryKeywords ?? [],
+            targetTags: interpretation?.targetTags ?? [],
+            workTrace: makeWorkTraceCard(for: thread),
+            secondHalfDisplay: nil,
+            surfaceListImageURLCandidates: [],
+            prefersInboundProviderCardTitleRewrite: isProviderInboundDesk,
+            cardInboundSenderLabel: inboundSenderLabel,
+            cardInboundRequesterPreview: inboundRequesterPreview,
+            isInboundProviderDesk: thread.metadata["inbound_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true",
+            hasFederatedInboundEnvelope: thread.lastInboundEnvelopeID?
+                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil,
+            prefersPreparedUserDirectedOutboundSend: false
+        )
+    }
+
+    private func deskSnapshotTitleNeedsTurnLoad(thread: ExchangeThread) -> Bool {
+        if thread.metadata["inbound_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true" {
+            return true
+        }
+
+        let stored = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stored.isEmpty,
+           !ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(stored),
+           !ExchangeUserFacingCopySanitizer.isGenericExchangeTitle(stored) {
+            return false
+        }
+        if let question = thread.interpretation?.userQuestion?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !question.isEmpty,
+           !ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(question) {
+            return false
+        }
+        return true
+    }
+
+    /// Non-template inbound inquiry summary from durable thread intent (desk/list projection only).
+    private func providerInboundInquirySummary(for thread: ExchangeThread) -> String? {
+        let objective = thread.intent.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !objective.isEmpty else { return nil }
+        if ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(objective) { return nil }
+        let normalized = objective.lowercased()
+        if normalized.hasPrefix("review and respond to the inbound") { return nil }
+        return objective
+    }
+
+    private struct DeskSnapshotUserRequestResolution: Sendable {
+        var text: String
+        var source: String
+    }
+
+    /// Desk list user-request text: turn capture first, then durable thread-level sources (no schema changes).
+    private func deskSnapshotResolvedUserRequestText(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> DeskSnapshotUserRequestResolution? {
+        func accept(_ raw: String?, source: String) -> DeskSnapshotUserRequestResolution? {
+            guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+                return nil
+            }
+            let lower = trimmed.lowercased()
+            if lower == "new request" || lower == "exchange request" {
+                return nil
+            }
+            if ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(trimmed) {
+                return nil
+            }
+            if thread.looksLikeInternalSearchQuery(trimmed) {
+                return nil
+            }
+            if ExchangeChildCoordinationRequestText.isDiscoveryOrSelectionSummary(trimmed) {
+                return nil
+            }
+            return DeskSnapshotUserRequestResolution(text: trimmed, source: source)
+        }
+
+        if let captured = deskSnapshotRequestCapturedText(thread: thread, turns: turns),
+           let resolution = accept(captured, source: "capturedTurn") {
+            return resolution
+        }
+
+        if let query = ExchangeThreadSearchQueryDisplay.displaySearchQuery(for: thread, turns: turns)?.text,
+           let resolution = accept(query, source: "displaySearchQuery") {
+            return resolution
+        }
+
+        let human = thread.humanRequesterText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let resolution = accept(human, source: "humanRequesterText") {
+            return resolution
+        }
+
+        if let resolution = accept(thread.intent.objective, source: "objective") {
+            return resolution
+        }
+
+        if let metadata = thread.metadata[ExchangeThread.originalRequesterTextMetadataKey],
+           let resolution = accept(metadata, source: "metadata") {
+            return resolution
+        }
+
+        return nil
+    }
+
+    private func deskSnapshotRequestCapturedText(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> String? {
+        if thread.threadRole == .candidateCoordination,
+           let query = ExchangeThreadSearchQueryDisplay.displaySearchQuery(for: thread, turns: turns)?.text {
+            return query
+        }
+        if thread.threadRole == .umbrellaSearch {
+            return ExchangeThreadCardTitleProjection.latestRequestCapturedText(from: turns)
+                ?? capturedRequestText(from: turns)
+        }
+        return capturedRequestText(from: turns)
+    }
+
+    #if DEBUG
+    private func logDeskSnapshotTitlePick(
+        thread: ExchangeThread,
+        storedTitle: String,
+        capturedRequestTextPresent: Bool,
+        titlePickSource: String?,
+        finalTitle: String?
+    ) {
+        let stored = storedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let storedRejected = ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(stored)
+            || ExchangeUserFacingCopySanitizer.isGenericExchangeTitle(stored)
+        let objective = thread.intent.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        let metadataOriginal = thread.metadata[ExchangeThread.originalRequesterTextMetadataKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let source = titlePickSource ?? "pending"
+        let final = finalTitle ?? "(pending)"
+        exchFacadeLog(
+            "[DeskSnapshotTitlePick] threadID=\(thread.id.uuidString) " +
+            "storedTitle=\(stored) storedTitleRejected=\(storedRejected) " +
+            "capturedRequestTextPresent=\(capturedRequestTextPresent) " +
+            "objectivePresent=\(!objective.isEmpty) metadataOriginalPresent=\(!metadataOriginal.isEmpty) " +
+            "finalTitle=\(final) source=\(source)"
+        )
+    }
+    #endif
+
+    private func deskLightweightOpportunityLines(thread: ExchangeThread) -> OpportunityHydrationLines {
+        let anchorOfferID = thread.canonicalCommercialOfferAnchor
+        let anchor = thread.intent.resolvedOpportunitySurfaceAnchor(
+            selectedOfferID: anchorOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedCounterpartyID: thread.selectedCounterpartyID
+        )
+
+        let resolvedTitle: String? = {
+            if let stored = thread.title.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+               !ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(stored),
+               !ExchangeThreadCardTitleProjection.isExchangeLifecycleStatusTitle(stored) {
+                return stored
+            }
+            if let question = thread.interpretation?.userQuestion?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+               !ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(question) {
+                return question
+            }
+            return nil
+        }()
+
+        let visible = thread.interpretation?.userSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        return OpportunityHydrationLines(
+            hydratedVisibleLine: visible,
+            hydratedMatchSummary: nil,
+            anchor: anchor,
+            resolvedTitle: resolvedTitle
+        )
+    }
+
+    private func deskSnapshotHasDraftRow(thread: ExchangeThread) -> Bool {
+        switch thread.state {
+        case .drafting, .draftReady:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func deskSnapshotHasActionableExternalOutboundDraft(thread: ExchangeThread) -> Bool {
+        switch thread.state {
+        case .draftReady:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Attaches structural child path summaries for History grouping (no per-child store hydration).
+    private func applyDeskCoordinationChildListSummaries(
+        inboxItem: inout ExchangeModels.InboxItem,
+        umbrellaThread: ExchangeThread,
+        index: ExchangeCoordinationThreadIndex
+    ) {
+        guard umbrellaThread.threadRole != .candidateCoordination else {
+            inboxItem.coordinationChildSummaries = []
+            return
+        }
+        let children = index.coordinationChildThreads(
+            forWorkbench: umbrellaThread.id,
+            rootThreadID: umbrellaThread.rootThreadID ?? umbrellaThread.id
+        )
+        inboxItem.coordinationChildSummaries = children.map {
+            ExchangeCoordinationThreadIndex.deskListSummary(for: $0)
+        }
+    }
+
+    /// Copies child selection ids from the in-memory coordination index without match/opportunity store hydration.
+    private func applyDeskLightweightUmbrellaOverlay(
+        inboxItem: inout ExchangeModels.InboxItem,
+        umbrellaThread: ExchangeThread,
+        index: ExchangeCoordinationThreadIndex
+    ) {
+        guard umbrellaThread.threadRole != .candidateCoordination else { return }
+        guard !inboxItem.coordinationChildThreadIDs.isEmpty else { return }
+
+        let childCount = inboxItem.coordinationChildThreadIDs.count
+        guard let bestChild = index.bestChildThread(
+            forWorkbench: umbrellaThread.id,
+            rootThreadID: umbrellaThread.rootThreadID ?? umbrellaThread.id
+        ) else {
+            return
+        }
+
+        inboxItem.candidateCount = max(inboxItem.candidateCount, childCount)
+
+        if let counterpartyID = bestChild.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            inboxItem.selectedCounterpartyID = counterpartyID
+        }
+        if let offerID = bestChild.selectedOfferID?.nilIfBlank {
+            inboxItem.selectedOfferID = offerID
+        }
+        if let profileID = bestChild.selectedPublicProfileID?.nilIfBlank {
+            inboxItem.selectedPublicProfileID = profileID
+        }
+
+        if inboxItem.selectedCounterpartyName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+            let childTitle = bestChild.title.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            if let childTitle,
+               !ExchangeUserFacingCopySanitizer.isGenericExchangeTitle(childTitle) {
+                inboxItem.selectedCounterpartyName = childTitle
+            }
+        }
+    }
+
+    /// Overlays display-only child-coordination fields onto an umbrella list row (does not persist thread selection).
+    private func hydrateUmbrellaInboxItemFromCoordinationChildren(
+        inboxItem: inout ExchangeModels.InboxItem,
+        umbrellaThread: ExchangeThread,
+        index: ExchangeCoordinationThreadIndex
+    ) async throws {
+        guard umbrellaThread.threadRole != .candidateCoordination else { return }
+        guard !inboxItem.coordinationChildThreadIDs.isEmpty else { return }
+
+        let childCount = inboxItem.coordinationChildThreadIDs.count
+        guard let bestChild = index.bestChildThread(
+            forWorkbench: umbrellaThread.id,
+            rootThreadID: umbrellaThread.rootThreadID ?? umbrellaThread.id
+        ) else {
+            return
+        }
+
+        inboxItem.candidateCount = max(inboxItem.candidateCount, childCount)
+
+        let childMatches = try await store.listMatches(threadID: bestChild.id, status: nil)
+        let childCounterparty = try await loadSelectedCounterparty(for: bestChild)
+        let bestMatch = preferredMatch(
+            for: bestChild,
+            matches: childMatches,
+            selectedCounterparty: childCounterparty
+        )
+        let opportunityHydration = await hydrateOpportunitySurfaceLines(
+            thread: bestChild,
+            bestMatch: bestMatch,
+            selectedCounterparty: childCounterparty
+        )
+
+        if let counterpartyID = bestChild.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            inboxItem.selectedCounterpartyID = counterpartyID
+        }
+        if let offerID = bestChild.selectedOfferID?.nilIfBlank {
+            inboxItem.selectedOfferID = offerID
+        }
+        if let profileID = bestChild.selectedPublicProfileID?.nilIfBlank {
+            inboxItem.selectedPublicProfileID = profileID
+        }
+
+        if let childCounterparty {
+            if let resolvedTitle = opportunityHydration.resolvedTitle?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                inboxItem.selectedCounterpartyName = resolvedTitle
+            } else if let headline = counterpartyPublicSurfaceHeadline(childCounterparty)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                inboxItem.selectedCounterpartyName = headline
+            } else {
+                let display = childCounterparty.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !display.isEmpty {
+                    inboxItem.selectedCounterpartyName = display
+                }
+            }
+        } else if let resolvedTitle = opportunityHydration.resolvedTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            inboxItem.selectedCounterpartyName = resolvedTitle
+        }
+
+        if let bestMatch {
+            inboxItem.latestMatch = bestMatch
+            inboxItem.latestMatchID = bestMatch.id
+        }
+
+        if let summary = selectedMatchSummary(
+            for: bestChild,
+            bestMatch: bestMatch,
+            selectedCounterparty: childCounterparty
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            inboxItem.selectedMatchSummary = summary
+        } else if let hydratedSummary = opportunityHydration.hydratedMatchSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            inboxItem.selectedMatchSummary = hydratedSummary
+        }
+
+        let umbrellaImagesEmpty = inboxItem.surfaceListImageURLCandidates.allSatisfy {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if umbrellaImagesEmpty {
+            async let resolvedOffer: ExchangeOffer? = {
+                guard let offerID = bestChild.selectedOfferID else { return nil }
+                return try await store.fetchOffer(id: offerID)
+            }()
+            async let resolvedProfile: ExchangePublicNodeProfile? = {
+                guard let profileID = bestChild.selectedPublicProfileID else { return nil }
+                return try await store.fetchPublicProfile(id: profileID)
+            }()
+            let (offer, profile) = try await (resolvedOffer, resolvedProfile)
+            inboxItem.surfaceListImageURLCandidates = ExchangeInboxItemSurfaceImageCandidates.build(
+                resolvedOffer: offer,
+                resolvedPublicProfile: profile,
+                counterpartyProfilePrimaryImageURL: childCounterparty?.publicProfile?.primaryImageURL,
+                matchMetadata: bestMatch?.metadata ?? [:],
+                selectedOfferID: bestChild.selectedOfferID,
+                selectedPublicProfileID: bestChild.selectedPublicProfileID
+            )
+        }
+    }
+
+    private func applyUmbrellaDiscoveryGradeProjection(
+        inboxItem: inout ExchangeModels.InboxItem,
+        umbrellaThread: ExchangeThread
+    ) {
+        guard case .matchCandidatesWeak = umbrellaThread.state else { return }
+
+        let gradeContext = ExchangeUmbrellaDiscoveryGradeProjection.Context(
+            activatedChildCount: inboxItem.coordinationChildThreadIDs.count,
+            strongestChildSourceRank: 1,
+            strongestChildProofValid: ExchangeUmbrellaDiscoveryGradeProjection.isProofValidForProjection(
+                match: inboxItem.latestMatch,
+                thread: umbrellaThread
+            )
+        )
+        let gradeResolution = ExchangeUmbrellaDiscoveryGradeProjection.resolve(
+            thread: umbrellaThread,
+            context: gradeContext
+        )
+        inboxItem.discoveryProjectedGrade = gradeResolution.projectedGrade
+        if gradeResolution.usesMetadata {
+            if let projectedTitle = ExchangeUmbrellaDiscoveryGradeProjection.inboxStateTitle(for: gradeResolution) {
+                inboxItem.stateTitle = projectedTitle
+            }
+        }
+        ExchangeUmbrellaDiscoveryGradeProjection.logDecision(
+            rootThreadID: umbrellaThread.rootThreadID ?? umbrellaThread.id,
+            resolution: gradeResolution,
+            context: gradeContext,
+            strongestChildOfferID: inboxItem.selectedOfferID
+        )
+    }
+
+    private func hydrateCoordinationChildSummaries(
+        _ childThreads: [ExchangeThread]
+    ) async throws -> [ExchangeModels.CoordinationChildThreadSummary] {
+        var summaries: [ExchangeModels.CoordinationChildThreadSummary] = []
+        summaries.reserveCapacity(childThreads.count)
+        for childThread in childThreads {
+            summaries.append(try await hydratedCoordinationChildSummary(for: childThread))
+        }
+        return summaries
+    }
+
+    private func hydratedCoordinationChildSummary(
+        for childThread: ExchangeThread
+    ) async throws -> ExchangeModels.CoordinationChildThreadSummary {
+        var summary = ExchangeCoordinationThreadIndex.structuralSummary(for: childThread)
+
+        let childMatches = try await store.listMatches(threadID: childThread.id, status: nil)
+        let childCounterparty = try await loadSelectedCounterparty(for: childThread)
+        let bestMatch = preferredMatch(
+            for: childThread,
+            matches: childMatches,
+            selectedCounterparty: childCounterparty
+        )
+        let opportunityHydration = await hydrateOpportunitySurfaceLines(
+            thread: childThread,
+            bestMatch: bestMatch,
+            selectedCounterparty: childCounterparty
+        )
+
+        summary.displayName = coordinationChildDisplayName(
+            counterparty: childCounterparty,
+            resolvedTitle: opportunityHydration.resolvedTitle,
+            bestMatch: bestMatch
+        )
+        summary.headline = coordinationChildHeadline(
+            bestMatch: bestMatch,
+            counterparty: childCounterparty,
+            resolvedTitle: opportunityHydration.resolvedTitle
+        )
+        summary.matchSummary = selectedMatchSummary(
+            for: childThread,
+            bestMatch: bestMatch,
+            selectedCounterparty: childCounterparty
+        ) ?? opportunityHydration.hydratedMatchSummary
+
+        async let resolvedOffer: ExchangeOffer? = {
+            guard let offerID = childThread.selectedOfferID else { return nil }
+            return try await store.fetchOffer(id: offerID)
+        }()
+        async let resolvedProfile: ExchangePublicNodeProfile? = {
+            guard let profileID = childThread.selectedPublicProfileID else { return nil }
+            return try await store.fetchPublicProfile(id: profileID)
+        }()
+        let (offer, profile) = try await (resolvedOffer, resolvedProfile)
+        let imageCandidates = ExchangeInboxItemSurfaceImageCandidates.build(
+            resolvedOffer: offer,
+            resolvedPublicProfile: profile,
+            counterpartyProfilePrimaryImageURL: childCounterparty?.publicProfile?.primaryImageURL,
+            matchMetadata: bestMatch?.metadata ?? [:],
+            selectedOfferID: childThread.selectedOfferID,
+            selectedPublicProfileID: childThread.selectedPublicProfileID
+        )
+        summary.primaryImageURL = imageCandidates.first {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        return summary
+    }
+
+    private func coordinationChildDisplayName(
+        counterparty: ExchangeCounterparty?,
+        resolvedTitle: String?,
+        bestMatch: ExchangeMatch?
+    ) -> String? {
+        if let resolvedTitle = resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return resolvedTitle
+        }
+        if let counterparty {
+            if let headline = counterpartyPublicSurfaceHeadline(counterparty)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                return headline
+            }
+            let display = counterparty.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !display.isEmpty { return display }
+        }
+        if let bestMatch {
+            if let name = matchPublicProfileName(bestMatch)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                return name
+            }
+            if let title = matchOfferTitle(bestMatch)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                return title
+            }
+        }
+        return nil
+    }
+
+    private func coordinationChildHeadline(
+        bestMatch: ExchangeMatch?,
+        counterparty: ExchangeCounterparty?,
+        resolvedTitle: String?
+    ) -> String? {
+        if let bestMatch {
+            if let offerTitle = matchOfferTitle(bestMatch)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                return offerTitle
+            }
+            if let profileHeadline = matchPublicProfileHeadline(bestMatch)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank {
+                return profileHeadline
+            }
+        }
+        if let counterparty,
+           let headline = counterpartyPublicSurfaceHeadline(counterparty)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank,
+           headline != resolvedTitle?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return headline
+        }
+        if let bestMatch {
+            return matchOfferSummary(bestMatch)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+        }
+        return nil
+    }
+
+    public func listThreads(
+        filter: ExchangeThreadFilter = .init()
+    ) async throws -> [ExchangeModels.InboxItem] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listThreads start | requiresHumanDecisionOnly=\(filter.requiresHumanDecisionOnly) | stateFilters=\(filter.states?.map(\.rawValue).joined(separator: ",") ?? "nil") | limit=\(filter.limit?.description ?? "nil")"
+        )
+
+        let threads = try await store.listThreads(filter: filter)
+        exchFacadeTTFT("listThreads.afterListThreads", start: start)
+
+        let coordinationIndex = ExchangeCoordinationThreadIndex(threads: threads)
+
+        var items: [ExchangeModels.InboxItem] = []
+        items.reserveCapacity(threads.count)
+
+        var profileTrustLinkHits: [String: String] = [:]
+        var profileTrustLinkMissesNoResolution: Set<String> = []
+
+        for thread in threads {
+            guard let assembly = try await buildSecretaryListRowAssembly(
+                thread: thread,
+                profileTrustLinkHits: &profileTrustLinkHits,
+                profileTrustLinkMissesNoResolution: &profileTrustLinkMissesNoResolution
+            ) else {
+                continue
+            }
+            var inboxItem = assembly.inboxItem
+            ExchangeCoordinationProjection.applyListFields(
+                to: &inboxItem,
+                thread: thread,
+                index: coordinationIndex
+            )
+            try await hydrateUmbrellaInboxItemFromCoordinationChildren(
+                inboxItem: &inboxItem,
+                umbrellaThread: thread,
+                index: coordinationIndex
+            )
+            applyUmbrellaDiscoveryGradeProjection(
+                inboxItem: &inboxItem,
+                umbrellaThread: thread
+            )
+            items.append(inboxItem)
+        }
+
+        exchFacadeTTFT("listThreads.itemsBuilt", start: start)
+
+        let sorted = items.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.threadID.uuidString < rhs.threadID.uuidString
+        }
+
+        let secondHalfCount = sorted.filter { $0.secondHalfDisplay != nil }.count
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+
+        exchFacadeLog(
+            "listThreads done | elapsed=\(elapsedMs)ms | threadCount=\(threads.count) | inboxItemCount=\(sorted.count) | secondHalfCount=\(secondHalfCount)"
+        )
+
+        return sorted
+    }
+
+    /// Desk snapshot list path: same visible rows as `listThreads`, bounded recent turns for assembly.
+    public func listDeskThreads(
+        filter: ExchangeThreadFilter = .init(),
+        limit: Int? = nil
+    ) async throws -> [ExchangeModels.InboxItem] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listDeskThreads start | requiresHumanDecisionOnly=\(filter.requiresHumanDecisionOnly) | stateFilters=\(filter.states?.map(\.rawValue).joined(separator: ",") ?? "nil") | filterLimit=\(filter.limit?.description ?? "nil") | deskRowLimit=\(limit?.description ?? "nil")"
+        )
+
+        let threads = try await store.listThreads(filter: filter)
+        exchFacadeTTFT("listDeskThreads.afterListThreads", start: start)
+
+        let coordinationIndex = ExchangeCoordinationThreadIndex(threads: threads)
+
+        let eligibleThreads = threads.filter { isEligibleSecretaryDeskListThread($0) }
+        let sortedEligibleThreads = eligibleThreads.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        let threadsForAssembly: [ExchangeThread]
+        if let limit, limit > 0 {
+            threadsForAssembly = Array(sortedEligibleThreads.prefix(limit))
+        } else {
+            threadsForAssembly = sortedEligibleThreads
+        }
+
+        var items: [ExchangeModels.InboxItem] = []
+        items.reserveCapacity(threadsForAssembly.count)
+
+        #if DEBUG
+        let lightRowBuildStart = CFAbsoluteTimeGetCurrent()
+        var lightRowsSkippedTurnLoad = 0
+        #endif
+
+        for thread in threadsForAssembly {
+            guard var inboxItem = try await buildSecretaryDeskListRowAssembly(thread: thread) else {
+                continue
+            }
+            #if DEBUG
+            if !deskSnapshotTitleNeedsTurnLoad(thread: thread) {
+                lightRowsSkippedTurnLoad += 1
+            }
+            #endif
+            ExchangeCoordinationProjection.applyListFields(
+                to: &inboxItem,
+                thread: thread,
+                index: coordinationIndex
+            )
+            applyDeskLightweightUmbrellaOverlay(
+                inboxItem: &inboxItem,
+                umbrellaThread: thread,
+                index: coordinationIndex
+            )
+            applyDeskCoordinationChildListSummaries(
+                inboxItem: &inboxItem,
+                umbrellaThread: thread,
+                index: coordinationIndex
+            )
+            applyUmbrellaDiscoveryGradeProjection(
+                inboxItem: &inboxItem,
+                umbrellaThread: thread
+            )
+            items.append(inboxItem)
+        }
+
+        #if DEBUG
+        let lightRowElapsedMs = Int((CFAbsoluteTimeGetCurrent() - lightRowBuildStart) * 1000)
+        Swift.print(
+            "[DeskSnapshotLightRow] built=\(items.count) skippedHeavySecondHalf=\(items.count) " +
+            "skippedOpportunityDisplay=\(items.count) skippedTurnLoad=\(lightRowsSkippedTurnLoad) " +
+            "elapsed=\(lightRowElapsedMs)ms"
+        )
+        #endif
+
+        exchFacadeTTFT("listDeskThreads.itemsBuilt", start: start)
+
+        let sorted = items.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.threadID.uuidString < rhs.threadID.uuidString
+        }
+
+        let secondHalfCount = sorted.filter { $0.secondHalfDisplay != nil }.count
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+
+        #if DEBUG
+        let limitLabel = limit.map(String.init) ?? "nil"
+        Swift.print(
+            "[DeskSnapshotLimit] inputThreads=\(threads.count) eligible=\(eligibleThreads.count) " +
+            "limit=\(limitLabel) built=\(sorted.count) elapsed=\(elapsedMs)ms"
+        )
+        #endif
+
+        exchFacadeLog(
+            "listDeskThreads done | elapsed=\(elapsedMs)ms | threadCount=\(threads.count) | selectedForAssembly=\(threadsForAssembly.count) | inboxItemCount=\(sorted.count) | secondHalfCount=\(secondHalfCount)"
+        )
+
+        return sorted
+    }
+
+    /// Secretary exchange list projection; additive alongside `listThreads` (same ordering and row inputs).
+    public func listSecretaryExchangeItems(
+        filter: ExchangeThreadFilter = .init()
+    ) async throws -> [SecretaryExchangeItem] {
+        let threads = try await store.listThreads(filter: filter)
+        var profileTrustLinkHits: [String: String] = [:]
+        var profileTrustLinkMissesNoResolution: Set<String> = []
+        var out: [SecretaryExchangeItem] = []
+        out.reserveCapacity(threads.count)
+        for thread in threads {
+            guard let assembly = try await buildSecretaryListRowAssembly(
+                thread: thread,
+                profileTrustLinkHits: &profileTrustLinkHits,
+                profileTrustLinkMissesNoResolution: &profileTrustLinkMissesNoResolution
+            ) else {
+                continue
+            }
+            out.append(
+                SecretaryExchangeDTOBuilder.buildItem(
+                    from: assembly.rowSource,
+                    turns: assembly.turns
+                )
+            )
+        }
+        return out.sorted { lhs, rhs in
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    /// Builds exchange detail DTO from an already-loaded thread snapshot (no extra `getThread`).
+    public func buildSecretaryExchangeDetail(from detail: ExchangeModels.ThreadDetail) -> SecretaryExchangeDetail {
+        SecretaryExchangeDTOBuilder.buildDetail(from: detail)
+    }
+
+    public func getSecretaryExchangeDetail(threadID: ExchangeThread.ID) async throws -> SecretaryExchangeDetail {
+        let detail = try await getThread(threadID: threadID)
+        return buildSecretaryExchangeDetail(from: detail)
+    }
+
+    public func listPendingApprovals(forDeskSnapshot: Bool = false) async throws -> [ExchangeModels.PendingApproval] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("listPendingApprovals start forDeskSnapshot=\(forDeskSnapshot)")
+
+        if forDeskSnapshot {
+            let pendingApprovals = try await store.listLatestPendingApprovals()
+            exchFacadeTTFT("listPendingApprovals.afterPendingQuery", start: start)
+
+            if pendingApprovals.isEmpty {
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                #if DEBUG
+                Swift.print(
+                    "[PendingApprovalsFastPath] forDeskSnapshot=true count=0 elapsed=\(elapsedMs)ms"
+                )
+                #endif
+                exchFacadeLog(
+                    "listPendingApprovals done | elapsed=\(elapsedMs)ms | pendingCount=0 | fastPath=true"
+                )
+                return []
+            }
+
+            var results: [ExchangeModels.PendingApproval] = []
+            results.reserveCapacity(pendingApprovals.count)
+
+            for approval in pendingApprovals {
+                guard let thread = try await store.fetchThread(id: approval.threadID) else {
+                    continue
+                }
+                if thread.isArchived { continue }
+                if shouldSuppressProviderInboundNeedsInputApproval(
+                    thread: thread,
+                    approval: approval
+                ) {
+                    continue
+                }
+
+                let summary = approval.summary.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                    ?? thread.title.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                    ?? "Pending approval"
+
+                results.append(
+                    ExchangeModels.PendingApproval(
+                        threadID: thread.id,
+                        approval: approval,
+                        draft: nil,
+                        summary: summary
+                    )
+                )
+            }
+
+            exchFacadeTTFT("listPendingApprovals.itemsBuilt", start: start)
+
+            let sorted = results.sorted { lhs, rhs in
+                if lhs.approval.updatedAt != rhs.approval.updatedAt {
+                    return lhs.approval.updatedAt > rhs.approval.updatedAt
+                }
+                return lhs.approval.id.uuidString < rhs.approval.id.uuidString
+            }
+
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            #if DEBUG
+            Swift.print(
+                "[PendingApprovalsFastPath] forDeskSnapshot=true count=\(sorted.count) elapsed=\(elapsedMs)ms"
+            )
+            #endif
+            exchFacadeLog(
+                "listPendingApprovals done | elapsed=\(elapsedMs)ms | pendingCount=\(sorted.count) | fastPath=true"
+            )
+            return sorted
+        }
+
+        let threads = try await store.listThreads(
+            filter: .init(requiresHumanDecisionOnly: true)
+        )
+        exchFacadeTTFT("listPendingApprovals.afterListThreads", start: start)
+
+        var results: [ExchangeModels.PendingApproval] = []
+
+        for thread in threads {
+            if thread.isArchived { continue }
+            guard let approval = try await store.fetchLatestApproval(threadID: thread.id),
+                  approval.status == .pending else {
+                continue
+            }
+            if shouldSuppressProviderInboundNeedsInputApproval(
+                thread: thread,
+                approval: approval
+            ) {
+                continue
+            }
+
+            let draft: ExchangeMessageDraft?
+            if let draftID = approval.draftID {
+                draft = try await store.fetchDraft(id: draftID)
+            } else {
+                draft = nil
+            }
+
+            let summary = summaryEngine.approvalSummary(
+                approval: approval,
+                draft: draft
+            )
+
+            results.append(
+                ExchangeModels.PendingApproval(
+                    threadID: thread.id,
+                    approval: approval,
+                    draft: draft,
+                    summary: summary
+                )
+            )
+        }
+
+        exchFacadeTTFT("listPendingApprovals.itemsBuilt", start: start)
+
+        let sorted = results.sorted { lhs, rhs in
+            if lhs.approval.updatedAt != rhs.approval.updatedAt {
+                return lhs.approval.updatedAt > rhs.approval.updatedAt
+            }
+            return lhs.approval.id.uuidString < rhs.approval.id.uuidString
+        }
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "listPendingApprovals done | elapsed=\(elapsedMs)ms | pendingCount=\(sorted.count)"
+        )
+
+        return sorted
+    }
+
+    private func shouldSuppressProviderInboundNeedsInputApproval(
+        thread: ExchangeThread,
+        approval: ExchangeApproval
+    ) -> Bool {
+        guard approval.status == .pending else { return false }
+        guard approval.draftID == nil else { return false }
+
+        let inbound = thread.metadata["inbound_thread"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
+        guard inbound else { return false }
+
+        if case .sending = thread.state { return false }
+        if case .awaitingResponse = thread.state { return false }
+        if let delivery = thread.delivery {
+            switch delivery.status {
+            case .readyToSend, .sending, .sent:
+                return false
+            default:
+                break
+            }
+        }
+
+        let actionRaw = thread.metadata["second_half_next_action"]?.lowercased() ?? ""
+        let commandRaw = thread.metadata["second_half_command"]?.lowercased() ?? ""
+        let stateRaw = thread.metadata["second_half_state"]?.lowercased() ?? ""
+        let reasonRaw = thread.metadata["second_half_boundary_reason"]?.lowercased() ?? ""
+
+        let needsProviderInput =
+            actionRaw.contains("requestuserinput")
+            || actionRaw.contains("askprovideruser")
+            || actionRaw.contains("needsproviderinput")
+            || commandRaw == "needsuserinput"
+            || stateRaw.contains("awaitingrequesterclarification")
+
+        guard needsProviderInput else { return false }
+
+        // Do not suppress explicit escalation pathways even if a draft was not linked.
+        if actionRaw.contains("escalateforapproval") { return false }
+        if reasonRaw.contains("legal") || reasonRaw.contains("policy") || reasonRaw.contains("custom pricing") {
+            return false
+        }
+
+        return true
+    }
+
+    // MARK: - Federation surface
+
+    public func canQueueApprovedOutbound(
+        threadID: ExchangeThread.ID,
+        draftID: ExchangeMessageDraft.ID,
+        counterpartyID: ExchangeCounterparty.ID
+    ) async throws -> ExchangeFederationSendEligibility {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "canQueueApprovedOutbound start | threadID=\(threadID.uuidString) | draftID=\(draftID.uuidString) | counterpartyID=\(counterpartyID)"
+        )
+
+        let thread = try await store.requireThread(id: threadID)
+        let draft = try await store.requireDraft(id: draftID)
+        let counterparty = try await store.requireCounterparty(id: counterpartyID)
+        exchFacadeTTFT("canQueueApprovedOutbound.afterLoads", start: start)
+
+        let result = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        exchFacadeTTFT("canQueueApprovedOutbound.afterEligibility", start: start)
+
+        exchFacadeLog(
+            "canQueueApprovedOutbound done | eligible=\(result.isEligible) | reason=\(result.reason)"
+        )
+
+        return result
+    }
+
+    func queueApprovedOutbound(
+        threadID: ExchangeThread.ID,
+        draftID: ExchangeMessageDraft.ID,
+        approvalID: ExchangeApproval.ID,
+        counterpartyID: ExchangeCounterparty.ID,
+        permit: OutboundQueuePermit,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel,
+        priority: ExchangeDeliveryState.Priority = .userInitiated,
+        now: Date = Date()
+    ) async throws -> ExchangeFederationQueueResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "queueApprovedOutbound start | threadID=\(threadID.uuidString) | draftID=\(draftID.uuidString) | approvalID=\(approvalID.uuidString) | counterpartyID=\(counterpartyID) | priority=\(priority)"
+        )
+
+        let thread = try await store.requireThread(id: threadID)
+        let draft = try await store.requireDraft(id: draftID)
+        let approval = try await store.requireApproval(id: approvalID)
+        let counterparty = try await store.requireCounterparty(id: counterpartyID)
+        exchFacadeTTFT("queueApprovedOutbound.afterLoads", start: start)
+
+        let result = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: permit,
+            disclosureLevel: disclosureLevel,
+            priority: priority,
+            now: now
+        )
+
+        exchFacadeTTFT("queueApprovedOutbound.afterQueue", start: start)
+
+        exchFacadeLog("queueApprovedOutbound done | threadID=\(threadID.uuidString)")
+        return result
+    }
+
+    public func cancelOutbound(
+        outboxItemID: ExchangeOutboxItem.ID,
+        reason: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeFederationCancellationResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "cancelOutbound start | outboxItemID=\(outboxItemID.uuidString) | reason=\(reason ?? "nil")"
+        )
+
+        let result = try await federationService.cancelOutbound(
+            outboxItemID: outboxItemID,
+            reason: reason,
+            now: now
+        )
+
+        exchFacadeTTFT("cancelOutbound.afterCancel", start: start)
+
+        exchFacadeLog("cancelOutbound done | outboxItemID=\(outboxItemID.uuidString)")
+        return result
+    }
+
+    public func flushOutbox(
+        now: Date = Date()
+    ) async throws -> ExchangeFederationFlushResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("flushOutbox start")
+
+        let result = try await federationService.flushOutbox(now: now)
+
+        exchFacadeTTFT("flushOutbox.afterFlush", start: start)
+
+        for threadID in result.outboundRelayConfirmedThreadIDs {
+            await runSecondHalfAfterThreadMutation(
+                threadID: threadID,
+                source: "relayOutboundConfirmed",
+                now: now
+            )
+            await recordDeliveryConfirmedTrustEvidenceIfNeeded(
+                threadID: threadID,
+                now: now
+            )
+            await recordThreadCompletedTrustEvidenceIfNeeded(
+                threadID: threadID,
+                now: now
+            )
+        }
+
+        await recordRecentDeliveryFailuresTrustEvidenceIfNeeded(now: now)
+
+        if result.failed > 0 {
+            let failedItems = (try? await store.listOutboxItems(
+                filter: .init(
+                    phases: [.failed, .incompatible],
+                    activeOnly: false,
+                    limit: 6
+                )
+            )) ?? []
+            for item in failedItems {
+                exchFacadeLog(
+                    "flushOutbox failedSummary | threadID=\(item.threadID.uuidString) | envelopeID=\(item.envelopeID) | phase=\(item.deliveryState.phase.rawValue) | errorCode=\(item.deliveryState.lastErrorCode ?? "nil") | note=\(item.deliveryState.note ?? "nil")"
+                )
+            }
+        }
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "flushOutbox done | elapsed=\(elapsedMs)ms | " +
+            "relayConfirmedThreads=\(result.outboundRelayConfirmedThreadIDs.count)"
+        )
+        return result
+    }
+
+    /// User-authored message to a trusted node counterparty, queued on the standard federation
+    /// outbound path (not `sendAsSecretary` / chat bridge).
+    ///
+    /// - `trustedNodeID`: `ExchangeCounterparty.ID` for the trusted target (same id used by trust edges).
+    /// - `existingThreadID`: optional inbox-linked thread to reuse; must match `trustedNodeID` on the
+    ///   durable thread (`selectedCounterpartyID`) or resolve to it via `selectedPublicProfileID` (same rule as inbox projection).
+    public func sendManualMessageToTrustedNode(
+        trustedNodeID: String,
+        existingThreadID: ExchangeThread.ID?,
+        subject: String?,
+        body: String,
+        attachment: DirectMessageOutboundAttachmentInput? = nil,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel = .balanced,
+        priority: ExchangeDeliveryState.Priority = .userInitiated,
+        now: Date = Date()
+    ) async throws -> ExchangeThread.ID {
+        let trimmedNodeID = trustedNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Trusted node id is missing.")
+        }
+
+        guard !trimmedBody.isEmpty || attachment != nil else {
+            throw ExchangeStoreError.storageFailure(reason: "Message body and attachment are both empty.")
+        }
+
+        let counterparty = try await store.requireCounterparty(id: trimmedNodeID)
+
+        let publicProfile = try await resolveExecutionProfileForTrustedManualSend(
+            counterparty: counterparty,
+            trustedNodeID: trimmedNodeID,
+            now: now
+        )
+
+        var threadID: ExchangeThread.ID
+        if let existingThreadID {
+            let existingInitial = try await store.requireThread(id: existingThreadID)
+            let trimmedSelected = existingInitial.selectedCounterpartyID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank ?? ""
+
+            if trimmedSelected.isEmpty {
+                let resolvedLink = try await resolveThreadTrustLinkingCounterpartyID(thread: existingInitial)
+                guard resolvedLink == trimmedNodeID else {
+                    throw ExchangeStoreError.storageFailure(
+                        reason: "Thread does not match the selected trusted counterparty."
+                    )
+                }
+            } else {
+                guard trimmedSelected == trimmedNodeID else {
+                    throw ExchangeStoreError.storageFailure(
+                        reason: "Thread does not match the selected trusted counterparty."
+                    )
+                }
+            }
+
+            let existingIsDM = existingInitial.metadata["direct_message_thread"] == "true"
+            let existingInbound = existingInitial.metadata["inbound_thread"] == "true"
+            let canReuseExistingForManualDM = existingIsDM && !existingInbound
+
+            if canReuseExistingForManualDM {
+                var existing = existingInitial
+                if trimmedSelected.isEmpty {
+                    existing.selectedCounterpartyID = trimmedNodeID
+                    existing.updatedAt = now
+                    try await store.updateThread(existing)
+                }
+
+                existing = try await store.requireThread(id: existingThreadID)
+                let existingProfileID = existing.selectedPublicProfileID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if existingProfileID.isEmpty {
+                    existing.selectedPublicProfileID = publicProfile.id
+                    existing.updatedAt = now
+                    try await store.updateThread(existing)
+                }
+
+                threadID = existing.id
+            } else {
+                #if DEBUG
+                let draftsForMixed = try await store.listDrafts(threadID: existingThreadID)
+                let hasManualDraft = draftsForMixed.contains { $0.metadata["trusted_node_manual_message"] == "true" }
+                let turnsForMixed = try await store.listTurns(threadID: existingThreadID, limit: 500, ascending: true)
+                let hasManualTurn = turnsForMixed.contains { $0.metadata["trusted_node_manual_message"] == "true" }
+                if hasManualDraft || hasManualTurn {
+                    Swift.print(
+                        "[MixedThreadWarning] threadID=\(existingThreadID.uuidString) hasManualDMTurns=\(hasManualDraft || hasManualTurn) metadataDirectMessage=false reason=historical_wrong_thread_write"
+                    )
+                }
+                #endif
+
+                let resolvedDmThreadID = try await openOrCreateDirectMessageThread(
+                    counterpartyNodeID: trimmedNodeID,
+                    displayName: counterparty.displayName
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .nilIfBlank,
+                    now: now
+                )
+
+                #if DEBUG
+                Swift.print(
+                    "[DMThreadRoutingBasis] source=sendManualMessageToTrustedNode counterparty=\(trimmedNodeID) existingThreadID=\(existingThreadID.uuidString) existingIsDM=\(existingIsDM) existingInbound=\(existingInbound) selectedThreadID=\(resolvedDmThreadID.uuidString) selectedIsDM=true reason=existing_non_dm_redirected_to_dm"
+                )
+                #endif
+
+                var dmThread = try await store.requireThread(id: resolvedDmThreadID)
+                let dmProfileID = dmThread.selectedPublicProfileID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if dmProfileID.isEmpty {
+                    dmThread.selectedPublicProfileID = publicProfile.id
+                    dmThread.updatedAt = now
+                    try await store.updateThread(dmThread)
+                }
+
+                threadID = resolvedDmThreadID
+            }
+        } else {
+            let engine = ExchangeThreadEngine()
+            let intent = ExchangeIntent(
+                kind: .message,
+                mode: .transactional,
+                queryIntentClass: .directOutreach,
+                title: "Message",
+                objective: "Direct message to trusted contact",
+                readiness: .ready,
+                interpretationConfidence: 1.0
+            )
+            let posture = ExchangePosture(privacy: .balanced)
+            let preview = String(trimmedBody.prefix(500))
+            let mutation = engine.beginThread(
+                userText: preview,
+                mode: .transactional,
+                intent: intent,
+                posture: posture,
+                now: now
+            )
+
+            var newThread = mutation.thread
+            newThread.selectedCounterpartyID = trimmedNodeID
+            newThread.selectedPublicProfileID = publicProfile.id
+            newThread.metadata["direct_message_thread"] = "true"
+            ExchangeThreadLaneResolver.applyLane(.directMessage, to: &newThread.metadata)
+
+            let threadToCreate = newThread
+            let turnsToAppend = mutation.turns
+            let createdThreadID = threadToCreate.id
+            try await store.performTransaction {
+                try await store.createThread(threadToCreate)
+                for turn in turnsToAppend {
+                    try await store.appendTurn(turn)
+                }
+            }
+
+            threadID = createdThreadID
+        }
+
+        var thread = try await store.requireThread(id: threadID)
+
+        if attachment != nil {
+            let isDirectMessageThread = thread.metadata["direct_message_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "true"
+            let isInboundThread = thread.metadata["inbound_thread"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == "true"
+            if !isDirectMessageThread || isInboundThread {
+                let dmThreadID = try await openOrCreateDirectMessageThread(
+                    counterpartyNodeID: trimmedNodeID,
+                    displayName: counterparty.displayName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+                    now: now
+                )
+                threadID = dmThreadID
+                thread = try await store.requireThread(id: dmThreadID)
+                let dmProfileID = thread.selectedPublicProfileID?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if dmProfileID.isEmpty {
+                    thread.selectedPublicProfileID = publicProfile.id
+                    thread.updatedAt = now
+                    try await store.updateThread(thread)
+                    thread = try await store.requireThread(id: dmThreadID)
+                }
+            }
+        }
+
+        let isDirectMessageThread = thread.metadata["direct_message_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true"
+        let isInboundThread = thread.metadata["inbound_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true"
+        if isDirectMessageThread, !isInboundThread {
+            try await directMessageSendService.sendTrustedManualMessage(
+                thread: thread,
+                counterparty: counterparty,
+                publicProfile: publicProfile,
+                subject: subject,
+                body: trimmedBody,
+                attachment: attachment,
+                disclosureLevel: disclosureLevel,
+                now: now
+            )
+            return thread.id
+        }
+
+        if attachment != nil {
+            throw ExchangeStoreError.storageFailure(
+                reason: "File attachments can only be sent on a direct message thread."
+            )
+        }
+
+        var draft = ExchangeMessageDraft(
+            threadID: thread.id,
+            kind: .other,
+            audience: .externalCounterparty,
+            subject: subject,
+            body: trimmedBody,
+            posture: thread.posture,
+            targetCounterpartyID: trimmedNodeID,
+            metadata: ["trusted_node_manual_message": "true"]
+        )
+        draft = draft.approving(at: now)
+        try await store.saveDraft(draft)
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Trusted contact message",
+            rationale: "User composed a direct message from the Trust tab.",
+            decidedAt: now,
+            decisionNote: Self.trustedNodeManualMessagePermitSource,
+            metadata: ["trusted_node_manual_message": "true"]
+        )
+        try await store.saveApproval(approval)
+
+        let approvalSnapshot = ExchangeThread.ApprovalSnapshot(
+            status: .approved,
+            requestedAt: now,
+            decidedAt: now,
+            requestedDraftID: draft.id,
+            note: Self.trustedNodeManualMessagePermitSource
+        )
+        thread = thread.settingApproval(approvalSnapshot, at: now)
+        try await store.updateThread(thread)
+
+        thread = try await store.requireThread(id: threadID)
+        draft = try await store.requireDraft(id: draft.id)
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            throw ExchangeStoreError.storageFailure(
+                reason: eligibility.reason
+            )
+        }
+
+        _ = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: .userApproved(source: Self.trustedNodeManualMessagePermitSource),
+            disclosureLevel: disclosureLevel,
+            priority: priority,
+            now: now
+        )
+
+        secSendBridgeLog(
+            "trusted manual message queued | thread=\(thread.id.uuidString) | draft=\(draft.id.uuidString)"
+        )
+
+        return thread.id
+    }
+
+    /// Explicit user-initiated contact request send path.
+    /// Creates outbound introduction payload metadata without auto-creating a trusted edge.
+    public func sendContactRequestToNode(
+        sourceNodeID: String,
+        targetNodeID: String,
+        displayNameOverride: String?,
+        note: String?,
+        now: Date = Date()
+    ) async throws -> ExchangeModels.ContactRequestSendResult {
+        let trimmedSource = sourceNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSource.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Your local node is not ready yet.")
+        }
+        let parse = ManualTrustedContactInputNormalizer.parse(targetNodeID)
+        guard let canonicalTarget = parse.nodeID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank else {
+            throw ExchangeStoreError.storageFailure(reason: "Enter a node id or invite link.")
+        }
+        guard canonicalTarget != trimmedSource else {
+            throw ExchangeStoreError.storageFailure(reason: "You cannot send a contact request to your own node.")
+        }
+
+        var hydratedFromDirectory: ExchangePublicNodeProfile?
+        if let client = directoryClient {
+            do {
+                let request = ExchangeDirectorySearchRequest(
+                    localNodeID: trimmedSource,
+                    mode: .transactional,
+                    intentKind: .message,
+                    queryText: canonicalTarget,
+                    tags: [canonicalTarget],
+                    limit: 16,
+                    scope: .hybridAllowed,
+                    routeRequirement: .any,
+                    accessRequirement: .discoverableOnly
+                )
+                let response = try await client.search(request)
+                if let match = response.matches.first(where: { Self.directoryMatchForManualTrustedContact($0, canonicalNodeID: canonicalTarget) }) {
+                    hydratedFromDirectory = Self.alignedPublicProfileForManualTrustedContact(
+                        match.publicProfile,
+                        canonicalCounterpartyID: canonicalTarget
+                    )
+                }
+            } catch {
+                exchFacadeLog("sendContactRequestToNode directory search skipped | error=\(error)")
+            }
+        }
+
+        let existing = try await store.fetchCounterparty(id: canonicalTarget)
+        let profileHint = hydratedFromDirectory ?? existing?.publicProfile
+        let displayName = displayNameOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            ?? profileHint?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            ?? existing?.displayName.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            ?? canonicalTarget
+
+        let mergedIdentity = ExchangeCounterparty.Identity(
+            nodeID: canonicalTarget,
+            publicKeyID: existing?.identity?.publicKeyID,
+            verification: existing?.identity?.verification ?? .unverified
+        )
+        if let profileToPersist = hydratedFromDirectory {
+            var taggedProfile = profileToPersist
+            ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationProfile(&taggedProfile, now: now)
+            let preliminaryCounterparty = ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationCounterparty(
+                ExchangeCounterparty(
+                    id: canonicalTarget,
+                    createdAt: existing?.createdAt ?? now,
+                    updatedAt: now,
+                    kind: existing?.kind ?? .person,
+                    displayName: displayName,
+                    source: existing?.source ?? .manualEntry,
+                    identity: mergedIdentity,
+                    publicProfile: existing?.publicProfile
+                ),
+                now: now
+            )
+            try await store.upsertCounterparties([preliminaryCounterparty])
+            try await store.savePublicProfile(taggedProfile)
+            hydratedFromDirectory = try await store.fetchPublicProfile(id: profileToPersist.id)
+        }
+        let mergedProfile = hydratedFromDirectory ?? existing?.publicProfile
+        let counterparty = ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationCounterparty(
+            ExchangeCounterparty(
+                id: canonicalTarget,
+                createdAt: existing?.createdAt ?? now,
+                updatedAt: now,
+                kind: existing?.kind ?? .person,
+                displayName: displayName,
+                source: existing?.source ?? .manualEntry,
+                identity: mergedIdentity,
+                publicProfile: mergedProfile
+            ),
+            now: now
+        )
+        try await store.upsertCounterparties([counterparty])
+
+        if let edge = try await store.fetchTrustEdge(sourceNodeID: trimmedSource, targetNodeID: canonicalTarget),
+           edge.revokedAt == nil {
+            throw ExchangeStoreError.storageFailure(
+                reason: "This node is already in your trusted contacts."
+            )
+        }
+
+        if let pending = try await store.fetchPendingOutgoingContactRequest(targetNodeID: canonicalTarget) {
+            #if DEBUG
+            Swift.print("[ContactRequestSendV2][duplicatePending] targetNodeID=\(canonicalTarget)")
+            Swift.print("[ContactRequestSend][duplicatePending] targetNodeID=\(canonicalTarget)")
+            #endif
+            return ExchangeModels.ContactRequestSendResult(
+                targetNodeID: canonicalTarget,
+                threadID: nil,
+                outboxItemID: nil,
+                envelopeID: pending.envelopeID,
+                outgoingContactRequestID: pending.id,
+                hydratedFromDirectory: hydratedFromDirectory != nil
+            )
+        }
+
+        return try await contactSignalSendService.sendFriendRequest(
+            sourceNodeID: trimmedSource,
+            counterparty: counterparty,
+            displayNameOverride: displayNameOverride,
+            note: note,
+            hydratedFromDirectory: hydratedFromDirectory != nil,
+            now: now
+        )
+    }
+
+    /// Resolves a thread-selected counterparty node suitable for the "Connect" action.
+    /// Read-only helper: does not mutate trust state or thread state.
+    public func resolveConnectTargetForThread(
+        threadID: ExchangeThread.ID
+    ) async throws -> ThreadConnectTarget? {
+        let detail = try await getThread(threadID: threadID)
+        let localNodeID = try await store.listPublicProfiles(filter: .init(limit: 1))
+            .first?
+            .nodeID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        func normalizedNode(_ raw: String?) -> String? {
+            raw?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        }
+
+        func sanitizeCandidate(
+            nodeID: String?,
+            displayName: String?,
+            publicProfileID: String?,
+            offerID: String?,
+            reason: String
+        ) -> ThreadConnectTarget? {
+            guard let nodeID = normalizedNode(nodeID) else { return nil }
+            if let localNodeID, localNodeID == nodeID { return nil }
+            return ThreadConnectTarget(
+                nodeID: nodeID,
+                displayName: displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+                publicProfileID: publicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+                offerID: offerID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+                reason: reason
+            )
+        }
+
+        if let selectedCounterpartyID = detail.thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            let selectedCounterparty: ExchangeCounterparty?
+            if let existing = detail.selectedCounterparty {
+                selectedCounterparty = existing
+            } else {
+                selectedCounterparty = try await store.fetchCounterparty(id: selectedCounterpartyID)
+            }
+            let nodeCandidate = selectedCounterparty?.identity?.nodeID ?? selectedCounterparty?.id ?? selectedCounterpartyID
+            if let target = sanitizeCandidate(
+                nodeID: nodeCandidate,
+                displayName: selectedCounterparty?.bestDisplayLine,
+                publicProfileID: detail.selectedPublicProfileID,
+                offerID: detail.selectedOfferID,
+                reason: "selected_counterparty"
+            ) {
+                return target
+            }
+        }
+
+        if let selectedPublicProfileID = detail.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+           let profile = try await store.fetchPublicProfile(id: selectedPublicProfileID) {
+            if let target = sanitizeCandidate(
+                nodeID: profile.counterpartyID ?? profile.nodeID,
+                displayName: profile.displayName,
+                publicProfileID: selectedPublicProfileID,
+                offerID: detail.selectedOfferID,
+                reason: "selected_public_profile"
+            ) {
+                return target
+            }
+        }
+
+        if let selectedOfferID = detail.selectedOfferID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank,
+           let offer = try await store.fetchOffer(id: selectedOfferID) {
+            if let target = sanitizeCandidate(
+                nodeID: offer.nodeID,
+                displayName: detail.selectedCounterparty?.bestDisplayLine,
+                publicProfileID: offer.publicProfileID,
+                offerID: selectedOfferID,
+                reason: "selected_offer"
+            ) {
+                return target
+            }
+        }
+
+        let preferredMatch = detail.selectedMatch ?? detail.matches.first
+        if let match = preferredMatch {
+            if let target = sanitizeCandidate(
+                nodeID: match.counterpartyID,
+                displayName: detail.counterparties.first(where: { $0.id == match.counterpartyID })?.bestDisplayLine,
+                publicProfileID: match.publicProfileID,
+                offerID: match.offerID,
+                reason: detail.selectedMatch != nil ? "selected_match" : "first_match"
+            ) {
+                return target
+            }
+        }
+
+        return nil
+    }
+
+    /// Returns a persisted DM container thread id for this counterparty when one already exists, using the same
+    /// eligibility rules as ``openOrCreateDirectMessageThread`` (no create, no trusted-contact record required).
+    public func resolveExistingDirectMessageThreadIDIfPresent(counterpartyNodeID: String) async throws -> ExchangeThread.ID? {
+        let trimmed = counterpartyNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return try await firstDirectMessageThreadIDMatchingOpenOrCreateRules(
+            trimmedNodeID: trimmed,
+            emitRejectionDebugLogs: false
+        )
+    }
+
+    /// Shared scan used by ``openOrCreateDirectMessageThread`` and ``resolveExistingDirectMessageThreadIDIfPresent``.
+    private func firstDirectMessageThreadIDMatchingOpenOrCreateRules(
+        trimmedNodeID: String,
+        emitRejectionDebugLogs: Bool
+    ) async throws -> ExchangeThread.ID? {
+        let threadItems = try await store.listDirectMessageThreadCandidates(
+            counterpartyNodeID: trimmedNodeID,
+            limit: 16
+        )
+        for item in threadItems {
+            let selectedCounterparty = item.selectedCounterpartyID?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard selectedCounterparty == trimmedNodeID else { continue }
+
+            guard item.metadata["direct_message_thread"] == "true" else {
+                #if DEBUG
+                if emitRejectionDebugLogs {
+                    Swift.print(
+                        "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=nil createdThreadID=nil rejectedOldThreadID=\(item.id.uuidString) reason=not_direct_message_thread"
+                    )
+                }
+                #endif
+                continue
+            }
+            if item.metadata["archived"] == "true" {
+                #if DEBUG
+                if emitRejectionDebugLogs {
+                    Swift.print(
+                        "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=nil createdThreadID=nil rejectedOldThreadID=\(item.id.uuidString) reason=archived"
+                    )
+                }
+                #endif
+                continue
+            }
+            if item.metadata["inbound_thread"] == "true" {
+                #if DEBUG
+                if emitRejectionDebugLogs {
+                    Swift.print(
+                        "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=nil createdThreadID=nil rejectedOldThreadID=\(item.id.uuidString) reason=inbound_thread"
+                    )
+                }
+                #endif
+                continue
+            }
+            guard item.intent.kind == ExchangeIntent.Kind.message else {
+                #if DEBUG
+                if emitRejectionDebugLogs {
+                    Swift.print(
+                        "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=nil createdThreadID=nil rejectedOldThreadID=\(item.id.uuidString) reason=intent_not_message"
+                    )
+                }
+                #endif
+                continue
+            }
+
+            #if DEBUG
+            Swift.print(
+                "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=\(item.id.uuidString) createdThreadID=nil rejectedOldThreadID=nil reason=reused_direct_message_thread"
+            )
+            #endif
+
+            return item.id
+        }
+        return nil
+    }
+
+    /// Resolves an existing direct-message thread for a trusted counterparty, or creates one without
+    /// running discovery/search. Uses `ExchangeThread` as the durable container.
+    public func openOrCreateDirectMessageThread(
+        counterpartyNodeID: String,
+        displayName: String?,
+        now: Date = Date()
+    ) async throws -> ExchangeThread.ID {
+        let trimmedNodeID = counterpartyNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNodeID.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Counterparty node id is missing.")
+        }
+
+        if try await store.fetchCounterparty(id: trimmedNodeID) != nil {
+            #if DEBUG
+            exchFacadeLog(
+                "[DMRoute][counterpartyShellExists] senderNodeID=\(trimmedNodeID) reason=inbound_direct_message"
+            )
+            #endif
+        } else {
+            guard try await inboxHasVerifiedDirectMessageEvidence(counterpartyNodeID: trimmedNodeID) else {
+                throw ExchangeStoreError.storageFailure(
+                    reason: "This contact is not saved yet. Add it to Trusted first."
+                )
+            }
+            try await upsertMinimalRelayCounterpartyShellForInboundDirectMessageOpen(
+                counterpartyNodeID: trimmedNodeID,
+                displayName: displayName,
+                now: now
+            )
+            #if DEBUG
+            exchFacadeLog(
+                "[DMRoute][counterpartyShellCreated] senderNodeID=\(trimmedNodeID) reason=inbound_direct_message"
+            )
+            #endif
+        }
+
+        let counterparty = try await store.requireCounterparty(id: trimmedNodeID)
+
+        if let existing = try await firstDirectMessageThreadIDMatchingOpenOrCreateRules(
+            trimmedNodeID: trimmedNodeID,
+            emitRejectionDebugLogs: true
+        ) {
+            let loaded = try await store.requireThread(id: existing)
+            guard let pub = counterparty.publicProfile else {
+                return existing
+            }
+            let repair = DirectMessageThreadExecutionBasis.repairedThreadForTrustedManualSend(
+                thread: loaded,
+                counterparty: counterparty,
+                publicProfile: pub,
+                now: now
+            )
+            if repair.mutated {
+                try await store.updateThread(repair.thread)
+                #if DEBUG
+                Swift.print(
+                    "[DMThreadMetadataSanitize] threadID=\(existing.uuidString) " +
+                        "clearedSelectedProfile=\(repair.clearedSelectedPublicProfileID ?? "nil") " +
+                        "clearedSelectedOffer=\(repair.clearedSelectedOfferID ?? "nil") " +
+                        "reason=dm_open_reuse_basis"
+                )
+                #endif
+            }
+            return existing
+        }
+
+        let engine = ExchangeThreadEngine()
+        let cleanedName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = cleanedName.isEmpty ? "Message" : "Message \(cleanedName)"
+        let intent = ExchangeIntent(
+            kind: .message,
+            mode: .transactional,
+            queryIntentClass: .directOutreach,
+            title: title,
+            objective: "Direct message to trusted contact",
+            readiness: .ready,
+            interpretationConfidence: 1.0
+        )
+        let mutation = engine.beginThread(
+            userText: "Direct message opened.",
+            mode: .transactional,
+            intent: intent,
+            posture: ExchangePosture(privacy: .balanced),
+            now: now
+        )
+
+        var newThread = mutation.thread
+        newThread.selectedOfferID = nil
+        newThread.selectedCounterpartyID = trimmedNodeID
+        if let profileID = counterparty.publicProfile?.id.nilIfBlank {
+            newThread.selectedPublicProfileID = profileID
+        }
+        newThread.metadata["direct_message_thread"] = "true"
+        ExchangeThreadLaneResolver.applyLane(.directMessage, to: &newThread.metadata)
+
+        let threadToCreate = newThread
+        let turnsToAppend = mutation.turns
+        try await store.performTransaction {
+            try await store.createThread(threadToCreate)
+            for turn in turnsToAppend {
+                try await store.appendTurn(turn)
+            }
+        }
+
+        #if DEBUG
+        Swift.print(
+            "[DirectMessageThreadResolve] nodeID=\(trimmedNodeID) providedExistingThreadID=nil reusedThreadID=nil createdThreadID=\(threadToCreate.id.uuidString) rejectedOldThreadID=nil reason=created_direct_message_thread"
+        )
+        #endif
+        return threadToCreate.id
+    }
+
+    /// Opens an existing active thread anchored on the same counterparty + public profile (no selected offer), or creates one.
+    ///
+    /// - Does not queue federation outbound, save drafts, or request approvals.
+    /// - Seeds the thread with `ExchangeThreadEngine.beginThread` only (no user-composed outbound body).
+    /// - Sets `metadata["source"]` = `for_you` and `metadata["surface"]` = `profile` on newly created threads.
+    public func connectForYouProfile(
+        counterpartyNodeID: String,
+        publicProfileID: ExchangePublicNodeProfile.ID?,
+        displayName: String?,
+        localNodeID: String?,
+        now: Date = Date()
+    ) async throws -> ExchangeThread.ID {
+        let trimmedNode = counterpartyNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNode.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Counterparty node id is missing.")
+        }
+
+        let trimmedProfileHint = publicProfileID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        if let existing = try await findExistingForYouProfileLedThread(
+            counterpartyNodeID: trimmedNode,
+            publicProfileIDHint: trimmedProfileHint
+        ) {
+            exchFacadeLog("connectForYouProfile reuse | threadID=\(existing.uuidString)")
+            return existing
+        }
+
+        let sourceNode = localNodeID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        guard let sourceNode, !sourceNode.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Your Exchange node isn’t ready yet.")
+        }
+
+        var hydratedFromDirectory: ExchangePublicNodeProfile?
+        if let client = directoryClient {
+            do {
+                let request = ExchangeDirectorySearchRequest(
+                    localNodeID: sourceNode,
+                    mode: .transactional,
+                    intentKind: .message,
+                    queryText: trimmedNode,
+                    tags: [trimmedNode],
+                    limit: 16,
+                    scope: .hybridAllowed,
+                    routeRequirement: .any,
+                    accessRequirement: .discoverableOnly
+                )
+                let response = try await client.search(request)
+                if let match = response.matches.first(where: { Self.directoryMatchForManualTrustedContact($0, canonicalNodeID: trimmedNode) }) {
+                    hydratedFromDirectory = Self.alignedPublicProfileForManualTrustedContact(
+                        match.publicProfile,
+                        canonicalCounterpartyID: trimmedNode
+                    )
+                }
+            } catch {
+                exchFacadeLog("connectForYouProfile directory search skipped | error=\(String(describing: error))")
+            }
+        }
+
+        let existingCounterparty = try await store.fetchCounterparty(id: trimmedNode)
+        let profileHintForDisplay = hydratedFromDirectory ?? existingCounterparty?.publicProfile
+
+        let overrideDisplay = displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        let resolvedDisplayName: String = {
+            if let overrideDisplay { return overrideDisplay }
+            if let existingCounterparty, !existingCounterparty.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return existingCounterparty.displayName
+            }
+            if let name = profileHintForDisplay?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+                return name
+            }
+            return trimmedNode
+        }()
+
+        let mergedIdentity = ExchangeCounterparty.Identity(
+            nodeID: trimmedNode,
+            publicKeyID: existingCounterparty?.identity?.publicKeyID,
+            verification: existingCounterparty?.identity?.verification ?? .unverified
+        )
+
+        if let profileToPersist = hydratedFromDirectory {
+            var taggedProfile = profileToPersist
+            ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationProfile(&taggedProfile, now: now)
+            let preliminaryCounterparty = ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationCounterparty(
+                ExchangeCounterparty(
+                    id: trimmedNode,
+                    createdAt: existingCounterparty?.createdAt ?? now,
+                    updatedAt: now,
+                    kind: existingCounterparty?.kind ?? .person,
+                    displayName: resolvedDisplayName,
+                    source: existingCounterparty?.source ?? .manualEntry,
+                    identity: mergedIdentity,
+                    publicProfile: existingCounterparty?.publicProfile
+                ),
+                now: now
+            )
+            try await store.upsertCounterparties([preliminaryCounterparty])
+            try await store.savePublicProfile(taggedProfile)
+            hydratedFromDirectory = try await store.fetchPublicProfile(id: profileToPersist.id)
+        }
+
+        var mergedProfile = hydratedFromDirectory ?? existingCounterparty?.publicProfile
+        if mergedProfile == nil, let hint = trimmedProfileHint {
+            mergedProfile = try? await store.fetchPublicProfile(id: hint)
+        }
+        if mergedProfile == nil {
+            mergedProfile = try await store.listPublicProfiles(
+                filter: ExchangePublicProfileFilter(nodeID: trimmedNode, limit: 1)
+            ).first
+        }
+
+        guard let anchorProfileID = mergedProfile?.id.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+            throw ExchangeStoreError.storageFailure(
+                reason: "Public profile is not available to anchor this thread yet. Try again after discovery syncs."
+            )
+        }
+
+        let counterparty = ExchangeCounterparty(
+            id: trimmedNode,
+            createdAt: existingCounterparty?.createdAt ?? now,
+            updatedAt: now,
+            kind: existingCounterparty?.kind ?? .person,
+            displayName: resolvedDisplayName,
+            source: existingCounterparty?.source ?? .manualEntry,
+            identity: mergedIdentity,
+            publicProfile: mergedProfile
+        )
+        try await store.upsertCounterparties([counterparty])
+
+        if let existingAgain = try await findExistingForYouProfileLedThread(
+            counterpartyNodeID: trimmedNode,
+            publicProfileIDHint: anchorProfileID
+        ) {
+            exchFacadeLog("connectForYouProfile reuse-after-hydrate | threadID=\(existingAgain.uuidString)")
+            return existingAgain
+        }
+
+        let engine = ExchangeThreadEngine()
+        let titleBase = resolvedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let connectTitle: String = {
+            if titleBase.isEmpty { return "Connect" }
+            let raw = "Connect · \(titleBase)"
+            return raw.count > 120 ? String(raw.prefix(120)) : raw
+        }()
+        let intent = ExchangeIntent(
+            kind: .message,
+            mode: .relational,
+            queryIntentClass: .socialAffinitySearch,
+            surfacePreference: .affinity,
+            title: connectTitle,
+            objective: "Profile-led connection from For You",
+            readiness: .ready,
+            interpretationConfidence: 1.0
+        )
+        let mutation = engine.beginThread(
+            userText: "",
+            mode: .relational,
+            intent: intent,
+            posture: ExchangePosture(privacy: .balanced),
+            now: now
+        )
+
+        var newThread = mutation.thread
+        newThread.selectedCounterpartyID = trimmedNode
+        newThread.selectedPublicProfileID = anchorProfileID
+        newThread.selectedOfferID = nil
+        ExchangeThreadLaneResolver.applyLane(.socialConnection, to: &newThread.metadata)
+        newThread.metadata["source"] = "for_you"
+        newThread.metadata["surface"] = "profile"
+
+        let threadToCreate = newThread
+        let turnsToAppend = mutation.turns
+        try await store.performTransaction {
+            try await store.createThread(threadToCreate)
+            for turn in turnsToAppend {
+                try await store.appendTurn(turn)
+            }
+        }
+
+        exchFacadeLog("connectForYouProfile created | threadID=\(threadToCreate.id.uuidString) profileID=\(anchorProfileID)")
+        return threadToCreate.id
+    }
+
+    private func findExistingForYouProfileLedThread(
+        counterpartyNodeID: String,
+        publicProfileIDHint: String?
+    ) async throws -> ExchangeThread.ID? {
+        let threads = try await store.listThreads(filter: ExchangeThreadFilter())
+        let hint = publicProfileIDHint?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+
+        let matches = threads.filter { thread in
+            guard Self.isActiveUnresolvedThreadState(thread.state) else { return false }
+            guard thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines) == counterpartyNodeID else {
+                return false
+            }
+            guard thread.selectedOfferID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank == nil else {
+                return false
+            }
+            if let hint {
+                guard thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank == hint else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        return matches.max(by: { $0.updatedAt < $1.updatedAt })?.id
+    }
+
+    private static func isActiveUnresolvedThreadState(_ state: ExchangeState) -> Bool {
+        switch state {
+        case .declined, .resolved:
+            return false
+        default:
+            return true
+        }
+    }
+
+    /// User-authored outbound on the **open exchange thread** (Conversation card on search/inquiry desks).
+    /// Queues through the standard outbox path on `threadID` — not the trusted-node DM lane.
+    public func sendManualConversationMessageOnThread(
+        threadID: ExchangeThread.ID,
+        targetCounterpartyID: String? = nil,
+        subject: String? = nil,
+        body: String,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel = .balanced,
+        priority: ExchangeDeliveryState.Priority = .userInitiated,
+        now: Date = Date()
+    ) async throws -> ExchangeThread.ID {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedBody.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Message body is empty.")
+        }
+
+        var thread = try await store.requireThread(id: threadID)
+        let isDirectMessageThread = thread.metadata["direct_message_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true"
+        let isInboundThread = thread.metadata["inbound_thread"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "true"
+
+        #if DEBUG
+        Swift.print(
+            "[ConversationCardSend] threadID=\(threadID.uuidString) " +
+                "isDirectMessageThread=\(isDirectMessageThread) isInboundThread=\(isInboundThread) " +
+                "route=sameThread bodyChars=\(trimmedBody.count)"
+        )
+        #endif
+
+        if isDirectMessageThread {
+            throw ExchangeStoreError.storageFailure(
+                reason: "Conversation card exchange send cannot target a direct message thread."
+            )
+        }
+        if isInboundThread {
+            throw ExchangeStoreError.storageFailure(
+                reason: "Use sendInboundProviderManualReply for inbound provider threads."
+            )
+        }
+
+        let storedSelectedCounterpartyID = thread.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        let passedTargetCounterpartyID = targetCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+
+        let resolvedNodeID: String
+        let targetResolveSource: String
+        if let storedSelectedCounterpartyID {
+            resolvedNodeID = storedSelectedCounterpartyID
+            targetResolveSource = "stored"
+        } else if let passedTargetCounterpartyID {
+            resolvedNodeID = passedTargetCounterpartyID
+            targetResolveSource = "passed"
+        } else if let linked = try await resolveThreadTrustLinkingCounterpartyID(thread: thread)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            resolvedNodeID = linked
+            targetResolveSource = "profileLink"
+        } else {
+            #if DEBUG
+            Swift.print(
+                "[ConversationCardSend][targetResolve] threadID=\(threadID.uuidString) " +
+                    "storedSelected=nil passedTarget=\(passedTargetCounterpartyID ?? "nil") resolved=nil source=missing"
+            )
+            Swift.print(
+                "[ConversationCardSend][blocked] threadID=\(threadID.uuidString) reason=missingCounterparty"
+            )
+            #endif
+            throw ExchangeStoreError.storageFailure(
+                reason: "This thread does not have a selected contact to message. Set routing on the thread, then try again."
+            )
+        }
+
+        #if DEBUG
+        Swift.print(
+            "[ConversationCardSend][targetResolve] threadID=\(threadID.uuidString) " +
+                "storedSelected=\(storedSelectedCounterpartyID ?? "nil") " +
+                "passedTarget=\(passedTargetCounterpartyID ?? "nil") " +
+                "resolved=\(resolvedNodeID) source=\(targetResolveSource)"
+        )
+        #endif
+
+        if let storedSelectedCounterpartyID,
+           !storedSelectedCounterpartyID.isEmpty,
+           storedSelectedCounterpartyID != resolvedNodeID {
+            throw ExchangeStoreError.storageFailure(
+                reason: "Thread does not match the selected trusted counterparty."
+            )
+        }
+
+        if storedSelectedCounterpartyID == nil {
+            var updated = thread
+            updated.selectedCounterpartyID = resolvedNodeID
+            updated.updatedAt = now
+            try await store.updateThread(updated)
+            thread = try await store.requireThread(id: threadID)
+            #if DEBUG
+            Swift.print(
+                "[ConversationCardSend][targetPersisted] threadID=\(threadID.uuidString) " +
+                    "selectedCounterpartyID=\(resolvedNodeID)"
+            )
+            #endif
+        }
+
+        guard ExchangeOutboundRecipientAnchor.hasRecipientSurface(for: thread) else {
+            #if DEBUG
+            Swift.print(
+                "[ConversationCardSend][blocked] threadID=\(threadID.uuidString) reason=missingThreadContext"
+            )
+            #endif
+            throw ExchangeStoreError.storageFailure(
+                reason: "This thread does not have a selected contact or offer to message yet."
+            )
+        }
+
+        let counterparty = try await store.requireCounterparty(id: resolvedNodeID)
+
+        thread = try await store.requireThread(id: threadID)
+        let profileOnThread = thread.selectedPublicProfileID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        if profileOnThread == nil, let pp = counterparty.publicProfile?.id.nilIfBlank {
+            var updated = thread
+            updated.selectedPublicProfileID = pp
+            updated.updatedAt = now
+            try await store.updateThread(updated)
+            thread = try await store.requireThread(id: threadID)
+        }
+
+        var draft = ExchangeMessageDraft(
+            threadID: thread.id,
+            kind: .inquiry,
+            audience: .externalCounterparty,
+            subject: subject,
+            body: trimmedBody,
+            posture: thread.posture,
+            targetCounterpartyID: resolvedNodeID,
+            metadata: [
+                "conversation_card_manual_outbound": "true",
+            ]
+        )
+        draft = draft.approving(at: now)
+        try await store.saveDraft(draft)
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Conversation message",
+            rationale: "User composed a message from the thread conversation card.",
+            decidedAt: now,
+            decisionNote: Self.conversationCardManualOutboundPermitSource,
+            metadata: [
+                "conversation_card_manual_outbound": "true",
+            ]
+        )
+        try await store.saveApproval(approval)
+
+        let approvalSnapshot = ExchangeThread.ApprovalSnapshot(
+            status: .approved,
+            requestedAt: now,
+            decidedAt: now,
+            requestedDraftID: draft.id,
+            note: Self.conversationCardManualOutboundPermitSource
+        )
+        thread = thread.settingApproval(approvalSnapshot, at: now)
+        try await store.updateThread(thread)
+
+        thread = try await store.requireThread(id: threadID)
+        draft = try await store.requireDraft(id: draft.id)
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            #if DEBUG
+            Swift.print(
+                "[ConversationCardSend][blocked] threadID=\(threadID.uuidString) " +
+                    "reason=sendEligibilityDenied detail=\(eligibility.reason)"
+            )
+            #endif
+            throw ExchangeStoreError.storageFailure(
+                reason: eligibility.reason
+            )
+        }
+
+        let queueResult = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: .userApproved(source: Self.conversationCardManualOutboundPermitSource),
+            disclosureLevel: disclosureLevel,
+            priority: priority,
+            now: now
+        )
+
+        #if DEBUG
+        let surface = ExchangeThreadLaneResolver.conversationSurface(
+            for: ExchangeThreadLaneResolver.lane(for: thread)
+        )
+        Swift.print(
+            "[ConversationCardSend][queued] threadID=\(thread.id.uuidString) surface=\(surface) " +
+                "counterpartyID=\(resolvedNodeID) draftID=\(draft.id.uuidString) " +
+                "outboxID=\(queueResult.outboxItem.id.uuidString)"
+        )
+        #endif
+
+        secSendBridgeLog(
+            "conversation card manual outbound queued | thread=\(thread.id.uuidString) | draft=\(draft.id.uuidString)"
+        )
+
+        return thread.id
+    }
+
+    /// User-authored reply on a **provider inbound** thread: resolves routing from durable thread anchors,
+    /// runs the same eligibility + queue path as ``sendManualMessageToTrustedNode``, without requiring
+    /// ``ExchangeCounterparty.publicProfile`` to be present before send (the federation layer resolves execution profile).
+    public func sendInboundProviderManualReply(
+        existingThreadID: ExchangeThread.ID,
+        subject: String?,
+        body: String,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel = .balanced,
+        priority: ExchangeDeliveryState.Priority = .userInitiated,
+        now: Date = Date()
+    ) async throws -> ExchangeThread.ID {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedBody.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Message body is empty.")
+        }
+
+        var thread = try await store.requireThread(id: existingThreadID)
+        guard thread.metadata["inbound_thread"] == "true" else {
+            throw ExchangeStoreError.storageFailure(
+                reason: "Manual replies from this composer are only for inbound message threads."
+            )
+        }
+
+        let resolvedNodeID: String
+        if let selected = thread.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            resolvedNodeID = selected
+        } else if let linked = try await resolveThreadTrustLinkingCounterpartyID(thread: thread)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            resolvedNodeID = linked
+        } else {
+            throw ExchangeStoreError.storageFailure(
+                reason: "This thread does not have a selected contact to reply to. Set routing on the thread, then try again."
+            )
+        }
+
+        let counterparty = try await store.requireCounterparty(id: resolvedNodeID)
+
+        let trimmedSelected = thread.selectedCounterpartyID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank ?? ""
+
+        if trimmedSelected.isEmpty {
+            var updated = thread
+            updated.selectedCounterpartyID = resolvedNodeID
+            updated.updatedAt = now
+            try await store.updateThread(updated)
+            thread = try await store.requireThread(id: existingThreadID)
+        } else {
+            guard trimmedSelected == resolvedNodeID else {
+                throw ExchangeStoreError.storageFailure(
+                    reason: "Thread does not match the selected trusted counterparty."
+                )
+            }
+        }
+
+        thread = try await store.requireThread(id: existingThreadID)
+        let profileOnThread = thread.selectedPublicProfileID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        if profileOnThread == nil, let pp = counterparty.publicProfile?.id.nilIfBlank {
+            var updated = thread
+            updated.selectedPublicProfileID = pp
+            updated.updatedAt = now
+            try await store.updateThread(updated)
+            thread = try await store.requireThread(id: existingThreadID)
+        }
+
+        var draft = ExchangeMessageDraft(
+            threadID: thread.id,
+            kind: .other,
+            audience: .externalCounterparty,
+            subject: subject,
+            body: trimmedBody,
+            posture: thread.posture,
+            targetCounterpartyID: resolvedNodeID,
+            metadata: [
+                "inbound_provider_manual_reply": "true",
+                "trusted_node_manual_message": "true",
+            ]
+        )
+        draft = draft.approving(at: now)
+        try await store.saveDraft(draft)
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Inbound thread reply",
+            rationale: "User composed a reply from an inbound message thread.",
+            decidedAt: now,
+            decisionNote: Self.inboundProviderManualReplyPermitSource,
+            metadata: [
+                "inbound_provider_manual_reply": "true",
+                "trusted_node_manual_message": "true",
+            ]
+        )
+        try await store.saveApproval(approval)
+
+        let approvalSnapshot = ExchangeThread.ApprovalSnapshot(
+            status: .approved,
+            requestedAt: now,
+            decidedAt: now,
+            requestedDraftID: draft.id,
+            note: Self.inboundProviderManualReplyPermitSource
+        )
+        thread = thread.settingApproval(approvalSnapshot, at: now)
+        try await store.updateThread(thread)
+
+        thread = try await store.requireThread(id: existingThreadID)
+        draft = try await store.requireDraft(id: draft.id)
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            throw ExchangeStoreError.storageFailure(
+                reason: eligibility.reason
+            )
+        }
+
+        _ = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: .userApproved(source: Self.inboundProviderManualReplyPermitSource),
+            disclosureLevel: disclosureLevel,
+            priority: priority,
+            now: now
+        )
+
+        secSendBridgeLog(
+            "inbound provider manual message queued | thread=\(thread.id.uuidString) | draft=\(draft.id.uuidString)"
+        )
+
+        return thread.id
+    }
+
+    /// Permit source for `sendManualMessageToTrustedNode` / outbound queue audit.
+    public static let trustedNodeManualMessagePermitSource = "trusted_node_manual_message"
+
+    /// Permit source for ``sendInboundProviderManualReply``.
+    public static let inboundProviderManualReplyPermitSource = "inbound_provider_manual_reply"
+
+    /// Permit source for ``sendManualConversationMessageOnThread``.
+    public static let conversationCardManualOutboundPermitSource = "conversation_card_manual_outbound"
+    public static let contactRequestSendPermitSource = "contact_request_send"
+
+    /// Payload kind for contact-request acceptance return signal (contact-signal lane).
+    public static let contactRequestAcceptedPayloadKind =
+        ExchangeRelayEnvelope.Payload.Kind.friendRequestAccepted.rawValue
+
+    public func receiveEnvelope(
+        _ envelope: ExchangeRelayEnvelope,
+        route: ExchangeRelayRoute? = nil,
+        receivedAt: Date = Date()
+    ) async throws -> ExchangeFederationReceiveResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "receiveEnvelope start | route=\(route?.routeKey ?? "nil") | receivedAt=\(receivedAt)"
+        )
+
+        let result = try await federationService.receiveEnvelope(
+            envelope,
+            route: route,
+            receivedAt: receivedAt
+        )
+
+        if Self.isInboundContactRequestAcceptanceInboxItem(result.inboxItem) {
+            await processInboundContactRequestAcceptanceIfEligible(
+                item: result.inboxItem,
+                now: receivedAt
+            )
+        }
+
+        exchFacadeTTFT("receiveEnvelope.afterReceive", start: start)
+
+        #if DEBUG
+        let it = result.inboxItem
+        let pLog = it.ordering.parentEnvelopeID ?? "nil"
+        exchFacadeLog(
+            "receiveEnvelope.savedItem | inboxItemID=\(it.id.uuidString) | envelopeID=\(it.envelopeID) | " +
+                "processingState=\(it.processingState.rawValue) | " +
+                "compatibility=\(it.compatibility) | senderNodeID=\(it.senderNodeID ?? "nil") | " +
+                "parentEnvelopeID=\(pLog) | threadID=\(it.threadID?.uuidString ?? "nil")"
+        )
+        #endif
+
+        exchFacadeLog("receiveEnvelope done")
+        return result
+    }
+
+    public func reconcileInbox(
+        now: Date = Date()
+    ) async throws -> ExchangeFederationReconcileResult {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("reconcileInbox start")
+
+        #if DEBUG
+        let preReconcileInbox = try? await store.listInboxItems(filter: .init())
+        exchFacadeLog(
+            "reconcileInbox.preStoreList | allStatesCount=\(preReconcileInbox?.count ?? -1)"
+        )
+        if let preReconcileInbox {
+            for row in preReconcileInbox {
+                let p = row.ordering.parentEnvelopeID ?? "nil"
+                exchFacadeLog(
+                    "reconcileInbox.preStoreRow | id=\(row.id.uuidString) | processingState=\(row.processingState.rawValue) | " +
+                        "compatibility=\(row.compatibility) | threadID=\(row.threadID?.uuidString ?? "nil") | parentEnvelopeID=\(p)"
+                )
+            }
+        }
+        #endif
+
+        let result = try await federationService.reconcileInbox(now: now)
+
+        exchFacadeTTFT("reconcileInbox.afterReconcile", start: start)
+
+        await processPendingInboundContactRequestAcceptanceSignals(now: now)
+
+        await emitSecretaryNotificationsForReconciledInbound(result: result, now: now)
+
+        // Second-half / agency evaluation can take seconds (LLM). It must not block
+        // reconcile return: persistent turns / inbox rows are already visible, and
+        // desk UI refresh was emitted above. Run second-half work asynchronously and
+        // post another refresh when each pass completes.
+        let trustEligibleThreadIDs = Set(result.trustEligibleThreadIDs)
+        for threadID in result.reconciledThreadIDs {
+            Task { [now] in
+                await runSecondHalfAfterThreadMutation(
+                    threadID: threadID,
+                    source: "reconcileInbox",
+                    now: now
+                )
+                if trustEligibleThreadIDs.contains(threadID) {
+                    await recordReplyReceivedTrustEvidenceIfNeeded(
+                        threadID: threadID,
+                        now: now
+                    )
+                    await recordThreadCompletedTrustEvidenceIfNeeded(
+                        threadID: threadID,
+                        now: now
+                    )
+                }
+            }
+        }
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "reconcileInbox done | elapsed=\(elapsedMs)ms | " +
+            "reconciled=\(result.reconciledCount) | deferred=\(result.deferredCount) | " +
+            "rejected=\(result.rejectedCount) | " +
+            "secondHalfTriggered=\(result.reconciledThreadIDs.count)"
+        )
+        return result
+    }
+
+    public func listOutboxItems(
+        filter: ExchangeOutboxFilter = .init()
+    ) async throws -> [ExchangeOutboxItem] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listOutboxItems start | threadID=\(filter.threadID?.uuidString ?? "nil") | phase=\(filter.phases?.map(\.rawValue).joined(separator: ",") ?? "nil") | limit=\(filter.limit?.description ?? "nil")"
+        )
+        let result = try await store.listOutboxItems(filter: filter)
+        exchFacadeTTFT("listOutboxItems.afterList", start: start)
+        exchFacadeLog("listOutboxItems done | count=\(result.count)")
+        return result
+    }
+
+    /// Archives a thread by writing a metadata flag. Does not delete any data.
+    /// All turns, drafts, approvals, outbox items, and audit records are preserved.
+    /// Archived threads are excluded from `listThreads` projection.
+    public func archiveThread(
+        id: ExchangeThread.ID,
+        now: Date = Date()
+    ) async throws {
+        var thread = try await store.requireThread(id: id)
+        guard !thread.isArchived else { return }
+        Self.applyArchiveMetadata(to: &thread, now: now, archivedByParentID: nil)
+        try await store.updateThread(thread)
+        exchFacadeLog("archiveThread | id=\(id.uuidString)")
+    }
+
+    /// Archives one thread, or an entire umbrella search family when `id` is an umbrella workbench.
+    public func archiveThreadRespectingCoordinationFamily(
+        id: ExchangeThread.ID,
+        now: Date = Date()
+    ) async throws {
+        let thread = try await store.requireThread(id: id)
+        if thread.threadRole == .umbrellaSearch {
+            try await archiveUmbrellaSearchFamily(umbrella: thread, now: now)
+        } else {
+            try await archiveThread(id: id, now: now)
+        }
+    }
+
+    private func archiveUmbrellaSearchFamily(
+        umbrella: ExchangeThread,
+        now: Date
+    ) async throws {
+        let rootID = umbrella.rootThreadID ?? umbrella.id
+        let children = try await coordinationFamilyChildren(
+            umbrellaID: umbrella.id,
+            rootID: rootID
+        )
+        var threadsToArchive: [ExchangeThread] = []
+        if !umbrella.isArchived {
+            threadsToArchive.append(umbrella)
+        }
+        threadsToArchive.append(contentsOf: children.filter { !$0.isArchived })
+
+        guard !threadsToArchive.isEmpty else { return }
+
+        try await archiveThreads(
+            threadsToArchive,
+            umbrellaID: umbrella.id,
+            now: now
+        )
+
+        let childIDs = children.map(\.id.uuidString).joined(separator: ",")
+        exchFacadeLog(
+            "archiveUmbrellaSearchFamily | umbrella=\(umbrella.id.uuidString) " +
+            "children=\(children.count) childIDs=\(childIDs)"
+        )
+    }
+
+    private func coordinationFamilyChildren(
+        umbrellaID: ExchangeThread.ID,
+        rootID: ExchangeThread.ID
+    ) async throws -> [ExchangeThread] {
+        let threads = try await store.listThreads(filter: ExchangeThreadFilter(limit: 2_000))
+        return threads.filter { thread in
+            guard thread.threadRole == .candidateCoordination else { return false }
+            if thread.parentThreadID == umbrellaID { return true }
+            if let threadRoot = thread.rootThreadID, threadRoot == rootID { return true }
+            return false
+        }
+    }
+
+    private func archiveThreads(
+        _ threads: [ExchangeThread],
+        umbrellaID: ExchangeThread.ID,
+        now: Date
+    ) async throws {
+        let archivedAt = ISO8601DateFormatter().string(from: now)
+        for var thread in threads {
+            let archivedByParent: ExchangeThread.ID? =
+                thread.id == umbrellaID ? nil : umbrellaID
+            Self.applyArchiveMetadata(
+                to: &thread,
+                now: now,
+                archivedAtISO8601: archivedAt,
+                archivedByParentID: archivedByParent
+            )
+            try await store.updateThread(thread)
+            exchFacadeLog(
+                "archiveThread | id=\(thread.id.uuidString) " +
+                "role=\(thread.threadRole.rawValue) " +
+                "archivedByParent=\(archivedByParent?.uuidString ?? "nil")"
+            )
+        }
+    }
+
+    private static func applyArchiveMetadata(
+        to thread: inout ExchangeThread,
+        now: Date,
+        archivedAtISO8601: String? = nil,
+        archivedByParentID: ExchangeThread.ID?
+    ) {
+        let at = archivedAtISO8601 ?? ISO8601DateFormatter().string(from: now)
+        thread.metadata[ExchangeThreadArchiveMetadata.archivedKey] = "true"
+        thread.metadata[ExchangeThreadArchiveMetadata.archivedAtKey] = at
+        if let archivedByParentID {
+            thread.metadata[ExchangeThreadArchiveMetadata.archivedByParentKey] =
+                archivedByParentID.uuidString.lowercased()
+        }
+    }
+
+    /// Hard-deletes one thread and linked local Exchange rows on this device only.
+    ///
+    /// Does not delete remote relay payloads, public profiles, counterparties, or federation identity.
+    /// Returns `nil` when the thread is already absent (idempotent).
+    public func hardDeleteThreadLocally(
+        threadID: ExchangeThread.ID
+    ) async throws -> ExchangeThreadLocalDeleteReport? {
+        let report = try await store.hardDeleteThreadLocally(id: threadID)
+        if let report {
+            exchFacadeLog(
+                "hardDeleteThreadLocally | id=\(threadID.uuidString) " +
+                "total=\(report.totalDeleted) note=local_only_not_remote"
+            )
+        } else {
+            exchFacadeLog("hardDeleteThreadLocally | id=\(threadID.uuidString) notFound")
+        }
+        return report
+    }
+
+    /// Removes contact-request inbox rows from the pending projection after accept/decline,
+    /// including items already linked or reconciled into a thread (`dismissUnlinkedInboxItem` skips those).
+    private func finalizeContactRequestInboxSurface(
+        itemIDs: [ExchangeInboxItem.ID],
+        accepted: Bool,
+        now: Date
+    ) async throws {
+        for id in itemIDs {
+            guard let item = try await store.fetchInboxItem(id: id) else { continue }
+            switch item.processingState {
+            case .archived, .rejected, .duplicateIgnored:
+                continue
+            default:
+                break
+            }
+            let updated = accepted ? item.archiving(at: now) : item.rejecting(at: now)
+            try await store.saveInboxItem(updated)
+            exchFacadeLog(
+                "finalizeContactRequestInboxSurface | id=\(id.uuidString) | accepted=\(accepted) | from=\(item.processingState.rawValue)"
+            )
+        }
+    }
+
+    /// Archives a linked inbox item (one that has been reconciled into a thread).
+    /// Uses the existing `.archived` processing state on `ExchangeInboxItem`.
+    /// No data is deleted. Unlinked items should use `dismissUnlinkedInboxItem` instead.
+    public func dismissLinkedInboxItem(
+        id: ExchangeInboxItem.ID,
+        now: Date = Date()
+    ) async throws {
+        guard let item = try await store.fetchInboxItem(id: id) else { return }
+        guard item.threadID != nil else { return }
+        guard item.processingState != .archived else { return }
+        let archived = item.archiving(at: now)
+        try await store.saveInboxItem(archived)
+        exchFacadeLog("dismissLinkedInboxItem | id=\(id.uuidString) | state=archived")
+    }
+
+    /// Dismisses an unlinked inbox item that has not been reconciled into a thread.
+    /// Only acts on items that have no `threadID` and are not already rejected or reconciled.
+    /// The item is marked `.deferred` so it will not surface again unless a reconcile pass
+    /// resolves it. This prevents stuck "Waiting to be filed" items from cluttering the inbox.
+    public func dismissUnlinkedInboxItem(
+        id: ExchangeInboxItem.ID,
+        now: Date = Date()
+    ) async throws {
+        guard let item = try await store.fetchInboxItem(id: id) else { return }
+        guard item.threadID == nil else { return }
+        guard item.processingState != .rejected,
+              item.processingState != .reconciledIntoThread else { return }
+        let deferred = item.markingDeferred(at: now)
+        try await store.saveInboxItem(deferred)
+        exchFacadeLog("dismissUnlinkedInboxItem | id=\(id.uuidString) | state=deferred")
+    }
+
+    public func listInboxItems(
+        filter: ExchangeInboxFilter = .init()
+    ) async throws -> [ExchangeInboxItem] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listInboxItems start | threadID=\(filter.threadID?.uuidString ?? "nil") | limit=\(filter.limit?.description ?? "nil")"
+        )
+        let listed = try await store.listInboxItems(filter: filter)
+        let result: [ExchangeInboxItem]
+        if filter.processingStates == nil, filter.threadID == nil {
+            if filter.includeReconciledLinkedToThread {
+                result = listed.filter { item in
+                    switch item.processingState {
+                    case .duplicateIgnored, .rejected, .archived:
+                        return false
+                    default:
+                        return true
+                    }
+                }
+            } else {
+                // Default inbox surface hides items already filed into a thread timeline.
+                result = listed.filter {
+                    if $0.processingState == .duplicateIgnored { return false }
+                    return !($0.processingState == .reconciledIntoThread && $0.threadID != nil)
+                }
+            }
+        } else {
+            result = listed
+        }
+        exchFacadeTTFT("listInboxItems.afterList", start: start)
+        exchFacadeLog("listInboxItems done | count=\(result.count)")
+        return result
+    }
+
+    public func listAuditRecords(
+        filter: ExchangeAuditFilter = .init()
+    ) async throws -> [ExchangeAuditRecord] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listAuditRecords start | threadID=\(filter.threadID?.uuidString ?? "nil") | limit=\(filter.limit?.description ?? "nil")"
+        )
+        let result = try await store.listAuditRecords(filter: filter)
+        exchFacadeTTFT("listAuditRecords.afterList", start: start)
+        exchFacadeLog("listAuditRecords done | count=\(result.count)")
+        return result
+    }
+
+    public func recentAudit(
+        threadID: ExchangeThread.ID? = nil,
+        limit: Int = 50
+    ) async throws -> [ExchangeAuditRecord] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "recentAudit start | threadID=\(threadID?.uuidString ?? "nil") | limit=\(limit)"
+        )
+        let result = try await federationService.recentAudit(
+            threadID: threadID,
+            limit: limit
+        )
+        exchFacadeTTFT("recentAudit.afterFetch", start: start)
+        exchFacadeLog("recentAudit done | count=\(result.count)")
+        return result
+    }
+
+    // MARK: - Trust graph
+
+    public func saveTrustEdge(
+        _ edge: ExchangeTrustEdge,
+        evidence: [ExchangeTrustEvidence] = []
+    ) async throws {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "saveTrustEdge start | edgeID=\(edge.id.uuidString) | source=\(edge.sourceNodeID) | target=\(edge.targetNodeID) | evidenceCount=\(evidence.count)"
+        )
+
+        try await store.performTransaction {
+            try await store.saveTrustEdge(edge)
+            for item in evidence {
+                try await store.appendTrustEvidence(item)
+            }
+        }
+
+        exchFacadeTTFT("saveTrustEdge.afterSave", start: start)
+        exchFacadeLog("saveTrustEdge done | edgeID=\(edge.id.uuidString)")
+    }
+
+    public func addOrUpdateTrustedNode(
+        sourceNodeID: String,
+        targetNodeID: String,
+        relationshipType: ExchangeTrustEdge.RelationshipType,
+        trustLevel: ExchangeTrustEdge.TrustLevel = .standard,
+        scopes: Set<ExchangeTrustEdge.TrustScope> = [],
+        propagation: ExchangeTrustEdge.Propagation = .privateOnly,
+        sourceKind: ExchangeTrustEdge.SourceKind = .manual,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeTrustEdge {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "addOrUpdateTrustedNode start | source=\(sourceNodeID) | target=\(targetNodeID) | relationship=\(relationshipType.rawValue) | trustLevel=\(trustLevel.rawValue)"
+        )
+
+        let existing = try await store.fetchTrustEdge(
+            sourceNodeID: sourceNodeID,
+            targetNodeID: targetNodeID
+        )
+
+        let edge: ExchangeTrustEdge
+        let evidence: ExchangeTrustEvidence
+
+        if let existing {
+            edge = existing.updating(
+                relationshipType: relationshipType,
+                trustLevel: trustLevel,
+                scopes: scopes,
+                propagation: propagation,
+                note: note,
+                at: now
+            ).confirming(at: now)
+
+            evidence = ExchangeTrustEvidence(
+                trustEdgeID: edge.id,
+                type: .manualUpgrade,
+                weight: 1.0,
+                summary: "Trusted node updated.",
+                note: note,
+                recordedAt: now
+            )
+        } else {
+            edge = ExchangeTrustEdge(
+                sourceNodeID: sourceNodeID,
+                targetNodeID: targetNodeID,
+                relationshipType: relationshipType,
+                trustLevel: trustLevel,
+                scopes: scopes,
+                propagation: propagation,
+                sourceKind: sourceKind,
+                note: note,
+                createdAt: now,
+                updatedAt: now,
+                lastConfirmedAt: now
+            )
+
+            evidence = .manualAdd(
+                trustEdgeID: edge.id,
+                note: note,
+                recordedAt: now
+            )
+        }
+
+        try await saveTrustEdge(edge, evidence: [evidence])
+        exchFacadeTTFT("addOrUpdateTrustedNode.afterSave", start: start)
+        exchFacadeLog("addOrUpdateTrustedNode done | edgeID=\(edge.id.uuidString)")
+        return edge
+    }
+
+    /// Manually add a known node to the local trust list (relationship book), without discovery/compare.
+    /// Persists a minimal counterparty, optional public profile from directory search, and a low-trust manual edge.
+    public func addManualTrustedContact(
+        sourceNodeID: String,
+        rawTargetInput: String,
+        displayNameOverride: String?,
+        note: String?,
+        now: Date = Date()
+    ) async throws -> ExchangeTrustEdge {
+        let start = CFAbsoluteTimeGetCurrent()
+        let trimmedSource = sourceNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSource.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Your local node is not ready yet.")
+        }
+
+        guard let canonicalTarget = ManualTrustedContactInputNormalizer.normalizedNodeID(from: rawTargetInput)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank else {
+            throw ExchangeStoreError.storageFailure(reason: "Enter a node id or link to add.")
+        }
+
+        guard canonicalTarget != trimmedSource else {
+            throw ExchangeStoreError.storageFailure(reason: "You cannot add your own node as a contact.")
+        }
+
+        var hydratedFromDirectory: ExchangePublicNodeProfile?
+        if let client = directoryClient {
+            do {
+                let request = ExchangeDirectorySearchRequest(
+                    localNodeID: trimmedSource,
+                    mode: .transactional,
+                    intentKind: .message,
+                    queryText: canonicalTarget,
+                    tags: [canonicalTarget],
+                    limit: 16,
+                    scope: .hybridAllowed,
+                    routeRequirement: .any,
+                    accessRequirement: .discoverableOnly
+                )
+                let response = try await client.search(request)
+                if let match = response.matches.first(where: { Self.directoryMatchForManualTrustedContact($0, canonicalNodeID: canonicalTarget) }) {
+                    hydratedFromDirectory = Self.alignedPublicProfileForManualTrustedContact(
+                        match.publicProfile,
+                        canonicalCounterpartyID: canonicalTarget
+                    )
+                }
+            } catch {
+                exchFacadeLog(
+                    "addManualTrustedContact directory search skipped | error=\(String(describing: error))"
+                )
+            }
+        }
+
+        let existing = try await store.fetchCounterparty(id: canonicalTarget)
+        let profileHintForDisplay = hydratedFromDirectory ?? existing?.publicProfile
+
+        let overrideDisplay = displayNameOverride?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        let displayName: String = {
+            if let overrideDisplay { return overrideDisplay }
+            if let existing, !existing.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return existing.displayName
+            }
+            if let name = profileHintForDisplay?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+                return name
+            }
+            return canonicalTarget
+        }()
+
+        let mergedIdentity = ExchangeCounterparty.Identity(
+            nodeID: canonicalTarget,
+            publicKeyID: existing?.identity?.publicKeyID,
+            verification: existing?.identity?.verification ?? .unverified
+        )
+
+        var executionProfile = hydratedFromDirectory ?? existing?.publicProfile
+        var attachedSyntheticExecutionBasis = false
+
+        if executionProfile == nil {
+            executionProfile = Self.syntheticTrustedContactExecutionProfile(
+                canonicalCounterpartyID: canonicalTarget,
+                displayName: Self.knownTrustedContactProfileDisplayName(
+                    displayNameOverride: displayNameOverride,
+                    existingCounterparty: existing,
+                    canonicalTarget: canonicalTarget
+                ),
+                now: now
+            )
+            attachedSyntheticExecutionBasis = true
+        }
+
+        // `exchange_public_profiles.counterparty_id` references `exchange_counterparties.id`;
+        // insert/update the counterparty row before saving a profile that names this counterparty.
+        if hydratedFromDirectory != nil || attachedSyntheticExecutionBasis,
+           let profileToPersist = executionProfile {
+            let preliminaryCounterparty = ExchangeCounterparty(
+                id: canonicalTarget,
+                createdAt: existing?.createdAt ?? now,
+                updatedAt: now,
+                kind: existing?.kind ?? .person,
+                displayName: displayName,
+                source: existing?.source ?? .manualEntry,
+                identity: mergedIdentity,
+                publicProfile: existing?.publicProfile
+            )
+            executionProfile = try await persistTrustedContactExecutionProfile(
+                profile: profileToPersist,
+                counterparty: preliminaryCounterparty,
+                now: now
+            )
+            if hydratedFromDirectory != nil {
+                hydratedFromDirectory = executionProfile
+            }
+        }
+
+        let mergedProfile = executionProfile
+
+        let counterparty = ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationCounterparty(
+            ExchangeCounterparty(
+                id: canonicalTarget,
+                createdAt: existing?.createdAt ?? now,
+                updatedAt: now,
+                kind: existing?.kind ?? .person,
+                displayName: displayName,
+                source: existing?.source ?? .manualEntry,
+                identity: mergedIdentity,
+                publicProfile: mergedProfile
+            ),
+            now: now
+        )
+
+        try await store.upsertCounterparties([counterparty])
+
+        let trimmedUserNote = note?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        let composedNote: String = {
+            let stamp = "Added as contact."
+            if let trimmedUserNote { return "\(trimmedUserNote) · \(stamp)" }
+            return stamp
+        }()
+
+        let edge = try await addOrUpdateTrustedNode(
+            sourceNodeID: trimmedSource,
+            targetNodeID: canonicalTarget,
+            relationshipType: .knownContact,
+            trustLevel: .low,
+            scopes: [.generalCommunication],
+            propagation: .privateOnly,
+            sourceKind: .manual,
+            note: composedNote,
+            now: now
+        )
+
+        #if DEBUG
+        Swift.print(
+            "[TrustedContactAdd] nodeID=\(canonicalTarget) hydrated=\(hydratedFromDirectory != nil) syntheticExecutionBasis=\(attachedSyntheticExecutionBasis) success=true"
+        )
+        #endif
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "addManualTrustedContact done | elapsed=\(elapsedMs)ms | target=\(canonicalTarget) | syntheticBasis=\(attachedSyntheticExecutionBasis)"
+        )
+
+        await emitTrustedContactAddedSecretaryNotification(
+            canonicalNodeID: canonicalTarget,
+            displayLine: displayName,
+            now: now
+        )
+
+        return edge
+    }
+
+    public func revokeTrustedNode(
+        trustEdgeID: ExchangeTrustEdge.ID,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeTrustEdge {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("revokeTrustedNode start | trustEdgeID=\(trustEdgeID.uuidString)")
+
+        let existing = try await store.requireTrustEdge(id: trustEdgeID)
+        let revoked = existing.revoking(at: now)
+
+        let evidence = ExchangeTrustEvidence.revocation(
+            trustEdgeID: revoked.id,
+            note: note,
+            recordedAt: now
+        )
+
+        try await saveTrustEdge(revoked, evidence: [evidence])
+        exchFacadeTTFT("revokeTrustedNode.afterSave", start: start)
+        exchFacadeLog("revokeTrustedNode done | trustEdgeID=\(trustEdgeID.uuidString)")
+        return revoked
+    }
+    
+    public func revokeTrustedContact(
+        sourceNodeID: String,
+        targetNodeID: String,
+        note: String? = nil,
+        now: Date = Date()
+    ) async throws -> ExchangeTrustEdge {
+        let source = sourceNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !source.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Missing source node id for trusted contact removal.")
+        }
+
+        guard !target.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Missing target node id for trusted contact removal.")
+        }
+
+        exchFacadeLog(
+            "revokeTrustedContact start | source=\(source) | target=\(target)"
+        )
+
+        guard let edge = try await store.fetchTrustEdge(
+            sourceNodeID: source,
+            targetNodeID: target
+        ) else {
+            throw ExchangeStoreError.storageFailure(reason: "Trusted contact not found.")
+        }
+
+        guard edge.isActive else {
+            exchFacadeLog(
+                "revokeTrustedContact skipped | source=\(source) | target=\(target) | reason=alreadyRevoked"
+            )
+            return edge
+        }
+
+        let revoked = try await revokeTrustedNode(
+            trustEdgeID: edge.id,
+            note: note,
+            now: now
+        )
+
+        exchFacadeLog(
+            "revokeTrustedContact done | source=\(source) | target=\(target) | trustEdgeID=\(revoked.id.uuidString)"
+        )
+
+        return revoked
+    }
+
+    public func fetchTrustEdge(id: ExchangeTrustEdge.ID) async throws -> ExchangeTrustEdge? {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("fetchTrustEdge(id:) start | id=\(id.uuidString)")
+        let result = try await store.fetchTrustEdge(id: id)
+        exchFacadeTTFT("fetchTrustEdge(id:).afterFetch", start: start)
+        exchFacadeLog("fetchTrustEdge(id:) done | found=\(result != nil)")
+        return result
+    }
+
+    public func fetchTrustEdge(
+        sourceNodeID: String,
+        targetNodeID: String
+    ) async throws -> ExchangeTrustEdge? {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("fetchTrustEdge(source:target:) start | source=\(sourceNodeID) | target=\(targetNodeID)")
+        let result = try await store.fetchTrustEdge(
+            sourceNodeID: sourceNodeID,
+            targetNodeID: targetNodeID
+        )
+        exchFacadeTTFT("fetchTrustEdge(source:target:).afterFetch", start: start)
+        exchFacadeLog("fetchTrustEdge(source:target:) done | found=\(result != nil)")
+        return result
+    }
+
+    public func listTrustEdges(
+        filter: ExchangeTrustEdgeFilter = .init()
+    ) async throws -> [ExchangeTrustEdge] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listTrustEdges start | source=\(filter.sourceNodeID ?? "nil") | target=\(filter.targetNodeID ?? "nil") | activeOnly=\(filter.activeOnly) | limit=\(filter.limit?.description ?? "nil")"
+        )
+        let result = try await store.listTrustEdges(filter: filter)
+        exchFacadeTTFT("listTrustEdges.afterList", start: start)
+        exchFacadeLog("listTrustEdges done | count=\(result.count)")
+        return result
+    }
+
+    public func listTrustedNodes(
+        sourceNodeID: String,
+        limit: Int? = nil
+    ) async throws -> [ExchangeModels.TrustedNodeItem] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listTrustedNodes start | sourceNodeID=\(sourceNodeID) | limit=\(limit?.description ?? "nil")"
+        )
+
+        let edges = try await store.listTrustEdges(
+            filter: .init(
+                sourceNodeID: sourceNodeID,
+                activeOnly: true,
+                limit: limit
+            )
+        )
+        exchFacadeTTFT("listTrustedNodes.afterListTrustEdges", start: start)
+
+        let uniqueSellerNodeIDs = Array(
+            Set(
+                edges.map { edge in
+                    edge.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { !$0.isEmpty }
+            )
+        )
+
+        var primaryOfferBySellerNodeID: [String: ExchangeOffer] = [:]
+        primaryOfferBySellerNodeID.reserveCapacity(uniqueSellerNodeIDs.count)
+        for sellerNodeID in uniqueSellerNodeIDs {
+            if let picked = await trustedListPickPrimarySellerOffer(forSellerNodeID: sellerNodeID) {
+                primaryOfferBySellerNodeID[sellerNodeID] = picked
+            }
+        }
+
+        var items: [ExchangeModels.TrustedNodeItem] = []
+        items.reserveCapacity(edges.count)
+
+        for edge in edges {
+            let counterparty = try await store.fetchCounterparty(id: edge.targetNodeID)
+            let profile = try await store.fetchTrustedNodeProfile(
+                nodeID: edge.targetNodeID,
+                forSourceNodeID: sourceNodeID
+            )
+
+            let targetKey = edge.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let primaryOffer = primaryOfferBySellerNodeID[targetKey]
+
+            let item = Self.trustedListMakeTrustedNodeItem(
+                edge: edge,
+                counterparty: counterparty,
+                trustedProfile: profile,
+                primaryOffer: primaryOffer
+            )
+
+            #if DEBUG
+            Swift.print(
+                "[TrustView][listTrustedNodes/item] nodeID=\(item.nodeID) " +
+                    "resolvedDisplayName=\(item.displayName) " +
+                    "publicDisplayName=\(item.publicDisplayName ?? "nil") " +
+                    "publicHeadline=\(item.publicHeadline ?? "nil") " +
+                    "publicPrimaryOfferLine=\(item.publicPrimaryOfferLine ?? "nil") " +
+                    "publicSummaryLine=\(item.publicSummaryLine ?? "nil") " +
+                    "chosenOfferID=\(primaryOffer?.id ?? "nil") " +
+                    "chosenOfferTitle=\(primaryOffer.map { $0.title } ?? "nil") " +
+                    "hasPublicSurface=\(item.hasPublicSurface)"
+            )
+            #endif
+
+            items.append(item)
+        }
+
+        exchFacadeTTFT("listTrustedNodes.itemsBuilt", start: start)
+
+        let sorted = items.sorted { lhs, rhs in
+            if lhs.trustLevel.sortRank != rhs.trustLevel.sortRank {
+                return lhs.trustLevel.sortRank > rhs.trustLevel.sortRank
+            }
+            if lhs.displayName != rhs.displayName {
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+            return lhs.nodeID < rhs.nodeID
+        }
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog("listTrustedNodes done | elapsed=\(elapsedMs)ms | count=\(sorted.count)")
+        return sorted
+    }
+    
+    public func listPendingOutgoingContactRequests(
+        limit: Int = 200
+    ) async throws -> [OutgoingContactRequest] {
+        try await store.listOutgoingContactRequests(
+            filter: OutgoingContactRequestFilter(
+                phases: [.queued, .sending, .sent],
+                limit: limit
+            )
+        )
+    }
+
+    public func listPendingContactRequests(
+        limit: Int? = 200
+    ) async throws -> [ExchangeModels.ContactRequestItem] {
+        let items = try await store.listInboxItems(
+            filter: .init(
+                processingStates: [
+                    .received,
+                    .deferred,
+                    .awaitingOrderingGapResolution,
+                    .reconciledIntoThread
+                ],
+                processableOnly: false,
+                limit: limit
+            )
+        )
+
+        #if DEBUG
+        for item in items {
+            if Self.isContactRequestInboxItem(item) {
+                Swift.print(
+                    "[ContactRequestProjection][include] inboxItemID=\(item.id.uuidString) sender=\(item.senderNodeID ?? "nil") payload_kind=\(item.metadata["payload_kind"] ?? "nil") surface=\(item.metadata["conversation_surface"] ?? "nil")"
+                )
+            } else if item.metadata["contact_request"]?.lowercased() == "true"
+                || item.metadata["conversation_kind"]?.lowercased() == "friend_request" {
+                Swift.print(
+                    "[ContactRequestProjection][exclude] inboxItemID=\(item.id.uuidString) reason=not_classified_as_contact_request payload_kind=\(item.metadata["payload_kind"] ?? "nil") surface=\(item.metadata["conversation_surface"] ?? "nil")"
+                )
+            }
+        }
+        #endif
+
+        let contactItems = items.filter(Self.isContactRequestInboxItem)
+        var grouped: [String: [ExchangeInboxItem]] = [:]
+        for item in contactItems {
+            let key = Self.contactRequestGroupKey(for: item)
+            grouped[key, default: []].append(item)
+        }
+
+        var output: [ExchangeModels.ContactRequestItem] = []
+        output.reserveCapacity(grouped.count)
+        for (key, groupRaw) in grouped {
+            let group = groupRaw.sorted {
+                if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            guard let latest = group.first else { continue }
+            let requesterNodeID = latest.senderNodeID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+
+            if let requesterNodeID,
+               let localNodeID = await resolveLocalNodeIDForContactSignals(),
+               let edge = try? await store.fetchTrustEdge(
+                    sourceNodeID: localNodeID,
+                    targetNodeID: requesterNodeID
+               ),
+               edge.revokedAt == nil {
+                try? await finalizeContactRequestInboxSurface(
+                    itemIDs: group.map(\.id),
+                    accepted: true,
+                    now: Date()
+                )
+                #if DEBUG
+                Swift.print(
+                    "[ContactRequestProjection][suppressConnected] requester=\(requesterNodeID)"
+                )
+                #endif
+                continue
+            }
+
+            let senderName = latest.senderDisplayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            let metadataSenderName = latest.metadata["sender_display_name"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+            let requesterCounterparty: ExchangeCounterparty?
+            if let node = requesterNodeID {
+                requesterCounterparty = try? await store.fetchCounterparty(id: node)
+            } else {
+                requesterCounterparty = nil
+            }
+            let profileName = requesterCounterparty?.publicProfile?.displayName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+            let displayName = profileName ?? senderName ?? metadataSenderName ?? requesterNodeID ?? "Unknown contact"
+            let avatarURL = requesterCounterparty?.publicProfile?.primaryImageURL?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+            let note = Self.contactRequestPreview(from: latest)
+            let envelopeIDs = group.map(\.envelopeID).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            output.append(
+                ExchangeModels.ContactRequestItem(
+                    id: key,
+                    requesterNodeID: requesterNodeID,
+                    displayName: displayName,
+                    note: note,
+                    receivedAt: latest.receivedAt,
+                    sourceInboxItemIDs: group.map(\.id),
+                    sourceEnvelopeIDs: envelopeIDs,
+                    pendingCount: group.count,
+                    avatarImageURL: avatarURL
+                )
+            )
+            #if DEBUG
+            Swift.print(
+                "[ContactRequestReceiveProjection] inboxID=\(latest.id.uuidString) senderNodeID=\(requesterNodeID ?? "nil") payloadKind=\(latest.metadata["payload_kind"] ?? "nil") pending=\(group.count)"
+            )
+            Swift.print(
+                "[ContactAvatarProjection] surface=contactRequest nodeID=\(requesterNodeID ?? "nil") hasProfile=\(requesterCounterparty?.publicProfile != nil) hasAvatar=\(avatarURL != nil) source=\(avatarURL != nil ? "publicProfile" : ((requesterNodeID ?? "").isEmpty ? "initials" : "nodeFallback"))"
+            )
+            #endif
+        }
+
+        output.sort {
+            if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
+            return $0.id < $1.id
+        }
+        #if DEBUG
+        let latest = output.first?.receivedAt.description ?? "nil"
+        Swift.print("[ContactRequestProjection] pending=\(output.count) latest=\(latest)")
+        #endif
+        return output
+    }
+
+    public func listCounterpartySupporterPresentations(
+        nodeIDs: [String]
+    ) async throws -> [String: ExchangeSupporterPresentation] {
+        var output: [String: ExchangeSupporterPresentation] = [:]
+
+        for raw in nodeIDs {
+            let nodeID = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nodeID.isEmpty else { continue }
+            guard let counterparty = try await store.fetchCounterparty(id: nodeID),
+                  let presentation = counterparty.publicProfile?.publicSupporterPresentation,
+                  presentation.showsGuardianCrown else {
+                continue
+            }
+            output[nodeID] = presentation
+        }
+
+        return output
+    }
+
+    public func listCounterpartyProfileImageURLs(
+        nodeIDs: [String]
+    ) async throws -> [String: String] {
+        var output: [String: String] = [:]
+        for raw in nodeIDs {
+            let nodeID = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nodeID.isEmpty else { continue }
+            guard let counterparty = try await store.fetchCounterparty(id: nodeID),
+                  let avatar = counterparty.publicProfile?.primaryImageURL?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !avatar.isEmpty else {
+                continue
+            }
+            output[nodeID] = avatar
+        }
+        return output
+    }
+    
+    public func listCounterpartyProfileSummaries(
+        nodeIDs: [String]
+    ) async throws -> [String: (displayName: String?, avatarURL: String?)] {
+        var output: [String: (displayName: String?, avatarURL: String?)] = [:]
+
+        for raw in nodeIDs {
+            let nodeID = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nodeID.isEmpty else { continue }
+            guard let counterparty = try await store.fetchCounterparty(id: nodeID) else { continue }
+
+            let displayName = counterparty.publicProfile?.displayName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+
+            let avatarURL = counterparty.publicProfile?.primaryImageURL?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+
+            guard displayName != nil || avatarURL != nil else { continue }
+
+            output[nodeID] = (
+                displayName: displayName,
+                avatarURL: avatarURL
+            )
+        }
+
+        return output
+    }
+
+    @discardableResult
+    public func acceptContactRequest(
+        sourceNodeID: String,
+        request: ExchangeModels.ContactRequestItem,
+        now: Date = Date()
+    ) async throws -> ExchangeTrustEdge {
+        guard let nodeID = request.requesterNodeID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+            throw ExchangeStoreError.storageFailure(reason: "Contact request is missing requester node id.")
+        }
+        #if DEBUG
+        Swift.print("[ContactRequestAccept] requesterNodeID=\(nodeID) displayName=\(request.displayName)")
+        #endif
+        let edge = try await addManualTrustedContact(
+            sourceNodeID: sourceNodeID,
+            rawTargetInput: nodeID,
+            displayNameOverride: request.displayName.nilIfBlank,
+            note: request.note,
+            now: now
+        )
+
+        let requesterCounterparty = try await store.fetchCounterparty(id: nodeID)
+            ?? ExchangeCounterparty(
+                id: nodeID,
+                createdAt: now,
+                updatedAt: now,
+                kind: .person,
+                displayName: request.displayName,
+                source: .relayNetwork,
+                identity: .init(nodeID: nodeID, publicKeyID: nil, verification: .unverified),
+                trust: .unverified
+            )
+        let accepterDisplayName = try? await store.listPublicProfiles(filter: .init(limit: 1))
+            .first?
+            .displayName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        let inReplyTo = request.sourceEnvelopeIDs.first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        do {
+            try await contactSignalSendService.sendFriendRequestAccepted(
+                sourceNodeID: sourceNodeID,
+                requesterCounterparty: requesterCounterparty,
+                accepterDisplayName: accepterDisplayName,
+                inReplyToEnvelopeID: inReplyTo,
+                now: now
+            )
+        } catch {
+            exchFacadeLog(
+                "acceptContactRequest acceptance send failed | requester=\(nodeID) | error=\(String(describing: error))"
+            )
+        }
+
+        try await finalizeContactRequestInboxSurface(
+            itemIDs: request.sourceInboxItemIDs,
+            accepted: true,
+            now: now
+        )
+
+        let reconciler = ExchangeContactRelationshipReconciliation(store: store)
+        _ = try await reconciler.completeRelationshipAfterTrust(
+            sourceNodeID: sourceNodeID,
+            remoteNodeID: nodeID,
+            displayName: request.displayName.nilIfBlank,
+            openDirectMessageThread: { [self] counterpartyNodeID, displayName, openedAt in
+                try await openOrCreateDirectMessageThread(
+                    counterpartyNodeID: counterpartyNodeID,
+                    displayName: displayName,
+                    now: openedAt
+                )
+            },
+            archiveInboxItems: { [self] itemIDs, archivedAt in
+                try await finalizeContactRequestInboxSurface(
+                    itemIDs: itemIDs,
+                    accepted: true,
+                    now: archivedAt
+                )
+            },
+            markOutgoingAccepted: { [self] targetNodeID, markedAt in
+                try await markOutgoingContactRequestsAccepted(
+                    targetNodeID: targetNodeID,
+                    now: markedAt
+                )
+            },
+            now: now
+        )
+
+        ExchangeContactRelationshipReconciliation.postRelationshipRefreshNotification(
+            remoteNodeID: nodeID,
+            reason: "contactRequestAccepted"
+        )
+
+        #if DEBUG
+        Swift.print("[ContactRequestAccept] nodeID=\(nodeID) sourceInboxIDs=\(request.sourceInboxItemIDs.map(\.uuidString).joined(separator: ",")) success=true")
+        #endif
+        return edge
+    }
+
+    /// Marks pending outgoing contact requests to `targetNodeID` as accepted (excluded from pending UI lists).
+    public func markOutgoingContactRequestsAccepted(
+        targetNodeID: String,
+        now: Date = Date()
+    ) async throws -> Int {
+        let count = try await store.markOutgoingContactRequestsAcceptedForTarget(
+            targetNodeID: targetNodeID,
+            now: now
+        )
+        #if DEBUG
+        if count > 0 {
+            Swift.print("[OutgoingContactRequest] accepted targetNodeID=\(targetNodeID) count=\(count)")
+        }
+        #endif
+        return count
+    }
+
+    private func resolveLocalNodeIDForContactSignals() async -> String? {
+        let identity = try? await BootstrappedIdentityService().localIdentity()
+        return identity?.nodeID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+    }
+
+    private enum ContactRelationshipRestoreBlockReason: Sendable {
+        case counterpartyBlocked
+        case trustEdgeRevoked
+        case userBlockedEvidence
+
+        var logToken: String {
+            switch self {
+            case .counterpartyBlocked: return "counterparty_blocked"
+            case .trustEdgeRevoked: return "trust_edge_revoked"
+            case .userBlockedEvidence: return "user_blocked_evidence"
+            }
+        }
+    }
+
+    private func contactRelationshipRestoreBlockReason(
+        sourceNodeID: String,
+        remoteNodeID: String
+    ) async -> ContactRelationshipRestoreBlockReason? {
+        let local = sourceNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let remote = remoteNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !local.isEmpty, !remote.isEmpty else { return nil }
+
+        if let counterparty = try? await store.fetchCounterparty(id: remote),
+           counterparty.status == .blocked {
+            return .counterpartyBlocked
+        }
+
+        guard let edge = try? await store.fetchTrustEdge(
+            sourceNodeID: local,
+            targetNodeID: remote
+        ) else {
+            return nil
+        }
+
+        if edge.revokedAt != nil {
+            return .trustEdgeRevoked
+        }
+
+        if let evidence = try? await loadEvidenceForEdge(edge),
+           evidence.contains(where: { $0.type == .userBlockedNode }) {
+            return .userBlockedEvidence
+        }
+
+        return nil
+    }
+
+    private func processPendingInboundContactRequestAcceptanceSignals(now: Date) async {
+        guard let items = try? await store.listInboxItems(
+            filter: .init(
+                processingStates: [
+                    .received,
+                    .deferred,
+                    .awaitingOrderingGapResolution,
+                    .reconciledIntoThread
+                ],
+                processableOnly: false,
+                limit: 200
+            )
+        ) else { return }
+
+        for item in items where Self.isInboundContactRequestAcceptanceInboxItem(item) {
+            await processInboundContactRequestAcceptanceIfEligible(item: item, now: now)
+        }
+    }
+
+    private func processInboundContactRequestAcceptanceIfEligible(
+        item: ExchangeInboxItem,
+        now: Date
+    ) async {
+        guard Self.isInboundContactRequestAcceptanceInboxItem(item) else { return }
+
+        switch item.processingState {
+        case .archived, .rejected, .duplicateIgnored:
+            return
+        default:
+            break
+        }
+
+        let accepterNodeID = item.senderNodeID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        guard let accepterNodeID else {
+            exchFacadeLog("[ContactRequestAcceptedReceive] ignored | reason=missing_sender")
+            try? await finalizeContactRequestInboxSurface(itemIDs: [item.id], accepted: true, now: now)
+            return
+        }
+
+        guard let localNodeID = await resolveLocalNodeIDForContactSignals() else {
+            exchFacadeLog("[ContactRequestAcceptedReceive] ignored | reason=missing_local_node")
+            return
+        }
+
+        if let blockReason = await contactRelationshipRestoreBlockReason(
+            sourceNodeID: localNodeID,
+            remoteNodeID: accepterNodeID
+        ) {
+            exchFacadeLog(
+                "[ContactRequestAcceptedReceive] ignored | accepter=\(accepterNodeID) | reason=\(blockReason.logToken)"
+            )
+            try? await finalizeContactRequestInboxSurface(itemIDs: [item.id], accepted: true, now: now)
+            return
+        }
+
+        if let metaTarget = item.metadata["target_node_id"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank,
+           metaTarget != localNodeID {
+            exchFacadeLog(
+                "[ContactRequestAcceptedReceive] ignored | accepter=\(accepterNodeID) | reason=target_mismatch | metaTarget=\(metaTarget)"
+            )
+            try? await finalizeContactRequestInboxSurface(itemIDs: [item.id], accepted: true, now: now)
+            return
+        }
+
+        let hadPendingOutgoing =
+            (try? await store.fetchPendingOutgoingContactRequest(targetNodeID: accepterNodeID)) != nil
+        if !hadPendingOutgoing {
+            let existingTrust = try? await store.fetchTrustEdge(
+                sourceNodeID: localNodeID,
+                targetNodeID: accepterNodeID
+            )
+            if existingTrust?.revokedAt == nil {
+                #if DEBUG
+                Swift.print(
+                    "[ContactRequestAcceptedReceive] trustAlreadyConnected accepter=\(accepterNodeID)"
+                )
+                #endif
+            } else {
+                #if DEBUG
+                Swift.print(
+                    "[ContactRequestAcceptedReceive] restored_without_pending_outgoing accepter=\(accepterNodeID)"
+                )
+                #endif
+                exchFacadeLog(
+                    "[ContactRequestAcceptedReceive] restored_without_pending_outgoing | accepter=\(accepterNodeID)"
+                )
+            }
+        }
+
+        let senderDisplayName = item.senderDisplayName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+            ?? item.metadata["sender_display_name"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank
+
+        #if DEBUG
+        Swift.print(
+            "[ContactRequestAcceptedReceive] accepter=\(accepterNodeID) local=\(localNodeID) inbox=\(item.id.uuidString)"
+        )
+        #endif
+
+        do {
+            _ = try await addManualTrustedContact(
+                sourceNodeID: localNodeID,
+                rawTargetInput: accepterNodeID,
+                displayNameOverride: senderDisplayName,
+                note: nil,
+                now: now
+            )
+        } catch {
+            if let existing = try? await store.fetchTrustEdge(
+                sourceNodeID: localNodeID,
+                targetNodeID: accepterNodeID
+            ), existing.revokedAt == nil {
+                exchFacadeLog(
+                    "[ContactRequestAcceptedReceive] trust already exists | accepter=\(accepterNodeID)"
+                )
+            } else {
+                exchFacadeLog(
+                    "[ContactRequestAcceptedReceive] trust create failed | accepter=\(accepterNodeID) | error=\(String(describing: error))"
+                )
+                return
+            }
+        }
+
+        _ = try? await markOutgoingContactRequestsAccepted(targetNodeID: accepterNodeID, now: now)
+        try? await finalizeContactRequestInboxSurface(itemIDs: [item.id], accepted: true, now: now)
+
+        let reconciler = ExchangeContactRelationshipReconciliation(store: store)
+        do {
+            _ = try await reconciler.completeRelationshipAfterTrust(
+                sourceNodeID: localNodeID,
+                remoteNodeID: accepterNodeID,
+                displayName: senderDisplayName,
+                openDirectMessageThread: { [self] counterpartyNodeID, displayName, openedAt in
+                    try await openOrCreateDirectMessageThread(
+                        counterpartyNodeID: counterpartyNodeID,
+                        displayName: displayName,
+                        now: openedAt
+                    )
+                },
+                archiveInboxItems: { [self] itemIDs, archivedAt in
+                    try await finalizeContactRequestInboxSurface(
+                        itemIDs: itemIDs,
+                        accepted: true,
+                        now: archivedAt
+                    )
+                },
+                markOutgoingAccepted: { [self] targetNodeID, markedAt in
+                    try await markOutgoingContactRequestsAccepted(
+                        targetNodeID: targetNodeID,
+                        now: markedAt
+                    )
+                },
+                now: now
+            )
+        } catch {
+            exchFacadeLog(
+                "[ContactRequestAcceptedReceive] relationshipSetupFailed | accepter=\(accepterNodeID) | error=\(String(describing: error))"
+            )
+            #if DEBUG
+            Swift.print(
+                "[ContactRequestAcceptedReceive] relationshipSetupFailed accepter=\(accepterNodeID) error=\(error)"
+            )
+            #endif
+            return
+        }
+
+        ExchangeContactRelationshipReconciliation.postRelationshipRefreshNotification(
+            remoteNodeID: accepterNodeID,
+            reason: "contactRequestAcceptedReceive"
+        )
+    }
+
+    public func declineContactRequest(
+        request: ExchangeModels.ContactRequestItem,
+        now: Date = Date()
+    ) async throws {
+        try await finalizeContactRequestInboxSurface(
+            itemIDs: request.sourceInboxItemIDs,
+            accepted: false,
+            now: now
+        )
+        #if DEBUG
+        Swift.print("[ContactRequestDecline] nodeID=\(request.requesterNodeID ?? "nil") sourceInboxIDs=\(request.sourceInboxItemIDs.map(\.uuidString).joined(separator: ",")) success=true")
+        #endif
+    }
+
+    public static func isInboundContactRequestAcceptanceInboxItem(_ item: ExchangeInboxItem) -> Bool {
+        ExchangeContactSignalClassifier.isInboundContactRequestAcceptance(item)
+    }
+
+    public static func isContactRequestInboxItem(_ item: ExchangeInboxItem) -> Bool {
+        ExchangeContactSignalClassifier.isContactRequestInboxItem(item)
+    }
+
+    private static func contactRequestGroupKey(for item: ExchangeInboxItem) -> String {
+        if let sender = item.senderNodeID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return "node:\(sender.lowercased())"
+        }
+        if let threadID = item.threadID {
+            return "thread:\(threadID.uuidString.lowercased())"
+        }
+        return "item:\(item.id.uuidString.lowercased())"
+    }
+
+    private static func contactRequestPreview(from item: ExchangeInboxItem) -> String? {
+        let parts = [
+            item.metadata["body_preview"],
+            item.visibleSummary,
+            item.metadata["subject_preview"]
+        ]
+        for part in parts {
+            let t = part?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !t.isEmpty { return String(t.prefix(300)) }
+        }
+        return nil
+    }
+
+    public func getTrustedNodeProfile(
+        nodeID: String,
+        forSourceNodeID sourceNodeID: String?
+    ) async throws -> ExchangeModels.TrustedNodeProfileView {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "getTrustedNodeProfile start | nodeID=\(nodeID) | sourceNodeID=\(sourceNodeID ?? "nil")"
+        )
+
+        let profile = try await store.requireTrustedNodeProfile(
+            nodeID: nodeID,
+            forSourceNodeID: sourceNodeID
+        )
+
+        let counterparty = try await store.fetchCounterparty(id: nodeID)
+
+        let evidence: [ExchangeTrustEvidence]
+        if let sourceNodeID,
+           let edge = try await store.fetchTrustEdge(
+                sourceNodeID: sourceNodeID,
+                targetNodeID: nodeID
+           ) {
+            evidence = try await store.listTrustEvidence(
+                trustEdgeID: edge.id,
+                limit: 50,
+                ascending: false
+            )
+        } else {
+            evidence = []
+        }
+
+        let result = ExchangeModels.TrustedNodeProfileView(
+            nodeID: nodeID,
+            displayName: counterparty?.bestDisplayLine ?? nodeID,
+            counterparty: counterparty,
+            profile: profile,
+            evidence: evidence
+        )
+
+        exchFacadeTTFT("getTrustedNodeProfile.afterBuild", start: start)
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "getTrustedNodeProfile done | elapsed=\(elapsedMs)ms | evidenceCount=\(evidence.count)"
+        )
+
+        return result
+    }
+
+    public func appendTrustEvidence(
+        _ evidence: ExchangeTrustEvidence
+    ) async throws {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "appendTrustEvidence start | trustEdgeID=\(evidence.trustEdgeID.uuidString) | type=\(evidence.type.rawValue)"
+        )
+        try await store.appendTrustEvidence(evidence)
+        exchFacadeTTFT("appendTrustEvidence.afterAppend", start: start)
+        exchFacadeLog("appendTrustEvidence done | trustEdgeID=\(evidence.trustEdgeID.uuidString)")
+    }
+
+    public func listTrustEvidence(
+        trustEdgeID: ExchangeTrustEdge.ID,
+        limit: Int? = nil,
+        ascending: Bool = false
+    ) async throws -> [ExchangeTrustEvidence] {
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog(
+            "listTrustEvidence start | trustEdgeID=\(trustEdgeID.uuidString) | limit=\(limit?.description ?? "nil") | ascending=\(ascending)"
+        )
+        let result = try await store.listTrustEvidence(
+            trustEdgeID: trustEdgeID,
+            limit: limit,
+            ascending: ascending
+        )
+        exchFacadeTTFT("listTrustEvidence.afterList", start: start)
+        exchFacadeLog("listTrustEvidence done | count=\(result.count)")
+        return result
+    }
+}
+
+// MARK: - Trusted node list DTO enrichment
+
+private extension ExchangeFacade {
+    // MARK: - Phase 1 inbound DM counterparty shell (no trust edge)
+
+    func inboxHasVerifiedDirectMessageEvidence(counterpartyNodeID: String) async throws -> Bool {
+        let trimmed = counterpartyNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let rows = try await store.listInboxItems(
+            filter: ExchangeInboxFilter(
+                senderNodeID: trimmed,
+                limit: 150,
+                includeReconciledLinkedToThread: true
+            )
+        )
+        for row in rows {
+            switch row.processingState {
+            case .rejected, .duplicateIgnored, .archived:
+                continue
+            case .received, .deferred, .awaitingOrderingGapResolution, .reconciledIntoThread:
+                break
+            }
+            let surface = row.metadata["conversation_surface"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() ?? ""
+            guard surface == "direct_message" else { continue }
+            if row.compatibility.isProcessable { return true }
+            if row.processingState == .reconciledIntoThread { return true }
+        }
+        return false
+    }
+
+    func upsertMinimalRelayCounterpartyShellForInboundDirectMessageOpen(
+        counterpartyNodeID: String,
+        displayName: String?,
+        now: Date
+    ) async throws {
+        let trimmed = counterpartyNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ExchangeStoreError.storageFailure(reason: "Counterparty node id is missing.")
+        }
+        let cleanedName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let shell = ExchangeCounterparty(
+            id: trimmed,
+            createdAt: now,
+            updatedAt: now,
+            kind: .secretaryNode,
+            displayName: cleanedName.isEmpty ? trimmed : cleanedName,
+            source: .relayNetwork,
+            identity: .init(
+                nodeID: trimmed,
+                publicKeyID: nil,
+                verification: .unverified
+            ),
+            trust: .unverified,
+            status: .active
+        )
+        try await store.upsertCounterparties([shell])
+    }
+
+    /// Picks one primary seller offer for Trusted Paths identity (deterministic).
+    ///
+    /// Policy: prefer `status == active`, exclude `visibility == hidden`, require non-empty title.
+    /// Order: newest `updatedAt`; tie-break lexicographically by title, then offer id.
+    func trustedListPickPrimarySellerOffer(forSellerNodeID nodeID: String) async -> ExchangeOffer? {
+        let trimmedNode = nodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedNode.isEmpty else { return nil }
+
+        do {
+            let offers = try await store.listOffers(
+                filter: ExchangeOfferFilter(
+                    nodeID: trimmedNode,
+                    statuses: [.active],
+                    limit: 200
+                )
+            )
+            let visible = offers.filter { $0.visibility != .hidden }
+            let titled = visible.filter {
+                !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            guard !titled.isEmpty else { return nil }
+
+            return titled.sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt {
+                    return lhs.updatedAt > rhs.updatedAt
+                }
+                let ct = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+                if ct != .orderedSame {
+                    return ct == .orderedAscending
+                }
+                return lhs.id.localizedCaseInsensitiveCompare(rhs.id) == .orderedAscending
+            }.first
+        } catch {
+            exchFacadeLog("trustedListPickPrimarySellerOffer skipped | nodeID=\(trimmedNode) | error=\(error)")
+            return nil
+        }
+    }
+
+    static func trustedListMakeTrustedNodeItem(
+        edge: ExchangeTrustEdge,
+        counterparty: ExchangeCounterparty?,
+        trustedProfile: ExchangeTrustedNodeProfile?,
+        primaryOffer: ExchangeOffer?
+    ) -> ExchangeModels.TrustedNodeItem {
+        let nodeID = edge.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pp = counterparty?.publicProfile
+
+        let publicDisplayName = trustedListPublicDisplayName(from: pp, nodeID: nodeID)
+        let publicHeadline = trustedListTrimmedOptional(pp?.headline)
+
+        var publicSummaryLine = trustedListTrimmedOptional(pp?.summary)
+        let publicIntroLine = trustedListTrimmedOptional(pp?.semantic.notes)
+        let publicRegionLine = trustedListJoinedLine(
+            from: (pp?.regionTags ?? []) + (pp?.regionAliases ?? []),
+            maxPieces: 5,
+            maxCharacters: 120
+        )
+        let publicOpenToLine = trustedListJoinedLine(from: pp?.openTo ?? [], maxPieces: 6, maxCharacters: 120)
+        let publicActivityLine = trustedListJoinedLine(from: pp?.activityTags ?? [], maxPieces: 6, maxCharacters: 120)
+
+        let profilePrimaryOfferStrings = trustedListFirstNonEmpty(from: pp?.offers ?? [])
+        let offerTitleForIdentity = trustedListOfferTitle(for: primaryOffer, nodeID: nodeID)
+
+        var publicPrimaryOfferLine = profilePrimaryOfferStrings
+        if publicPrimaryOfferLine == nil,
+           let offerTitleForIdentity {
+            publicPrimaryOfferLine = offerTitleForIdentity
+        }
+
+        let offerSummaryForCard = trustedListSellerOfferSummaryIfDisplaySafe(primaryOffer, nodeID: nodeID)
+        if publicSummaryLine == nil {
+            publicSummaryLine = offerSummaryForCard
+        }
+
+        if publicSummaryLine == nil,
+           let interestsLine = trustedListJoinedLine(from: pp?.interests ?? [], maxPieces: 8, maxCharacters: 160) {
+            publicSummaryLine = interestsLine
+        }
+
+        let resolvedDisplayName = trustedListResolveDisplayName(
+            publicDisplayName: publicDisplayName,
+            counterparty: counterparty,
+            offerTitle: offerTitleForIdentity,
+            publicHeadline: publicHeadline,
+            relationshipType: edge.relationshipType,
+            nodeID: nodeID
+        )
+
+        let preferredOfferID: String? = trustedListTrimmedOptional(primaryOffer?.id)
+
+        let hasPublicSurface = trustedListHasDisplayableTrustedSurface(
+            publicDisplayName: publicDisplayName,
+            publicHeadline: publicHeadline,
+            publicSummaryLine: publicSummaryLine,
+            publicIntroLine: publicIntroLine,
+            publicRegionLine: publicRegionLine,
+            publicOpenToLine: publicOpenToLine,
+            publicActivityLine: publicActivityLine,
+            publicPrimaryOfferLine: publicPrimaryOfferLine
+        )
+
+        return ExchangeModels.TrustedNodeItem(
+            nodeID: edge.targetNodeID,
+            displayName: resolvedDisplayName,
+            relationshipType: edge.relationshipType,
+            trustLevel: edge.trustLevel,
+            scopes: edge.scopes,
+            isMutual: trustedProfile?.isMutual ?? false,
+            trustedByCount: trustedProfile?.networkTrust.trustedByCount ?? 0,
+            trustedByYourTrustedCount: trustedProfile?.networkTrust.trustedByYourTrustedCount ?? 0,
+            lastConfirmedAt: edge.lastConfirmedAt,
+            note: edge.note,
+            hasPublicProfileForMessaging: pp != nil,
+            publicDisplayName: publicDisplayName,
+            publicHeadline: publicHeadline,
+            publicSummaryLine: publicSummaryLine,
+            publicIntroLine: publicIntroLine,
+            publicRegionLine: publicRegionLine,
+            publicOpenToLine: publicOpenToLine,
+            publicActivityLine: publicActivityLine,
+            publicPrimaryOfferLine: publicPrimaryOfferLine,
+            publicImageURL: trustedListTrimmedOptional(pp?.primaryImageURL),
+            publicProfileUpdatedAt: pp?.updatedAt,
+            preferredOfferID: preferredOfferID,
+            hasPublicSurface: hasPublicSurface
+        )
+    }
+
+    private static func trustedListPublicDisplayName(
+        from pp: ExchangePublicNodeProfile?,
+        nodeID: String
+    ) -> String? {
+        guard let raw = pp?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              !trustedListNameLooksLikeNodeToken(raw, nodeID: nodeID) else { return nil }
+        return raw
+    }
+
+    private static func trustedListTrimmedOptional(_ value: String?) -> String? {
+        guard let t = value?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+        return t
+    }
+
+    private static func trustedListFirstNonEmpty(from values: [String]) -> String? {
+        for v in values {
+            let t = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        return nil
+    }
+
+    private static func trustedListJoinedLine(
+        from pieces: [String],
+        maxPieces: Int,
+        maxCharacters: Int
+    ) -> String? {
+        let trimmed = pieces.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return nil }
+        var joined = trimmed.prefix(maxPieces).joined(separator: ", ")
+        if joined.count > maxCharacters, maxCharacters > 1 {
+            joined = String(joined.prefix(maxCharacters - 1)) + "…"
+        }
+        return joined
+    }
+
+    /// True when at least one **mapped** trusted-path display slice is non-empty (avoids interests-only false positives on the chip).
+    private static func trustedListHasDisplayableTrustedSurface(
+        publicDisplayName: String?,
+        publicHeadline: String?,
+        publicSummaryLine: String?,
+        publicIntroLine: String?,
+        publicRegionLine: String?,
+        publicOpenToLine: String?,
+        publicActivityLine: String?,
+        publicPrimaryOfferLine: String?
+    ) -> Bool {
+        [
+            publicDisplayName,
+            publicHeadline,
+            publicSummaryLine,
+            publicIntroLine,
+            publicRegionLine,
+            publicOpenToLine,
+            publicActivityLine,
+            publicPrimaryOfferLine
+        ].contains { trustedListTrimmedOptional($0) != nil }
+    }
+
+    private static func trustedListOfferTitle(for offer: ExchangeOffer?, nodeID: String) -> String? {
+        guard let offer else { return nil }
+        let t = offer.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        guard !trustedListNameLooksLikeNodeToken(t, nodeID: nodeID) else { return nil }
+        return t
+    }
+
+    private static func trustedListSellerOfferSummaryIfDisplaySafe(
+        _ offer: ExchangeOffer?,
+        nodeID: String
+    ) -> String? {
+        guard let raw = offer?.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        guard !trustedListNameLooksLikeNodeToken(raw, nodeID: nodeID) else { return nil }
+        let lower = raw.lowercased()
+        if lower.contains("node-") { return nil }
+        if lower.contains("profile-node-") { return nil }
+        if lower.contains("trust:") { return nil }
+        if lower.contains("deterministic") { return nil }
+        if lower.contains("insufficient structured data") { return nil }
+        if raw.count > 360 {
+            return String(raw.prefix(359)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+        }
+        return raw
+    }
+
+    private static func trustedListNameLooksLikeNodeToken(_ value: String, nodeID: String) -> Bool {
+        let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return true }
+        let lower = t.lowercased()
+        if lower.hasPrefix("node-") || lower.contains("node-") { return true }
+        if t == nodeID { return true }
+        if t.lowercased() == nodeID.lowercased() { return true }
+        return false
+    }
+
+    private static func trustedListStripParentheticalNodeHandle(from line: String) -> String? {
+        guard let openParen = line.lastIndex(of: "(") else { return nil }
+        let prefix = line[..<openParen].trimmingCharacters(in: .whitespacesAndNewlines)
+        let afterOpen = line[line.index(after: openParen)...]
+        guard let closeParen = afterOpen.firstIndex(of: ")") else { return nil }
+        let interior = afterOpen[..<closeParen].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard interior.lowercased().contains("node-") else { return nil }
+        return prefix.isEmpty ? nil : String(prefix)
+    }
+
+    private static func trustedListCounterpartyDisplayLine(
+        counterparty: ExchangeCounterparty?,
+        nodeID: String
+    ) -> String? {
+        guard let cp = counterparty else { return nil }
+
+        let primary = cp.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !primary.isEmpty {
+            if !trustedListNameLooksLikeNodeToken(primary, nodeID: nodeID) {
+                return primary
+            }
+            if let stripped = trustedListStripParentheticalNodeHandle(from: primary),
+               !trustedListNameLooksLikeNodeToken(stripped, nodeID: nodeID) {
+                return stripped
+            }
+        }
+
+        let dn = cp.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if dn.isEmpty { return nil }
+        if !trustedListNameLooksLikeNodeToken(dn, nodeID: nodeID) { return dn }
+
+        return nil
+    }
+
+    private static func trustedListResolveDisplayName(
+        publicDisplayName: String?,
+        counterparty: ExchangeCounterparty?,
+        offerTitle: String?,
+        publicHeadline: String?,
+        relationshipType: ExchangeTrustEdge.RelationshipType,
+        nodeID: String
+    ) -> String {
+        if let publicDisplayName, !publicDisplayName.isEmpty {
+            return publicDisplayName
+        }
+        if let line = trustedListCounterpartyDisplayLine(counterparty: counterparty, nodeID: nodeID) {
+            return line
+        }
+        if let ot = offerTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !ot.isEmpty,
+           !trustedListNameLooksLikeNodeToken(ot, nodeID: nodeID) {
+            return ot
+        }
+        if let h = publicHeadline?.trimmingCharacters(in: .whitespacesAndNewlines), !h.isEmpty,
+           !trustedListNameLooksLikeNodeToken(h, nodeID: nodeID) {
+            return h
+        }
+        return trustedListRelationshipFallbackTitle(relationshipType)
+    }
+
+    private static func trustedListRelationshipFallbackTitle(
+        _ relationshipType: ExchangeTrustEdge.RelationshipType
+    ) -> String {
+        switch relationshipType {
+        case .friend: return "Trusted friend"
+        case .family: return "Trusted family contact"
+        case .colleague: return "Trusted colleague"
+        case .client: return "Trusted client"
+        case .provider: return "Trusted provider"
+        case .collaborator: return "Trusted collaborator"
+        case .knownContact: return "Known contact"
+        case .preferredNode, .other: return "Trusted contact"
+        }
+    }
+}
+
+public extension ExchangeFacade {
+    struct ApprovalQueueResult: Sendable {
+        public var response: ExchangeOrchestrator.Response
+        public var queued: ExchangeFederationQueueResult?
+        public var queueStatus: QueueStatus
+
+        public init(
+            response: ExchangeOrchestrator.Response,
+            queued: ExchangeFederationQueueResult?,
+            queueStatus: QueueStatus
+        ) {
+            self.response = response
+            self.queued = queued
+            self.queueStatus = queueStatus
+        }
+
+        public enum QueueStatus: Sendable, Hashable {
+            case queued
+            case notEligible(reason: String)
+            case notReady(reason: String)
+        }
+    }
+    
+    enum SecondHalfPreparedDraftSendResult: String, Sendable {
+        case queued
+        case missingThread
+        case missingDraft
+        case missingCounterparty
+        case boundaryBlocked
+        case alreadyQueued
+        case notEligible
+    }
+}
+
+private extension ExchangeFacade {
+    func recordApprovalTrustEvidenceIfNeeded(
+        thread: ExchangeThread,
+        approvalID: ExchangeApproval.ID,
+        approved: Bool,
+        now: Date
+    ) async {
+        let event: ExchangeTrustEvidence.EvidenceType = approved ? .userApprovedContact : .userDeclinedContact
+        let weight: Double = approved ? 0.10 : -0.12
+        let userSafeSummary = approved
+            ? "You approved contact before."
+            : "You declined a previous contact."
+        let internalSummary = approved
+            ? "User approved a contact boundary."
+            : "User declined a contact boundary."
+
+        await recordTrustEvidenceIfNeeded(
+            thread: thread,
+            type: event,
+            weight: weight,
+            internalSummary: internalSummary,
+            userSafeSummary: userSafeSummary,
+            sourceEventKey: "thread:\(thread.id.uuidString):\(event.rawValue):\(approvalID.uuidString)",
+            now: now
+        )
+    }
+
+    func recordDeliveryConfirmedTrustEvidenceIfNeeded(
+        threadID: ExchangeThread.ID,
+        now: Date
+    ) async {
+        do {
+            let thread = try await store.requireThread(id: threadID)
+            let turns = try await store.listTurns(threadID: threadID, limit: nil, ascending: true)
+            guard let lastSendConfirmed = turns.last(where: { $0.kind == .sendConfirmed }) else { return }
+
+            await recordTrustEvidenceIfNeeded(
+                thread: thread,
+                type: .deliveryConfirmed,
+                weight: 0.05,
+                internalSummary: "Outbound delivery was confirmed.",
+                userSafeSummary: "Delivery was confirmed.",
+                sourceEventKey: "thread:\(threadID.uuidString):deliveryConfirmed:\(lastSendConfirmed.id.uuidString)",
+                now: now
+            )
+        } catch {
+            exchFacadeLog("recordDeliveryConfirmedTrustEvidenceIfNeeded skipped | threadID=\(threadID.uuidString) | error=\(error)")
+        }
+    }
+
+    func recordReplyReceivedTrustEvidenceIfNeeded(
+        threadID: ExchangeThread.ID,
+        now: Date
+    ) async {
+        do {
+            let thread = try await store.requireThread(id: threadID)
+            let turns = try await store.listTurns(threadID: threadID, limit: nil, ascending: true)
+            guard let lastReply = turns.last(where: { $0.kind == .replyReceived }) else { return }
+
+            await recordTrustEvidenceIfNeeded(
+                thread: thread,
+                type: .replyReceived,
+                weight: 0.08,
+                internalSummary: "Inbound reply was reconciled into this thread.",
+                userSafeSummary: "They replied in this thread.",
+                sourceEventKey: "thread:\(threadID.uuidString):replyReceived:\(lastReply.id.uuidString)",
+                now: now
+            )
+        } catch {
+            exchFacadeLog("recordReplyReceivedTrustEvidenceIfNeeded skipped | threadID=\(threadID.uuidString) | error=\(error)")
+        }
+    }
+
+    func recordThreadCompletedTrustEvidenceIfNeeded(
+        threadID: ExchangeThread.ID,
+        now: Date
+    ) async {
+        do {
+            guard let thread = try await store.fetchThread(id: threadID) else { return }
+            await recordThreadCompletedTrustEvidenceIfNeeded(thread: thread, now: now)
+        } catch {
+            exchFacadeLog("recordThreadCompletedTrustEvidenceIfNeeded skipped | threadID=\(threadID.uuidString) | error=\(error)")
+        }
+    }
+
+    func recordThreadCompletedTrustEvidenceIfNeeded(
+        thread: ExchangeThread,
+        now: Date
+    ) async {
+        guard case .resolved = thread.state else { return }
+        await recordTrustEvidenceIfNeeded(
+            thread: thread,
+            type: .threadCompleted,
+            weight: 0.15,
+            internalSummary: "Thread reached resolved state.",
+            userSafeSummary: "Prior exchange completed.",
+            sourceEventKey: "thread:\(thread.id.uuidString):threadCompleted",
+            now: now
+        )
+    }
+
+    func recordRecentDeliveryFailuresTrustEvidenceIfNeeded(now: Date) async {
+        do {
+            let failed = try await store.listOutboxItems(
+                filter: .init(
+                    phases: [.failed],
+                    activeOnly: false,
+                    limit: 20
+                )
+            )
+
+            for item in failed {
+                guard now.timeIntervalSince(item.updatedAt) < 7 * 24 * 60 * 60 else { continue }
+                guard let thread = try await store.fetchThread(id: item.threadID) else { continue }
+
+                await recordTrustEvidenceIfNeeded(
+                    thread: thread,
+                    type: .deliveryFailed,
+                    weight: -0.10,
+                    internalSummary: "Outbound delivery entered failed terminal state.",
+                    userSafeSummary: "Prior delivery issue.",
+                    sourceEventKey: "thread:\(item.threadID.uuidString):deliveryFailed:\(item.id.uuidString)",
+                    now: now
+                )
+            }
+        } catch {
+            exchFacadeLog("recordRecentDeliveryFailuresTrustEvidenceIfNeeded skipped | error=\(error)")
+        }
+    }
+
+    func recordTrustEvidenceIfNeeded(
+        thread: ExchangeThread,
+        type: ExchangeTrustEvidence.EvidenceType,
+        weight: Double,
+        internalSummary: String,
+        userSafeSummary: String,
+        sourceEventKey: String,
+        now: Date
+    ) async {
+        do {
+            guard let targetNodeID = try await resolveTrustTargetNodeID(for: thread) else { return }
+            guard let sourceNodeID = try await resolveLocalTrustSourceNodeID() else { return }
+
+            let edge = try await requireSystemObservedTrustEdge(
+                sourceNodeID: sourceNodeID,
+                targetNodeID: targetNodeID,
+                now: now
+            )
+
+            let existing = try await store.listTrustEvidence(
+                trustEdgeID: edge.id,
+                limit: nil,
+                ascending: true
+            )
+
+            let alreadyRecorded = existing.contains { item in
+                if item.metadata["source_event_key"] == sourceEventKey { return true }
+                return item.threadID == thread.id
+                    && item.type == type
+                    && item.summary == userSafeSummary
+            }
+            guard !alreadyRecorded else { return }
+
+            let evidence = ExchangeTrustEvidence(
+                trustEdgeID: edge.id,
+                type: type,
+                weight: weight,
+                threadID: thread.id,
+                relatedCounterpartyID: targetNodeID,
+                summary: userSafeSummary,
+                note: nil,
+                recordedAt: now,
+                metadata: [
+                    "source_event_key": sourceEventKey,
+                    "internal_summary": internalSummary
+                ]
+            )
+
+            try await store.appendTrustEvidence(evidence)
+            exchFacadeLog("recordTrustEvidenceIfNeeded appended | type=\(type.rawValue) | threadID=\(thread.id.uuidString)")
+        } catch {
+            exchFacadeLog("recordTrustEvidenceIfNeeded skipped (non-fatal) | type=\(type.rawValue) | threadID=\(thread.id.uuidString) | error=\(error)")
+        }
+    }
+
+    func resolveTrustTargetNodeID(for thread: ExchangeThread) async throws -> String? {
+        guard let selectedID = thread.selectedCounterpartyID else { return nil }
+        guard let selected = try await store.fetchCounterparty(id: selectedID) else { return selectedID.nilIfBlank }
+        if let nodeID = selected.identity?.nodeID?.nilIfBlank {
+            return nodeID
+        }
+        return selected.id.nilIfBlank
+    }
+
+    func resolveLocalTrustSourceNodeID() async throws -> String? {
+        let profiles = try await store.listPublicProfiles(filter: .init(limit: 1))
+        return profiles.first?.nodeID.nilIfBlank
+    }
+
+    func requireSystemObservedTrustEdge(
+        sourceNodeID: String,
+        targetNodeID: String,
+        now: Date
+    ) async throws -> ExchangeTrustEdge {
+        if let existing = try await store.fetchTrustEdge(
+            sourceNodeID: sourceNodeID,
+            targetNodeID: targetNodeID
+        ) {
+            return existing
+        }
+
+        let edge = ExchangeTrustEdge(
+            sourceNodeID: sourceNodeID,
+            targetNodeID: targetNodeID,
+            relationshipType: .knownContact,
+            trustLevel: .standard,
+            scopes: [.generalCommunication],
+            propagation: .privateOnly,
+            sourceKind: .systemObserved,
+            note: "Auto-created from local thread trust evidence.",
+            createdAt: now,
+            updatedAt: now,
+            lastConfirmedAt: now
+        )
+        try await store.saveTrustEdge(edge)
+        return edge
+    }
+
+    func deriveLocalTrustPosture(
+        detail: ExchangeModels.ThreadDetail,
+        fallbackRouteLabel: String?
+    ) async throws -> ExchangeLocalTrustPosture? {
+        guard let thread = try await store.fetchThread(id: detail.thread.id) else { return nil }
+        let routeLabel = fallbackRouteLabel?.nilIfBlank
+
+        guard let targetNodeID = try await resolveTrustTargetNodeID(for: thread) else {
+            guard let routeLabel else { return nil }
+            return ExchangeLocalTrustPosture(
+                nodeID: "",
+                level: .new,
+                confidence: .unknown,
+                score: 0,
+                evidenceCount: 0,
+                positiveEvidenceCount: 0,
+                negativeEvidenceCount: 0,
+                lastInteractionAt: nil,
+                title: "New contact",
+                summary: "New contact · no prior relationship evidence yet.",
+                evidenceLines: [],
+                cautionLines: [],
+                isLedgerBacked: false,
+                isThreadContextOnly: true,
+                routeLabel: routeLabel
+            )
+        }
+
+        let sourceNodeID = try await resolveLocalTrustSourceNodeID()
+        let profile = try await store.fetchTrustedNodeProfile(
+            nodeID: targetNodeID,
+            forSourceNodeID: sourceNodeID
+        )
+        let edge: ExchangeTrustEdge?
+        if let sourceNodeID {
+            edge = try await store.fetchTrustEdge(
+                sourceNodeID: sourceNodeID,
+                targetNodeID: targetNodeID
+            )
+        } else {
+            edge = nil
+        }
+        let evidence = try await loadEvidenceForEdge(edge)
+        let counterparty = detail.counterparties.first(where: { counterparty in
+            counterparty.id == detail.thread.selectedCounterpartyID
+        })
+
+        let score = min(max(evidence.reduce(0.0, { $0 + $1.weight }), -1), 1)
+        let positiveCount = evidence.filter { $0.isPositive }.count
+        let negativeCount = evidence.count - positiveCount
+
+        let blockedByEvidence = evidence.contains(where: { $0.type == ExchangeTrustEvidence.EvidenceType.userBlockedNode })
+        let blockedByStatus = counterparty?.status == .blocked
+        let trustFloorMismatch = isTrustFloorMismatch(counterparty)
+
+        let evidenceLines = trustEvidenceLines(from: evidence)
+        var cautionLines = trustCautionLines(from: evidence)
+        if trustFloorMismatch {
+            cautionLines.append("This profile requires a stronger relationship before direct contact.")
+        }
+
+        let level: ExchangeLocalTrustPosture.Level = {
+            if blockedByEvidence || blockedByStatus {
+                return .blocked
+            }
+            if negativeCount > 0 || trustFloorMismatch || score < -0.15 {
+                return .caution
+            }
+            if let edge, edge.trustLevel == .high, positiveCount >= 2 {
+                return .trusted
+            }
+            if positiveCount >= 3 && score > 0 {
+                return .reliable
+            }
+            if positiveCount >= 1 || edge != nil {
+                return .known
+            }
+            return .new
+        }()
+
+        let confidence: ExchangeLocalTrustPosture.Confidence = {
+            if evidence.isEmpty { return .unknown }
+            if evidence.count <= 1 { return .low }
+            if evidence.count <= 3 { return .medium }
+            return .high
+        }()
+
+        let title: String
+        let summary: String
+        switch level {
+        case .blocked:
+            title = "Blocked"
+            summary = "Blocked · you blocked this node."
+        case .caution:
+            title = "Caution"
+            summary = "Caution · prior delivery or policy issue."
+        case .new:
+            title = "New contact"
+            summary = "New contact · no prior relationship evidence yet."
+        case .known:
+            title = "Known path"
+            summary = "Known path · you approved contact before."
+        case .reliable:
+            title = "Reliable contact"
+            summary = "Reliable contact · prior successful exchange."
+        case .trusted:
+            title = "Trusted relationship"
+            summary = "Reliable contact · prior successful exchange."
+        }
+
+        let isLedgerBacked = edge != nil || !evidence.isEmpty || profile != nil
+
+        return ExchangeLocalTrustPosture(
+            nodeID: targetNodeID,
+            level: level,
+            confidence: confidence,
+            score: score,
+            evidenceCount: evidence.count,
+            positiveEvidenceCount: positiveCount,
+            negativeEvidenceCount: negativeCount,
+            lastInteractionAt: evidence.map { $0.recordedAt }.max(),
+            title: title,
+            summary: summary,
+            evidenceLines: evidenceLines,
+            cautionLines: cautionLines,
+            isLedgerBacked: isLedgerBacked,
+            isThreadContextOnly: !isLedgerBacked,
+            routeLabel: routeLabel
+        )
+    }
+
+    func loadEvidenceForEdge(_ edge: ExchangeTrustEdge?) async throws -> [ExchangeTrustEvidence] {
+        guard let edge else { return [] }
+        return try await store.listTrustEvidence(
+            trustEdgeID: edge.id,
+            limit: 40,
+            ascending: false
+        )
+    }
+
+    func trustEvidenceLines(from evidence: [ExchangeTrustEvidence]) -> [String] {
+        var lines: [String] = []
+        var seen = Set<String>()
+        for item in evidence {
+            let line: String?
+            switch item.type {
+            case .userApprovedContact, .repeatedApproval:
+                line = "You approved contact before."
+            case .deliveryConfirmed:
+                line = "Delivery was confirmed."
+            case .replyReceived:
+                line = "They replied in this thread."
+            case .threadCompleted, .successfulThread:
+                line = "Prior exchange completed."
+            case .groundedPublicAnswer:
+                line = "They answered from public facts."
+            default:
+                line = nil
+            }
+
+            guard let line else { continue }
+            let key = line.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            lines.append(line)
+            if lines.count >= 4 { break }
+        }
+        return lines
+    }
+
+    func trustCautionLines(from evidence: [ExchangeTrustEvidence]) -> [String] {
+        var lines: [String] = []
+        var seen = Set<String>()
+        for item in evidence {
+            let line: String?
+            switch item.type {
+            case .deliveryFailed:
+                line = "Prior delivery issue."
+            case .userDeclinedContact:
+                line = "You declined a previous contact."
+            case .policyConcern:
+                line = "A prior policy concern was recorded."
+            case .userBlockedNode:
+                line = "You blocked this node."
+            default:
+                line = nil
+            }
+            guard let line else { continue }
+            let key = line.lowercased()
+            guard seen.insert(key).inserted else { continue }
+            lines.append(line)
+            if lines.count >= 4 { break }
+        }
+        return lines
+    }
+
+    func isTrustFloorMismatch(_ counterparty: ExchangeCounterparty?) -> Bool {
+        guard let counterparty,
+              let minimumTrust = counterparty.publicProfile?.reachability.minimumTrustLevel
+        else {
+            return false
+        }
+
+        return trustRank(counterparty.trust.level) < trustRank(minimumTrust)
+    }
+
+    func trustRank(_ level: ExchangeCounterparty.TrustSnapshot.Level) -> Int {
+        switch level {
+        case .unverified:
+            return 0
+        case .low:
+            return 1
+        case .moderate:
+            return 2
+        case .high:
+            return 3
+        }
+    }
+}
+
+fileprivate extension ExchangeFacade {
+    struct Pass2AgencyBuildResult {
+        var assessment: ExchangeAgencyAssessment
+        var requesterContext: ExchangeAgencyContext?
+        var requesterExecutionContext: ExchangeSecondHalfExecutionContext?
+        var requesterStyleProfile: ExchangeSecretaryStyleProfile?
+        /// Compact top match lines (max 3) for autonomous compose / rewrite prompts.
+        var requesterTopRankedCandidateSummaries: [String]
+        /// LLM compare (requester ask vs matched surface); nil when skipped or non–on-device runner.
+        var requesterMatchCompare: ExchangeRequesterMatchCompareResult?
+        /// Final provider-bound question lines for agency packets (LLM or named deterministic fallback).
+        var requesterDirectedQuestionsForAgency: [String]
+        /// True when on-device requester-match compare completed without decode/run failure.
+        var requesterMatchCompareSucceeded: Bool
+        /// Deterministic requester intent vs surface gaps for this Pass-2 build (requester threads only).
+        var requesterIntentGaps: [ExchangeRequesterIntentGap]
+        var providerContext: ExchangeAgencyContext?
+        var providerExecutionContext: ExchangeSecondHalfExecutionContext?
+        var providerStyleProfile: ExchangeSecretaryStyleProfile?
+        /// LLM compare for inbound inquiry vs seller surface (provider threads).
+        var providerInquiryCompare: ExchangeProviderInquiryCompareResult?
+    }
+
+    /// Reused between compare-first prefetch and pass-2 to avoid a second `providerInquiryCompare` LLM call.
+    struct ProviderInboundCompareFirstCache: Sendable {
+        var compare: ExchangeProviderInquiryCompareResult
+        var governed: ProviderInquiryCompareGovernor.Outcome
+    }
+
+    func makeProviderCompareFirstStructuredPillarBypassPacket(
+        cache: ProviderInboundCompareFirstCache,
+        snapshot: ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot
+    ) -> ProviderCompareFirstStructuredPillarBypassPacket {
+        let governed = cache.governed
+        let cmp = governed.clampedCompare
+        let draftTrimmed = cmp.draftReply?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasCompareGroundedDraft = !draftTrimmed.isEmpty
+
+        let answerabilityOK =
+            cmp.answerableFromOffer
+            || snapshot.inquiry?.canBeAnsweredFromKnownFacts == true
+
+        let consentOK = cmp.canSendWithinConsent != false
+        let boundaryFieldsOK = cmp.requiresBoundaryApproval != true
+        let missingOK = cmp.missingFacts.isEmpty
+        let needsInputOK = !cmp.needsProviderInput
+        let actionOK = governed.normalizedAction == .sendWithinConsent
+
+        let snapshotCommitmentSafe =
+            !snapshot.isCustomPricing
+            && !snapshot.includesScheduleCommitment
+            && !snapshot.includesLegalCommercialCommitment
+            && !snapshot.includesSensitiveDisclosure
+            && !snapshot.isPolicyException
+
+        let isEligible =
+            actionOK
+            && answerabilityOK
+            && needsInputOK
+            && missingOK
+            && hasCompareGroundedDraft
+            && consentOK
+            && boundaryFieldsOK
+            && snapshotCommitmentSafe
+
+        return ProviderCompareFirstStructuredPillarBypassPacket(
+            isEligible: isEligible,
+            compareNormalizedAction: governed.normalizedAction.rawValue,
+            recommendedDisposition: cmp.recommendedDisposition,
+            answerableFromOffer: cmp.answerableFromOffer,
+            missingFactsCount: cmp.missingFacts.count,
+            needsProviderInput: cmp.needsProviderInput,
+            canSendWithinConsent: cmp.canSendWithinConsent,
+            requiresBoundaryApproval: cmp.requiresBoundaryApproval,
+            hasCompareGroundedDraft: hasCompareGroundedDraft
+        )
+    }
+
+    func makeRequesterReviewSurfaceContext(
+        thread: ExchangeThread,
+        snapshot: ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot,
+        pass2: Pass2AgencyBuildResult?
+    ) -> ExchangeRequesterReviewSurfaceContext? {
+        guard snapshot.role == .requester else { return nil }
+        let ctx = pass2?.requesterContext
+        let firstRegion =
+            (ctx?.offer?.regionTags ?? []).lazy
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+                ?? (ctx?.publicProfile?.regionTags ?? []).lazy
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+        return ExchangeRequesterReviewSurfaceContext(
+            subjectMatter: snapshot.subjectMatter ?? thread.title,
+            counterpartyDisplayName: snapshot.counterpartyName,
+            offerTitle: ctx?.offer?.title,
+            profileDisplayName: ctx?.publicProfile?.displayName,
+            profileHeadline: ctx?.publicProfile?.headline,
+            regionHint: firstRegion
+        )
+    }
+
+    struct SecondHalfMutationDisplayOutcome {
+        var display: ExchangeSecondHalfUIAdapter.DisplayModel
+        var pass2Agency: Pass2AgencyBuildResult?
+    }
+
+    enum AgencyOutboundMaterializationResult: Equatable {
+        case skipped(String)
+        case composedAndSaved(draftID: ExchangeMessageDraft.ID)
+        case failed(String)
+    }
+
+    enum ExchangeSecondHalfProjectionPolicy: Sendable {
+        /// Side-effect-free path for list/detail UI reads.
+        case cachedOnly
+        /// Full evaluator path for mutation/sync flows.
+        case evaluateAndPersistAfterMutation
+    }
+
+    func makeSecondHalfDisplayIfAvailable(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        matches: [ExchangeMatch],
+        selectedCounterparty: ExchangeCounterparty?,
+        latestDraft: ExchangeMessageDraft?,
+        latestApproval: ExchangeApproval?,
+        projectionPolicy: ExchangeSecondHalfProjectionPolicy
+    ) async -> ExchangeSecondHalfUIAdapter.DisplayModel? {
+        guard isSecondHalfEligible(thread: thread, matches: matches, latestDraft: latestDraft) else {
+            // Do not aggressively clear secondHalf during normal list/get projection.
+            // A thread can temporarily look ineligible while related records are still loading,
+            // or after a state transition before the next orchestration pass.
+            return nil
+        }
+
+        if case .cachedOnly = projectionPolicy {
+            // Guardrail: read projection must remain deterministic and side-effect free.
+            guard let persistedSnapshot = thread.secondHalf else { return nil }
+            return secondHalfFacade.getCachedDisplayModel(
+                snapshot: persistedSnapshot,
+                thread: thread,
+                selectedCounterpartyName: selectedCounterparty?.bestDisplayLine,
+                latestDraft: latestDraft
+            )
+        }
+
+        return (await buildSecondHalfMutationDisplayOutcome(
+            thread: thread,
+            turns: turns,
+            matches: matches,
+            selectedCounterparty: selectedCounterparty,
+            latestDraft: latestDraft,
+            latestApproval: latestApproval
+        ))?.display
+    }
+
+    func buildSecondHalfMutationDisplayOutcome(
+        thread threadInput: ExchangeThread,
+        turns: [ExchangeTurn],
+        matches: [ExchangeMatch],
+        selectedCounterparty selectedCounterpartyInput: ExchangeCounterparty?,
+        latestDraft: ExchangeMessageDraft?,
+        latestApproval: ExchangeApproval?
+    ) async -> SecondHalfMutationDisplayOutcome? {
+        var anchoredThread = threadInput
+        var selectedCounterparty = selectedCounterpartyInput
+        do {
+            try await persistWeakMatchRecipientAnchorIfNeeded(
+                thread: anchoredThread,
+                matches: matches,
+                selectedCounterparty: selectedCounterparty
+            )
+            anchoredThread = try await store.requireThread(id: threadInput.id)
+            selectedCounterparty = try await loadSelectedCounterparty(for: anchoredThread) ?? selectedCounterpartyInput
+        } catch {
+            anchoredThread = threadInput
+            selectedCounterparty = selectedCounterpartyInput
+            #if DEBUG
+            exchFacadeLog(
+                "buildSecondHalfMutationDisplayOutcome weak-anchor hydration failed | thread=\(threadInput.id.uuidString) | \(error)"
+            )
+            #endif
+        }
+
+        // Use the role locked by the first evaluation if one exists, so the thread does not
+        // flip from .requester to .provider when an inbound reply sets lastInboundEnvelopeID.
+        let role: ExchangeSecondHalfRole =
+            await secondHalfFacade.loadFirstEstablishedRole(for: anchoredThread.id)
+            ?? inferSecondHalfRole(thread: anchoredThread)
+
+        let state = mapSecondHalfState(
+            thread: anchoredThread,
+            latestDraft: latestDraft,
+            latestApproval: latestApproval
+        )
+
+        let knownFacts = await makeSecondHalfKnownFacts(
+            thread: anchoredThread,
+            turns: turns,
+            matches: matches,
+            selectedCounterparty: selectedCounterparty,
+            latestDraft: latestDraft
+        )
+
+        let requestCapturedSummary = turns.reversed().first(where: { $0.kind == .requestCaptured })?.summary
+        let unresolvedIssues = makeSecondHalfUnresolvedIssues(
+            thread: anchoredThread,
+            latestApproval: latestApproval,
+            knownFacts: knownFacts,
+            matches: matches,
+            requestCapturedSupplement: requestCapturedSummary
+        )
+
+        #if DEBUG
+        do {
+            var interpKeywordParts: [String] = []
+            if let i = anchoredThread.interpretation {
+                interpKeywordParts.append(contentsOf: i.semanticTags)
+                interpKeywordParts.append(contentsOf: i.discoveryKeywords)
+                interpKeywordParts.append(contentsOf: i.targetTags)
+            }
+            let interpPreview = exchangeDebugAuditBodyPrefix(
+                interpKeywordParts.joined(separator: " · "),
+                maxLen: 160
+            )
+            let issuesPreview = exchangeDebugAuditBodyPrefix(
+                unresolvedIssues.joined(separator: " | "),
+                maxLen: 220
+            )
+            exchFacadeLog(
+                "[SecondHalfPreEvalIssues] thread=\(anchoredThread.id.uuidString) state=\(state.rawValue) knownFactsCount=\(knownFacts.count) unresolvedIssuesCount=\(unresolvedIssues.count) unresolvedPreview=\(issuesPreview) selectedCounterpartyID=\(anchoredThread.selectedCounterpartyID ?? "nil") selectedProfileID=\(anchoredThread.selectedPublicProfileID ?? "nil") selectedOfferID=\(anchoredThread.selectedOfferID ?? "nil") titlePreview=\(exchangeDebugAuditBodyPrefix(anchoredThread.title, maxLen: 120)) visibleSummaryPreview=\(exchangeDebugAuditBodyPrefix(anchoredThread.visibleSummary ?? "", maxLen: 160)) interpretationKeywordsPreview=\(interpPreview)"
+            )
+        }
+        #endif
+
+        let requestCapturedText = ExchangeThreadCardTitleProjection.requestCapturedText(from: turns)
+        let isFirstExternalContact = RequesterOutboundPhase.isFirstExternalContact(
+            thread: anchoredThread,
+            turns: turns
+        )
+        let snapshotSubjectMatter: String? = role == .requester
+            ? await resolvedRequesterOutboundSubjectMatterLabel(
+                thread: anchoredThread,
+                turns: turns,
+                selectedCounterparty: selectedCounterparty
+            )
+            : anchoredThread.title
+
+        let compareFirstActive = role == .provider && enableCompareFirstProviderInbound
+
+        var providerCompareFirstCache: ProviderInboundCompareFirstCache?
+        let resolvedInquiry: ExchangeInboundInquiry?
+
+        if compareFirstActive {
+            let provisionalSnapshot = ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot(
+                threadID: anchoredThread.id,
+                role: role,
+                state: state,
+                priorQuestionsAsked: makeSecondHalfPriorQuestions(thread: anchoredThread, turns: turns),
+                priorAnswersReceived: makeSecondHalfPriorAnswers(turns: turns),
+                currentConstraints: makeSecondHalfConstraints(thread: anchoredThread),
+                priorNonCommitments: [],
+                knownFacts: knownFacts,
+                unresolvedIssues: unresolvedIssues,
+                surfacedCandidateCount: max(matches.count, anchoredThread.candidateCounterpartyIDs.count),
+                clarificationRounds: countClarificationRounds(turns: turns),
+                followUpAttempts: countFollowUpAttempts(turns: turns),
+                autonomousRoundsSoFar: countAutonomousRounds(turns: turns),
+                isTimeSensitive: isTimeSensitive(thread: anchoredThread, turns: turns),
+                isPriceSensitive: isPriceSensitive(thread: anchoredThread, turns: turns),
+                hasLowTrustSignals: hasLowTrustSignals(thread: anchoredThread),
+                hasComparableAlternatives: matches.count > 1 || anchoredThread.candidateCounterpartyIDs.count > 1,
+                hasFreshProviderAnswer: hasFreshProviderAnswer(thread: anchoredThread, turns: turns),
+                counterpartyName: selectedCounterparty?.bestDisplayLine,
+                subjectMatter: snapshotSubjectMatter,
+                requestedItems: requestedItems(thread: anchoredThread),
+                clarifiedFacts: knownFacts,
+                inquiry: nil,
+                structuredQuery: makeStructuredQueryIfAvailable(thread: anchoredThread, turns: turns),
+                isCustomPricing: containsAny(
+                    thread: anchoredThread,
+                    turns: turns,
+                    terms: ["custom price", "custom pricing", "quote", "special rate"]
+                ),
+                includesSensitiveDisclosure: containsAny(
+                    thread: anchoredThread,
+                    turns: turns,
+                    terms: ["private", "confidential", "sensitive", "personal information"]
+                ),
+                includesScheduleCommitment: containsAny(
+                    thread: anchoredThread,
+                    turns: turns,
+                    terms: ["book", "schedule", "appointment", "reserve", "confirm time"]
+                ),
+                includesLegalCommercialCommitment: containsAny(
+                    thread: anchoredThread,
+                    turns: turns,
+                    terms: ["contract", "agreement", "sign", "purchase order", "invoice"]
+                ),
+                isPolicyException: containsAny(
+                    thread: anchoredThread,
+                    turns: turns,
+                    terms: ["exception", "outside policy", "special case"]
+                ),
+                lastDecisionFrame: makePreviousSecondHalfDecisionFrame(from: anchoredThread.secondHalf),
+                latestDelta: makePreviousSecondHalfDelta(from: anchoredThread.secondHalf),
+                lastKnownStance: makePreviousSecondHalfStance(from: anchoredThread.secondHalf),
+                lastApprovedPosition: latestApproval?.summary,
+                previousRecommendation: anchoredThread.secondHalf?.recommendation
+                    ?? anchoredThread.secondHalf?.previousRecommendation
+                    ?? anchoredThread.interpretation?.userNextStep,
+                customInstructions: currentSecretaryConstitutionText(),
+                latestCounterpartyReplyText: latestCounterpartyReplyTextForSecondHalf(from: turns),
+                isThreadExplicitlyCompleted: isExchangeThreadExplicitlyCompleted(thread: anchoredThread),
+                selectedCounterpartyID: anchoredThread.selectedCounterpartyID,
+                selectedPublicProfileID: anchoredThread.selectedPublicProfileID,
+                selectedOfferID: anchoredThread.selectedOfferID,
+                lastInboundEnvelopeID: anchoredThread.lastInboundEnvelopeID,
+                requestCapturedText: requestCapturedText,
+                isFirstExternalContact: role == .requester ? isFirstExternalContact : nil
+            )
+            let cache = await runProviderCompareFirstPrefetch(
+                anchoredThread: anchoredThread,
+                turns: turns,
+                provisionalSnapshot: provisionalSnapshot
+            )
+            providerCompareFirstCache = cache
+            let latestInbound = latestInboundRequesterMessage(thread: anchoredThread, turns: turns)
+            resolvedInquiry = ProviderInboundCompareRoutingAdapter.makeInboundInquiry(
+                compare: cache.governed.clampedCompare,
+                governed: cache.governed,
+                rawRequesterAsk: latestInbound?.text ?? "Inbound coordination.",
+                matchedOfferOrProfileAnchor: anchoredThread.selectedOfferID ?? anchoredThread.selectedPublicProfileID
+            )
+            #if DEBUG
+            exchFacadeLog(
+                "[ProviderInboundCompare] compare_first synthesized | thread=\(anchoredThread.id.uuidString) | action=\(cache.governed.normalizedAction.rawValue)"
+            )
+            #endif
+        } else {
+            resolvedInquiry = nil
+        }
+
+        let inquiryForSnapshot: ExchangeInboundInquiry?
+        if compareFirstActive {
+            inquiryForSnapshot = resolvedInquiry ?? fallbackInboundInquiry(
+                thread: anchoredThread,
+                turns: turns,
+                selectedCounterparty: selectedCounterparty
+            )
+        } else {
+            inquiryForSnapshot = await makeInboundInquiryIfAvailable(
+                thread: anchoredThread,
+                turns: turns,
+                selectedCounterparty: selectedCounterparty,
+                knownFacts: knownFacts,
+                unresolvedIssues: unresolvedIssues
+            )
+        }
+
+        var snapshot = ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot(
+            threadID: anchoredThread.id,
+            role: role,
+            state: state,
+            priorQuestionsAsked: makeSecondHalfPriorQuestions(thread: anchoredThread, turns: turns),
+            priorAnswersReceived: makeSecondHalfPriorAnswers(turns: turns),
+            currentConstraints: makeSecondHalfConstraints(thread: anchoredThread),
+            priorNonCommitments: [],
+            knownFacts: knownFacts,
+            unresolvedIssues: unresolvedIssues,
+            surfacedCandidateCount: max(matches.count, anchoredThread.candidateCounterpartyIDs.count),
+            clarificationRounds: countClarificationRounds(turns: turns),
+            followUpAttempts: countFollowUpAttempts(turns: turns),
+            autonomousRoundsSoFar: countAutonomousRounds(turns: turns),
+            isTimeSensitive: isTimeSensitive(thread: anchoredThread, turns: turns),
+            isPriceSensitive: isPriceSensitive(thread: anchoredThread, turns: turns),
+            hasLowTrustSignals: hasLowTrustSignals(thread: anchoredThread),
+            hasComparableAlternatives: matches.count > 1 || anchoredThread.candidateCounterpartyIDs.count > 1,
+            hasFreshProviderAnswer: hasFreshProviderAnswer(thread: anchoredThread, turns: turns),
+            counterpartyName: selectedCounterparty?.bestDisplayLine,
+            subjectMatter: snapshotSubjectMatter,
+            requestedItems: requestedItems(thread: anchoredThread),
+            clarifiedFacts: knownFacts,
+            inquiry: inquiryForSnapshot,
+            structuredQuery: makeStructuredQueryIfAvailable(thread: anchoredThread, turns: turns),
+            isCustomPricing: containsAny(
+                thread: anchoredThread,
+                turns: turns,
+                terms: ["custom price", "custom pricing", "quote", "special rate"]
+            ),
+            includesSensitiveDisclosure: containsAny(
+                thread: anchoredThread,
+                turns: turns,
+                terms: ["private", "confidential", "sensitive", "personal information"]
+            ),
+            includesScheduleCommitment: containsAny(
+                thread: anchoredThread,
+                turns: turns,
+                terms: ["book", "schedule", "appointment", "reserve", "confirm time"]
+            ),
+            includesLegalCommercialCommitment: containsAny(
+                thread: anchoredThread,
+                turns: turns,
+                terms: ["contract", "agreement", "sign", "purchase order", "invoice"]
+            ),
+            isPolicyException: containsAny(
+                thread: anchoredThread,
+                turns: turns,
+                terms: ["exception", "outside policy", "special case"]
+            ),
+            lastDecisionFrame: makePreviousSecondHalfDecisionFrame(from: anchoredThread.secondHalf),
+            latestDelta: makePreviousSecondHalfDelta(from: anchoredThread.secondHalf),
+            lastKnownStance: makePreviousSecondHalfStance(from: anchoredThread.secondHalf),
+            lastApprovedPosition: latestApproval?.summary,
+            previousRecommendation: anchoredThread.secondHalf?.recommendation
+                ?? anchoredThread.secondHalf?.previousRecommendation
+                ?? anchoredThread.interpretation?.userNextStep,
+            customInstructions: currentSecretaryConstitutionText(),
+            latestCounterpartyReplyText: latestCounterpartyReplyTextForSecondHalf(from: turns),
+            isThreadExplicitlyCompleted: isExchangeThreadExplicitlyCompleted(thread: anchoredThread),
+            selectedCounterpartyID: anchoredThread.selectedCounterpartyID,
+            selectedPublicProfileID: anchoredThread.selectedPublicProfileID,
+            selectedOfferID: anchoredThread.canonicalCommercialOfferAnchor,
+            lastInboundEnvelopeID: anchoredThread.lastInboundEnvelopeID,
+            requestCapturedText: requestCapturedText,
+            isFirstExternalContact: role == .requester ? isFirstExternalContact : nil
+        )
+
+        if compareFirstActive, let cache = providerCompareFirstCache {
+            snapshot.providerCompareFirstStructuredPillarBypassPacket =
+                makeProviderCompareFirstStructuredPillarBypassPacket(cache: cache, snapshot: snapshot)
+        }
+
+        do {
+            let result = try await secondHalfFacade.evaluateThread(snapshot)
+
+            let pass2Result: Pass2AgencyBuildResult?
+            do {
+                let assembled = try await secondHalfFacade.assembledOperatingMemory(for: snapshot)
+                pass2Result = try await buildPass2AgencyAssessment(
+                    thread: anchoredThread,
+                    turns: turns,
+                    snapshot: snapshot,
+                    knownFacts: knownFacts,
+                    operatingMemory: assembled,
+                    matches: matches,
+                    providerCompareFirstCache: compareFirstActive ? providerCompareFirstCache : nil
+                )
+            } catch {
+                #if DEBUG
+                exchFacadeLog(
+                    "buildSecondHalfMutationDisplayOutcome agency overlay skipped | thread=\(anchoredThread.id.uuidString) | \(error)"
+                )
+                #endif
+
+                pass2Result = nil
+            }
+
+            #if DEBUG
+            if role == .provider {
+                let plan = result.plan
+                let intake = result.providerIntakeDecision?.rawValue ?? "nil"
+                let inboundAns = snapshot.inquiry?.answerabilityStatus.rawValue ?? "nil"
+                let pass2Ans = pass2Result?.assessment.providerAnswerability?.answerability.rawValue ?? "nil"
+                let missingCount = pass2Result?.assessment.providerAnswerability?.missingFacts.count ?? 0
+                let reasonLine = exchangeDebugAuditBodyPrefix(plan.rationale, maxLen: 140)
+                exchFacadeLog(
+                    "[SecondHalfPlan] role=provider actionRaw=\(plan.selectedAction.rawValue) actionTitle=\(plan.selectedAction.displayTitle) intakeDecision=\(intake) answerabilityStatus=\(inboundAns) pass2Answerability=\(pass2Ans) missingFactsCount=\(missingCount) reason=\(reasonLine)"
+                )
+            }
+            #endif
+
+            let agencyAssessment = pass2Result?.assessment
+            let requesterSurfaceContext = makeRequesterReviewSurfaceContext(
+                thread: anchoredThread,
+                snapshot: snapshot,
+                pass2: pass2Result
+            )
+            let outboundSendContext = ExchangeSecondHalfOutboundSendContext(
+                thread: anchoredThread,
+                latestDraft: latestDraft
+            )
+            var display = secondHalfFacade.getDisplayModel(
+                result,
+                inquiry: snapshot.inquiry,
+                agencyAssessment: agencyAssessment,
+                requesterSurfaceContext: requesterSurfaceContext,
+                outboundSendContext: outboundSendContext
+            )
+
+            let pass2HydratedOffer =
+                pass2Result?.requesterContext?.offer != nil || pass2Result?.providerContext?.offer != nil
+            let pass2HydratedProfile =
+                pass2Result?.requesterContext?.publicProfile != nil
+                || pass2Result?.providerContext?.publicProfile != nil
+
+            display = display.applyingSurfaceAwareOpportunityMissingFacts(
+                thread: anchoredThread,
+                hasHydratedOffer: pass2HydratedOffer,
+                hasHydratedProfile: pass2HydratedProfile
+            )
+
+            do {
+                let gate = ExchangeAgencyPlanner.evaluateAutonomousOutboundGate(display: display)
+                let hold = gate.allowed
+                    ? (line: Optional<String>.none, reason: Optional<String>.none)
+                    : ExchangeAgencyPlanner.userFacingAutonomyHold(from: gate)
+                let agencySnapshot = agencyAssessment.map {
+                    ExchangeSecondHalfAgencySnapshot.fromAssessment(
+                        $0,
+                        autonomyHoldLine: hold.line,
+                        autonomyHoldReason: hold.reason,
+                        gate: gate
+                    )
+                }
+                try await secondHalfFacade.saveSecondHalfAgencySnapshot(
+                    forThreadID: anchoredThread.id,
+                    role: role,
+                    agency: agencySnapshot
+                )
+            } catch {
+                #if DEBUG
+                exchFacadeLog(
+                    "buildSecondHalfMutationDisplayOutcome agency persist skipped | thread=\(anchoredThread.id.uuidString) | \(error)"
+                )
+                #endif
+            }
+
+            await persistSecondHalfDisplayIfChanged(
+                display,
+                for: anchoredThread
+            )
+
+            return SecondHalfMutationDisplayOutcome(display: display, pass2Agency: pass2Result)
+        } catch {
+            #if DEBUG
+            exchFacadeLog(
+                "buildSecondHalfMutationDisplayOutcome failed | thread=\(anchoredThread.id.uuidString) | error=\(error)"
+            )
+            #endif
+
+            return nil
+        }
+    }
+
+    func pass2ThreadHistoryLines(from turns: [ExchangeTurn], limit: Int = 12) -> [String] {
+        let tail = turns.suffix(limit)
+
+        var lines: [String] = []
+        lines.reserveCapacity(tail.count)
+
+        for turn in tail {
+            let trimmed = turn.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard !trimmed.isEmpty else { continue }
+
+            lines.append(trimmed)
+
+            if lines.count >= limit {
+                break
+            }
+        }
+
+        return lines
+    }
+
+    private func providerInboundAskFingerprint(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
+    private func sha256HexUtf8(_ text: String) -> String {
+        let digest = SHA256.hash(data: Data(text.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func providerInboundLatestIntentExtraction(
+        thread: ExchangeThread,
+        inquiryText: String
+    ) async -> ProviderInboundIntentSnapshot {
+        let fingerprint = providerInboundAskFingerprint(inquiryText)
+        let askHash = sha256HexUtf8(fingerprint)
+        let env = thread.lastInboundEnvelopeID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let key = ProviderInboundIntentExtractionCache.Key(
+            threadID: thread.id,
+            envelopeID: env,
+            askHash: askHash
+        )
+
+        if let hit = ProviderInboundIntentExtractionCache.cached(key) {
+            return ProviderInboundIntentSnapshot(
+                extraction: hit,
+                source: "cached",
+                askHash: askHash,
+                decodeSucceeded: true,
+                fallbackReason: nil,
+                rawChars: nil,
+                cleanedChars: nil
+            )
+        }
+
+        let request = ProviderInboundIntentExtractionRequest(
+            rawRequesterAsk: inquiryText,
+            threadID: thread.id,
+            selectedCounterpartyID: thread.selectedCounterpartyID,
+            selectedOfferID: thread.selectedOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID
+        )
+
+        do {
+            let extraction = try await intelligenceProvider.extractProviderInboundIntent(request)
+            ProviderInboundIntentExtractionCache.store(key, value: extraction)
+            logProviderInboundIntentExtraction(
+                threadID: thread.id,
+                envelopeID: env,
+                askHash: askHash,
+                extraction: extraction,
+                source: "providerInboundIntentExtraction",
+                decodeSucceeded: true,
+                fallbackReason: nil
+            )
+            return ProviderInboundIntentSnapshot(
+                extraction: extraction,
+                source: "providerInboundIntentExtraction",
+                askHash: askHash,
+                decodeSucceeded: true,
+                fallbackReason: nil,
+                rawChars: nil,
+                cleanedChars: nil
+            )
+        } catch let failure as ProviderInboundIntentExtractionFailure {
+            let (reason, raw, cleaned): (String, Int?, Int?) = {
+                switch failure {
+                case .decodeFailed(let d):
+                    return ("decode_failed", d.rawCharacterCount, d.cleanedCharacterCount)
+                }
+            }()
+            #if DEBUG
+            exchFacadeLog(
+                "[ProviderInboundIntentExtraction] thread=\(thread.id.uuidString) lastInboundEnvelopeID=\(env) askHash=\(askHash) decodeSucceeded=false fallbackReason=\(reason) rawChars=\(raw.map(String.init) ?? "nil") cleanedChars=\(cleaned.map(String.init) ?? "nil") extraction_error=\(failure)"
+            )
+            #endif
+            return ProviderInboundIntentSnapshot(
+                extraction: nil,
+                source: "decodeFailed",
+                askHash: askHash,
+                decodeSucceeded: false,
+                fallbackReason: reason,
+                rawChars: raw,
+                cleanedChars: cleaned
+            )
+        } catch {
+            #if DEBUG
+            exchFacadeLog(
+                "[ProviderInboundIntentExtraction] thread=\(thread.id.uuidString) lastInboundEnvelopeID=\(env) askHash=\(askHash) decodeSucceeded=false fallbackReason=runner_or_provider_error rawChars=nil cleanedChars=nil extraction_error=\(error)"
+            )
+            #endif
+            return ProviderInboundIntentSnapshot(
+                extraction: nil,
+                source: "skipped",
+                askHash: askHash,
+                decodeSucceeded: false,
+                fallbackReason: "runner_or_provider_error",
+                rawChars: nil,
+                cleanedChars: nil
+            )
+        }
+    }
+
+    private func logProviderInboundIntentExtraction(
+        threadID: ExchangeThread.ID,
+        envelopeID: String,
+        askHash: String,
+        extraction: ProviderInboundIntentExtraction,
+        source: String,
+        decodeSucceeded: Bool,
+        fallbackReason: String?
+    ) {
+        let surfaces = extraction.requestedFactSurfaces.map(\.rawValue).sorted().joined(separator: ",")
+        let claims = extraction.requestedClaims.map(\.rawValue).sorted().joined(separator: ",")
+        let fr = fallbackReason ?? "nil"
+        exchFacadeLog(
+            "[ProviderInboundIntentExtraction] thread=\(threadID.uuidString) lastInboundEnvelopeID=\(envelopeID) askHash=\(askHash) " +
+                "decodeSucceeded=\(decodeSucceeded) fallbackReason=\(fr) source=\(source) " +
+                "inquiryKind=\(extraction.inquiryKind.rawValue) requestedSurfaces=\(surfaces) requestedClaims=\(claims) " +
+                "commercialIntent=\(extraction.commercialIntent) asksForCommitment=\(extraction.asksForCommitment) " +
+                "asksForSensitiveInfo=\(extraction.asksForSensitiveInfo) needsProviderInputLikely=\(extraction.needsProviderInputLikely) " +
+                "needsCompareLLM=\(extraction.needsCompareLLM) confidence=\(String(format: "%.2f", extraction.confidence))"
+        )
+    }
+
+    private func pass2CompactOfferSummary(
+        offer: ExchangeOffer?,
+        allowedSurfaces: ProviderAllowedFactSurfaces? = nil,
+        applyFactSurfaceGating: Bool = false
+    ) -> String? {
+        guard let offer else { return nil }
+        let gate = applyFactSurfaceGating ? allowedSurfaces : nil
+        if gate?.includeOffer == false {
+            return nil
+        }
+
+        var parts: [String] = []
+        let t = offer.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { parts.append(t) }
+
+        let emitPricing = !applyFactSurfaceGating || (gate?.includeCommercialPricingFacts ?? true)
+        let emitNonPricingCommercial = !applyFactSurfaceGating || (gate?.includeCommercialNonPricingFacts ?? true)
+
+        if let s = offer.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            let summaryReadsPricingHeavy = Self.pass2OfferSummaryLooksPricingHeavy(s)
+            if emitPricing {
+                parts.append(s)
+            } else if emitNonPricingCommercial && !summaryReadsPricingHeavy {
+                parts.append(s)
+            }
+        }
+
+        let cf = offer.commercialFacts
+        let hasPublicPriceLine =
+            !(cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            || cf.priceMin != nil
+            || cf.priceMax != nil
+        if emitPricing, !hasPublicPriceLine {
+            parts.append("pricing: \(offer.fulfillment.pricingMode.rawValue)")
+        }
+        if emitNonPricingCommercial,
+           let area = cf.serviceAreaNote?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !area.isEmpty {
+            parts.append("service area: \(area)")
+        }
+        let joined = parts.joined(separator: " · ")
+        return joined.isEmpty ? nil : joined
+    }
+
+    /// Heuristic on **seller-authored summary text** to avoid re-injecting commercial pricing lines when pricing facts are gated off (not user-intent routing).
+    private static func pass2OfferSummaryLooksPricingHeavy(_ text: String) -> Bool {
+        let low = text.lowercased()
+        if low.contains("price:") || low.contains("price range") { return true }
+        if low.contains("$") || low.contains("€") || low.contains("£") { return true }
+        if low.range(of: #"\b\d{5,}\b"#, options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    private func pass2CompactProfileSummary(
+        profile: ExchangePublicNodeProfile?,
+        allowedSurfaces: ProviderAllowedFactSurfaces? = nil,
+        applyFactSurfaceGating: Bool = false
+    ) -> String? {
+        ProviderInquiryCompareProfileSummaryGate.compactProfileSummary(
+            profile: profile,
+            allowedSurfaces: allowedSurfaces,
+            applyFactSurfaceGating: applyFactSurfaceGating
+        )
+    }
+
+    private func logProviderClaimBoundaryPacket(
+        _ packet: ProviderClaimBoundaryPacket,
+        threadID: UUID,
+        phase: String
+    ) {
+        #if DEBUG
+        let t = packet.traceSummary
+        let caveatsPreview = exchangeDebugAuditBodyPrefix(t.requiredCaveats.joined(separator: " | "), maxLen: 120)
+        exchFacadeLog(
+            "[ProviderClaimBoundary] phase=\(phase) thread=\(threadID.uuidString) " +
+                "dimensions=\(t.dimensions.joined(separator: ",")) riskTier=\(t.riskTier) " +
+                "answerabilityStatus=\(t.answerabilityStatus) responseMode=\(t.responseMode) " +
+                "allowedClaimsCount=\(t.allowedClaimsCount) missingClaimsCount=\(t.missingClaimsCount) " +
+                "forbiddenClaimsCount=\(t.forbiddenClaimsCount) requiredCaveats=\(caveatsPreview)"
+        )
+        #endif
+    }
+
+    private func providerClaimBoundaryPacketForReportOnly(
+        pass2: Pass2AgencyBuildResult,
+        requesterText: String
+    ) -> ProviderClaimBoundaryPacket? {
+        guard let ctx = pass2.providerContext else { return nil }
+        let osm = pass2.providerExecutionContext?.operatingMemory ?? ctx.operatingMemory
+        let surfaceGatingEnabled = exchangeDebugProviderFactSurfaceGatingEnabled()
+        let surfaces = ProviderAllowedFactSurfaces(
+            includePublicProfile: false,
+            includeOffer: ctx.offer != nil,
+            includeCommercialOffer: ctx.offer != nil,
+            includeContactReachability: false,
+            includeOperatingMemoryDelta: true,
+            reason: "pass2_report_only_recompute"
+        )
+        let sellerControlledFacts = providerInquiryCompareSellerControlledFactsBlock(
+            offer: ctx.offer,
+            profile: ctx.publicProfile,
+            operatingMemory: osm,
+            allowedSurfaces: surfaceGatingEnabled ? surfaces : nil,
+            applyFactSurfaceGating: surfaceGatingEnabled,
+            channelGating: nil,
+            threadID: ctx.threadID
+        )
+        return evaluateProviderClaimBoundaryLogOnly(
+            requesterText: requesterText,
+            offer: ctx.offer,
+            profile: ctx.publicProfile,
+            allowedSurfaces: surfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled,
+            sellerControlledFacts: sellerControlledFacts
+        )
+    }
+
+    private struct CompareFirstClaimBoundaryAutoSendGate: Sendable {
+        var validation: ProviderClaimBoundaryValidationResult?
+        var claimBoundaryAllowsAutoSend: Bool
+        var skippedMissingPacket: Bool
+    }
+
+    private func evaluateCompareFirstClaimBoundaryAutoSendGate(
+        draft: ExchangeMessageDraft?,
+        pass2: Pass2AgencyBuildResult?,
+        requesterText: String?
+    ) -> CompareFirstClaimBoundaryAutoSendGate {
+        if let draft,
+           let cached = ProviderClaimBoundaryValidator.validationResultFromDraftMetadata(draft.metadata) {
+            let allows = ProviderClaimBoundaryValidator.claimBoundaryAllowsAutoSend(cached)
+            return CompareFirstClaimBoundaryAutoSendGate(
+                validation: cached,
+                claimBoundaryAllowsAutoSend: allows,
+                skippedMissingPacket: false
+            )
+        }
+
+        guard let draft else {
+            return CompareFirstClaimBoundaryAutoSendGate(
+                validation: nil,
+                claimBoundaryAllowsAutoSend: true,
+                skippedMissingPacket: true
+            )
+        }
+
+        let ask = requesterText
+            ?? pass2?.providerExecutionContext?.inquiry?.requesterAsk
+            ?? pass2?.providerContext?.userIntent
+            ?? ""
+        guard let pass2,
+              let packet = providerClaimBoundaryPacketForReportOnly(pass2: pass2, requesterText: ask) else {
+            return CompareFirstClaimBoundaryAutoSendGate(
+                validation: nil,
+                claimBoundaryAllowsAutoSend: true,
+                skippedMissingPacket: true
+            )
+        }
+
+        let body = draft.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = ProviderClaimBoundaryValidator.validate(
+            body: body,
+            packet: packet,
+            requesterText: ask
+        )
+        return CompareFirstClaimBoundaryAutoSendGate(
+            validation: result,
+            claimBoundaryAllowsAutoSend: ProviderClaimBoundaryValidator.claimBoundaryAllowsAutoSend(result),
+            skippedMissingPacket: false
+        )
+    }
+
+    private func applyClaimBoundaryValidationMetadata(
+        to draft: inout ExchangeMessageDraft,
+        body: String,
+        packet: ProviderClaimBoundaryPacket?,
+        requesterText: String,
+        threadID: UUID
+    ) {
+        guard let packet else {
+            ProviderClaimBoundaryValidator.logEnforcedGate(
+                result: nil,
+                threadID: threadID,
+                claimBoundaryAllowsAutoSend: true,
+                skippedMissingPacket: true
+            )
+            return
+        }
+        let result = ProviderClaimBoundaryValidator.validate(
+            body: body,
+            packet: packet,
+            requesterText: requesterText
+        )
+        ProviderClaimBoundaryValidator.attachValidationMetadata(to: &draft.metadata, result: result)
+        let allows = ProviderClaimBoundaryValidator.claimBoundaryAllowsAutoSend(result)
+        ProviderClaimBoundaryValidator.logEnforcedGate(
+            result: result,
+            threadID: threadID,
+            claimBoundaryAllowsAutoSend: allows,
+            skippedMissingPacket: false
+        )
+    }
+
+    private func evaluateProviderClaimBoundaryLogOnly(
+        requesterText: String,
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?,
+        allowedSurfaces: ProviderAllowedFactSurfaces,
+        applyFactSurfaceGating: Bool,
+        sellerControlledFacts: String
+    ) -> ProviderClaimBoundaryPacket {
+        let detection = ProviderInboundDimensionDetector.detect(requesterText: requesterText)
+        let ledger = ProviderClaimLedgerBuilder.build(profile: profile, offer: offer)
+        let input = ProviderInboundClaimPolicyInput(
+            requesterText: requesterText,
+            detection: detection,
+            allowedSurfaces: allowedSurfaces,
+            applyFactSurfaceGating: applyFactSurfaceGating,
+            offer: offer,
+            profile: profile,
+            sellerControlledFacts: sellerControlledFacts
+        )
+        return ProviderInboundClaimPolicyEngine.evaluateLogOnly(input, ledger: ledger)
+    }
+
+    private func pass2StructuredOperatingMemorySummary(_ memory: ExchangeStructuredOperatingMemory) -> String {
+        var parts: [String] = []
+        for r in memory.pricingRules.prefix(6) {
+            parts.append("\(r.label): \(r.amountDescription)")
+        }
+        for s in memory.serviceItems.prefix(6) where s.isActive {
+            let detail = s.details.map { " (\($0))" } ?? ""
+            parts.append(s.name + detail)
+        }
+        for a in memory.coverageAreas.prefix(4) {
+            let detail = a.details.map { " — \($0)" } ?? ""
+            parts.append("area: \(a.name)\(detail)")
+        }
+        for w in memory.availabilityWindows.prefix(4) {
+            let detail = w.details.map { " — \($0)" } ?? ""
+            parts.append("availability: \(w.label)\(detail)")
+        }
+        let joined = parts.joined(separator: " | ")
+        return String(joined.prefix(2800))
+    }
+
+    private struct ProviderCompareOSMDeltaPack {
+        let joined: String
+        let originalLineCount: Int
+        let deltaLineCount: Int
+        let droppedPricingPostureLines: Int
+        let droppedMirrorLines: Int
+        let droppedCategoryTags: [String]
+    }
+
+    private func providerInquiryCompareOperatingMemoryDeltaPack(
+        operatingMemory: ExchangeStructuredOperatingMemory,
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?,
+        allowedSurfaces: ProviderAllowedFactSurfaces? = nil,
+        applyFactSurfaceGating: Bool = false
+    ) -> ProviderCompareOSMDeltaPack {
+        let gate = applyFactSurfaceGating ? allowedSurfaces : nil
+        let includeOSM = gate?.includeOperatingMemoryDelta ?? true
+        if !includeOSM {
+            return ProviderCompareOSMDeltaPack(
+                joined: "",
+                originalLineCount: 0,
+                deltaLineCount: 0,
+                droppedPricingPostureLines: 0,
+                droppedMirrorLines: 0,
+                droppedCategoryTags: ["operating_memory_suppressed"]
+            )
+        }
+
+        let raw = pass2StructuredOperatingMemorySummary(operatingMemory)
+        let segments = raw.split(separator: "|")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let originalLineCount = segments.count
+
+        let emitProfileMirror = !applyFactSurfaceGating || (gate?.includePublicProfile ?? true)
+        let emitOfferMirror = !applyFactSurfaceGating || (gate?.includeOffer ?? true)
+        let emitPricingMirror = !applyFactSurfaceGating || (gate?.includeCommercialPricingFacts ?? true)
+        let emitNonPricingCommercialMirror = !applyFactSurfaceGating || (gate?.includeCommercialNonPricingFacts ?? true)
+
+        var mirror = ""
+        if emitProfileMirror, let profile {
+            mirror += (profile.displayName ?? "") + " " + (profile.headline ?? "") + " " + (profile.summary ?? "") + " "
+        }
+        if emitOfferMirror, let offer {
+            mirror += offer.title + " "
+            if emitNonPricingCommercialMirror {
+                mirror += (offer.summary ?? "") + " "
+            }
+            let cf = offer.commercialFacts
+            if emitPricingMirror {
+                mirror += (cf.priceDisplay ?? "") + " "
+            }
+            if emitNonPricingCommercialMirror {
+                mirror += offer.commercialSurfaceSkimLines.joined(separator: " ") + " "
+                mirror += offer.regionTags.joined(separator: " ")
+            } else if let cat = offer.category?.trimmingCharacters(in: .whitespacesAndNewlines), !cat.isEmpty {
+                mirror += cat + " "
+            }
+        }
+        let mirrorLower = mirror.lowercased()
+
+        let cf = offer?.commercialFacts
+        let hasNumericPrice =
+            !(cf?.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            || cf?.priceMin != nil
+            || cf?.priceMax != nil
+
+        let stripPricingHeavyOSM = applyFactSurfaceGating && (gate?.includeCommercialPricingFacts == false)
+
+        var droppedPricingPostureLines = 0
+        var droppedMirrorLines = 0
+        var droppedCategoryTags: Set<String> = []
+        var kept: [String] = []
+        for seg in segments {
+            let low = seg.lowercased()
+            if low.contains("offer pricing posture"), hasNumericPrice {
+                droppedPricingPostureLines += 1
+                droppedCategoryTags.insert("price")
+                continue
+            }
+            if stripPricingHeavyOSM, Self.osmSegmentLooksPricingHeavy(seg) {
+                droppedMirrorLines += 1
+                droppedCategoryTags.insert("price")
+                continue
+            }
+            if seg.count >= 24, mirrorLower.contains(low) {
+                droppedMirrorLines += 1
+                Self.classifyOSMSegmentMirrorCategories(seg, offer: offer, profile: profile).forEach {
+                    droppedCategoryTags.insert($0)
+                }
+                continue
+            }
+            kept.append(seg)
+        }
+
+        let joined = kept.joined(separator: " | ")
+        return ProviderCompareOSMDeltaPack(
+            joined: String(joined.prefix(2800)),
+            originalLineCount: originalLineCount,
+            deltaLineCount: kept.count,
+            droppedPricingPostureLines: droppedPricingPostureLines,
+            droppedMirrorLines: droppedMirrorLines,
+            droppedCategoryTags: Array(droppedCategoryTags).sorted()
+        )
+    }
+
+    /// Compare-only OSM line shape heuristics (not user-intent routing).
+    private static func osmSegmentLooksPricingHeavy(_ seg: String) -> Bool {
+        let low = seg.lowercased()
+        if low.contains("price") { return true }
+        if low.contains("$") || low.contains("€") || low.contains("£") { return true }
+        if low.range(of: #"\b\d{5,}\b"#, options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    private static func classifyOSMSegmentMirrorCategories(
+        _ seg: String,
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?
+    ) -> [String] {
+        var tags: [String] = []
+        let low = seg.lowercased()
+        if low.hasPrefix("area:") { tags.append("area") }
+        if low.hasPrefix("availability:") { tags.append("availability") }
+        if Self.osmSegmentLooksPricingHeavy(seg) { tags.append("price") }
+        if let offer {
+            let ot = offer.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if ot.count >= 6, low.contains(ot) { tags.append("offerSummary") }
+            if let s = offer.summary?.trimmingCharacters(in: .whitespacesAndNewlines), s.count >= 12 {
+                let sl = s.lowercased()
+                if low.contains(sl) { tags.append("offerSummary") }
+            }
+            if let cat = offer.category?.trimmingCharacters(in: .whitespacesAndNewlines), !cat.isEmpty,
+               low.contains(cat.lowercased()) {
+                tags.append("category")
+            }
+        }
+        if let profile, let s = profile.summary?.trimmingCharacters(in: .whitespacesAndNewlines), s.count >= 12,
+           low.contains(s.lowercased()) {
+            tags.append("profileSummary")
+        }
+        if tags.isEmpty { tags.append("mirrored_excerpt") }
+        return tags
+    }
+
+    /// Compact seller-authored **profile**, **offer**, and **operating memory** sections for `providerInquiryCompare`.
+    /// Order: profile → offer → OSM so profile-primary routing is not visually dominated by listing copy.
+    private func providerInquiryCompareSellerControlledFactsBlock(
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?,
+        operatingMemory: ExchangeStructuredOperatingMemory,
+        allowedSurfaces: ProviderAllowedFactSurfaces? = nil,
+        applyFactSurfaceGating: Bool = false,
+        channelGating: ProviderCompareChannelGatingFlags? = nil,
+        threadID: UUID? = nil
+    ) -> String {
+        let gate = applyFactSurfaceGating ? allowedSurfaces : nil
+
+        let includeProfile = gate?.includePublicProfile ?? true
+        let includeOffer = gate?.includeOffer ?? true
+        let includeCommercialAggregate = gate?.includeCommercialOffer ?? true
+        let emitCommercialPricing = !applyFactSurfaceGating || (gate?.includeCommercialPricingFacts ?? true)
+        let emitCommercialNonPricing = !applyFactSurfaceGating || (gate?.includeCommercialNonPricingFacts ?? true)
+        let includeContact = gate?.includeContactReachability ?? true
+        let includeOSM = gate?.includeOperatingMemoryDelta ?? true
+
+        var emittedSectionMarkers: [String] = []
+        var droppedSectionMarkers: [String] = []
+
+        if applyFactSurfaceGating {
+            if includeProfile { emittedSectionMarkers.append("PROFILE_FACTS") }
+            else { droppedSectionMarkers.append("PROFILE_FACTS") }
+            if includeOffer { emittedSectionMarkers.append("OFFER_FACTS") }
+            else { droppedSectionMarkers.append("OFFER_FACTS") }
+            if includeOSM { emittedSectionMarkers.append("OPERATING_MEMORY_EXCERPT") }
+            else { droppedSectionMarkers.append("OPERATING_MEMORY_EXCERPT") }
+        }
+
+        var blocks: [String] = []
+
+        if includeProfile {
+            var profileLines: [String] = []
+            profileLines.append("=== PROFILE_FACTS ===")
+            if let profile {
+                profileLines.append("profile_id: \(profile.id)")
+                if let n = profile.displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !n.isEmpty {
+                    profileLines.append("profile_display_name: \(n)")
+                }
+                if let h = profile.headline?.trimmingCharacters(in: .whitespacesAndNewlines), !h.isEmpty {
+                    profileLines.append("profile_headline: \(h)")
+                }
+                if includeContact {
+                    if let s = profile.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                        profileLines.append("profile_summary: \(s)")
+                    }
+                    profileLines.append("profile_availability: \(profile.availability.rawValue)")
+                    if !profile.regionTags.isEmpty {
+                        profileLines.append("profile_region_tags: \(profile.regionTags.joined(separator: ", "))")
+                    }
+                    if !profile.openTo.isEmpty {
+                        profileLines.append("profile_open_to: \(profile.openTo.joined(separator: ", "))")
+                    }
+                    let r = profile.reachability
+                    profileLines.append(
+                        "profile_reachability: accessMode=\(r.accessMode.rawValue) acceptingInbound=\(r.acceptingInbound) disclosureCeiling=\(r.disclosureCeiling.rawValue) intentCategoryPolicy=\(r.intentCategoryPolicy.rawValue)"
+                    )
+                    if !r.allowedModes.isEmpty {
+                        profileLines.append("profile_reachability_allowed_modes: \(r.allowedModes.joined(separator: ", "))")
+                    }
+                    let ap = profile.approach
+                    if let ps = ap.preferredStyle {
+                        profileLines.append("profile_approach_preferred_style: \(ps.rawValue)")
+                    }
+                    if !ap.preferredFirstContactKinds.isEmpty {
+                        profileLines.append(
+                            "profile_approach_first_contact_kinds: \(ap.preferredFirstContactKinds.map(\.rawValue).joined(separator: ", "))"
+                        )
+                    }
+                    if let note = ap.note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+                        profileLines.append("profile_approach_note: \(note)")
+                    }
+                    if !profile.interests.isEmpty {
+                        profileLines.append("profile_interests: \(profile.interests.joined(separator: ", "))")
+                    }
+                    if !profile.activityTags.isEmpty {
+                        profileLines.append("profile_activity_tags: \(profile.activityTags.joined(separator: ", "))")
+                    }
+                    if !profile.offers.isEmpty {
+                        profileLines.append("profile_public_offer_terms: \(profile.offers.joined(separator: ", "))")
+                    }
+                } else if let s = profile.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                    profileLines.append("profile_summary: \(s)")
+                }
+            } else {
+                profileLines.append("public_profile: (nil)")
+            }
+            profileLines.append("=== END PROFILE_FACTS ===")
+            blocks.append(profileLines.joined(separator: "\n"))
+        }
+
+        var priceLinesEmitted = 0
+        var skimPriceDupesDropped = 0
+        var pricingModeEmitted = false
+
+        if includeOffer {
+            var offerLines: [String] = []
+            offerLines.append("=== OFFER_FACTS ===")
+            if let offer {
+                offerLines.append("offer_id: \(offer.id)")
+                offerLines.append("offer_title: \(offer.title)")
+                if let s = offer.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                    offerLines.append("offer_details: \(s)")
+                }
+                if let cat = offer.category?.trimmingCharacters(in: .whitespacesAndNewlines), !cat.isEmpty {
+                    offerLines.append("category: \(cat)")
+                }
+                if !offer.tags.isEmpty {
+                    offerLines.append("offer_tags: \(offer.tags.joined(separator: ", "))")
+                }
+                if !offer.regionTags.isEmpty {
+                    offerLines.append("offer_region_tags: \(offer.regionTags.joined(separator: ", "))")
+                }
+
+                let cf = offer.commercialFacts
+                let hasPublicPriceScalar =
+                    !(cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                    || cf.priceMin != nil
+                    || cf.priceMax != nil
+
+                if includeCommercialAggregate {
+                    if emitCommercialPricing, !hasPublicPriceScalar {
+                        offerLines.append("fulfillment_pricing_mode: \(offer.fulfillment.pricingMode.rawValue)")
+                        pricingModeEmitted = true
+                    }
+
+                    let trimmedDisplay = cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let hasDisplay = !(trimmedDisplay ?? "").isEmpty
+                    if emitCommercialNonPricing {
+                        for skim in offer.commercialSurfaceSkimLines {
+                            let t = skim.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let tl = t.lowercased()
+                            if !emitCommercialPricing {
+                                if tl.hasPrefix("price:") || tl.hasPrefix("price range:") || tl.hasPrefix("currency:")
+                                    || tl.hasPrefix("package:") {
+                                    skimPriceDupesDropped += 1
+                                    continue
+                                }
+                            }
+                            if hasDisplay, tl.hasPrefix("price:") {
+                                skimPriceDupesDropped += 1
+                                continue
+                            }
+                            offerLines.append("useful_commercial: \(skim)")
+                        }
+                    }
+
+                    if emitCommercialPricing {
+                        if let pd = trimmedDisplay, !pd.isEmpty {
+                            offerLines.append("price_display: \(pd)")
+                            priceLinesEmitted += 1
+                        }
+                        if let min = cf.priceMin {
+                            offerLines.append("price_min: \((min as NSDecimalNumber).stringValue)")
+                            priceLinesEmitted += 1
+                        }
+                        if let max = cf.priceMax {
+                            offerLines.append("price_max: \((max as NSDecimalNumber).stringValue)")
+                            priceLinesEmitted += 1
+                        }
+                        if let c = cf.currency?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+                            offerLines.append("currency: \(c)")
+                        }
+                        if let u = cf.priceUnit?.trimmingCharacters(in: .whitespacesAndNewlines), !u.isEmpty {
+                            offerLines.append("price_unit: \(u)")
+                        }
+                        for pkg in cf.packages.prefix(8) {
+                            var p = pkg.title
+                            if let sum = pkg.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !sum.isEmpty {
+                                p += " — \(sum)"
+                            }
+                            if let pr = pkg.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines), !pr.isEmpty {
+                                p += " (\(pr))"
+                            }
+                            offerLines.append("package: \(p)")
+                        }
+                    }
+
+                    var blobParts: [String] = []
+                    if let sum = offer.summary { blobParts.append(sum) }
+                    if emitCommercialPricing {
+                        if let pd = cf.priceDisplay { blobParts.append(pd) }
+                        blobParts.append(
+                            cf.packages.map { "\($0.title) \($0.summary ?? "") \($0.priceDisplay ?? "")" }.joined(separator: " ")
+                        )
+                    }
+                    let blob = blobParts.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: " ")
+                    let parsed = Self.providerInquiryCompareParseDwellingSignals(from: blob)
+                    if let b = parsed.bedrooms {
+                        offerLines.append("parsed_public_bedrooms: \(b)")
+                    }
+                    if let b = parsed.bathrooms {
+                        offerLines.append("parsed_public_bathrooms: \(b)")
+                    }
+                    if let s = parsed.sqftOrSize {
+                        offerLines.append("parsed_public_sqft_or_size_number: \(s)")
+                    }
+                }
+            } else {
+                offerLines.append("offer: (nil)")
+            }
+            offerLines.append("=== END OFFER_FACTS ===")
+            blocks.append(offerLines.joined(separator: "\n"))
+        }
+
+        let osmPack = providerInquiryCompareOperatingMemoryDeltaPack(
+            operatingMemory: operatingMemory,
+            offer: offer,
+            profile: profile,
+            allowedSurfaces: gate,
+            applyFactSurfaceGating: applyFactSurfaceGating
+        )
+        let osmOriginalLines = osmPack.originalLineCount
+        let osmDeltaLines = osmPack.deltaLineCount
+        let droppedPricingPostureLines = osmPack.droppedPricingPostureLines
+        let droppedMirrorLines = osmPack.droppedMirrorLines
+        let droppedOSMCategories = osmPack.droppedCategoryTags
+
+        if includeOSM, !osmPack.joined.isEmpty {
+            let osmBlock = """
+            === OPERATING_MEMORY_EXCERPT ===
+            \(osmPack.joined)
+            === END OPERATING_MEMORY_EXCERPT ===
+            """
+            blocks.append(osmBlock)
+        }
+
+        let joined = blocks.joined(separator: "\n")
+
+        #if DEBUG
+        let tid = threadID?.uuidString ?? "nil"
+        if applyFactSurfaceGating, let g = gate {
+            let unknownLean =
+                g.reason.contains("unknown")
+                || g.reason.contains("unmapped")
+                || g.reason.contains("low_confidence")
+                || g.reason.contains("classification_decode_failed")
+            let ch = channelGating.map {
+                " gatedOfferSummary=\($0.gatedOfferSummary) gatedProfileSummary=\($0.gatedProfileSummary) " +
+                    "gatedCommercialFacts=\($0.gatedCommercialFacts) gatedUsefulDetails=\($0.gatedUsefulDetails) " +
+                    "gatedOSM=\($0.gatedOSM)"
+            } ?? ""
+            exchFacadeLog(
+                "[ProviderFactBoundaryApplied] thread=\(tid) enabled=true surfaceReason=\(g.reason) " +
+                    "emittedSections=\(emittedSectionMarkers.joined(separator: ",")) " +
+                    "droppedSections=\(droppedSectionMarkers.joined(separator: ",")) " +
+                    "droppedPriceBecauseNotAsked=\(!includeCommercialAggregate) " +
+                    "droppedProfileBecauseCommercialAsk=\(!includeProfile && includeOffer) " +
+                    "droppedOfferBecauseProfileAsk=\(!includeOffer && includeProfile) " +
+                    "osmDeltaOnly=\(includeOSM && osmDeltaLines > 0 && osmDeltaLines < osmOriginalLines) " +
+                    "unknownConservative=\(unknownLean)" +
+                    ch
+            )
+        } else {
+            exchFacadeLog(
+                "[ProviderFactBoundaryApplied] thread=\(tid) enabled=false surfaceReason=gating_disabled " +
+                    "emittedSections=unfiltered " +
+                    "droppedSections=none " +
+                    "droppedPriceBecauseNotAsked=false " +
+                    "droppedProfileBecauseCommercialAsk=false " +
+                    "droppedOfferBecauseProfileAsk=false " +
+                    "osmDeltaOnly=\(osmDeltaLines > 0 && osmDeltaLines < osmOriginalLines) " +
+                    "unknownConservative=false"
+            )
+        }
+
+        let priceDisplayPresent =
+            !(offer?.commercialFacts.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+        let pricingMode = offer?.fulfillment.pricingMode.rawValue ?? "nil"
+        let priceResolution: String = {
+            guard let offer else { return "unknown" }
+            let cf = offer.commercialFacts
+            let hasDisplay = !(cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            if hasDisplay {
+                return pricingModeEmitted ? "mixed_posture_and_display" : "priceDisplayWins"
+            }
+            if pricingModeEmitted { return "postureOnly" }
+            return "withheld_or_unknown"
+        }()
+        exchFacadeLog(
+            "[ProviderFactOwnership] thread=\(tid) priceDisplayPresent=\(priceDisplayPresent) " +
+                "pricingMode=\(pricingMode) priceResolution=\(priceResolution) " +
+                "emittedPriceLines=\(priceLinesEmitted) droppedPriceLines=\(skimPriceDupesDropped) " +
+                "commercialDuplicatesDropped=\(skimPriceDupesDropped) compactSummaryPricingDropped=see_pass2_compact_offer_summary"
+        )
+
+        exchFacadeLog(
+            "[ProviderOSMDelta] thread=\(tid) originalLines=\(osmOriginalLines) deltaLines=\(osmDeltaLines) " +
+                "droppedMirroredOfferLines=\(droppedMirrorLines) droppedMirroredProfileLines=\(droppedMirrorLines) " +
+                "droppedMirroredCommercialLines=\(droppedPricingPostureLines) " +
+                "droppedCategories=\(droppedOSMCategories.joined(separator: ",")) " +
+                "emptyDelta=\(includeOSM && osmDeltaLines == 0 && osmOriginalLines > 0)"
+        )
+        #endif
+
+        return joined
+    }
+
+    private static func providerInquiryCompareParseDwellingSignals(from text: String) -> (
+        bedrooms: Int?,
+        bathrooms: Int?,
+        sqftOrSize: Int?
+    ) {
+        let t = text
+        func firstInt(pattern: String) -> Int? {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                return nil
+            }
+            let range = NSRange(t.startIndex..., in: t)
+            guard let m = regex.firstMatch(in: t, options: [], range: range),
+                  m.numberOfRanges >= 2,
+                  let r = Range(m.range(at: 1), in: t) else { return nil }
+            return Int(t[r].filter(\.isNumber))
+        }
+
+        let beds = firstInt(pattern: #"(\d+)\s*(?:bed|bedroom)s?\b"#)
+        let baths = firstInt(pattern: #"(\d+)\s*(?:bath|bathroom)s?\b"#)
+        var sqft = firstInt(pattern: #"(\d{3,6})\s*(?:sq\.?\s*ft|sqft|sf|square\s+feet)\b"#)
+        if sqft == nil {
+            sqft = firstInt(pattern: #"(?i)(?:bath|bathroom)s?\s+(\d{3,6})\b"#)
+        }
+        if sqft == nil,
+           let regex = try? NSRegularExpression(
+               pattern: #"(?i)(\d+)\s*(?:bed|bedroom)s?.{0,120}?(\d+)\s*(?:bath|bathroom)s?\s+(\d{3,6})\b"#,
+               options: []
+           ) {
+            let range = NSRange(t.startIndex..., in: t)
+            if let m = regex.firstMatch(in: t, options: [], range: range),
+               m.numberOfRanges >= 4,
+               let r = Range(m.range(at: 3), in: t) {
+                sqft = Int(t[r].filter(\.isNumber))
+            }
+        }
+        return (beds, baths, sqft)
+    }
+
+    #if DEBUG
+    private func debugLogProviderInquiryCompareFactsInput(
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?,
+        compareOfferSummary: String?,
+        compareProfileSummary: String?,
+        memorySummary: String,
+        sellerControlledFacts: String,
+        requesterAsk: String,
+        gate: ProviderAllowedFactSurfaces?,
+        surfaceGatingEnabled: Bool
+    ) {
+        let redactOffer = surfaceGatingEnabled && (gate?.includeOffer == false)
+        let redactProfile = surfaceGatingEnabled && (gate?.includePublicProfile == false)
+        let redactCommercialPricing = surfaceGatingEnabled && (gate?.includeCommercialPricingFacts == false)
+        let redactUseful = surfaceGatingEnabled
+            && (gate?.includeCommercialOffer == false || gate?.includeCommercialPricingFacts == false)
+
+        let offerDetails = redactOffer ? "(gated)" : (offer?.summary ?? "")
+        let usefulLines = redactUseful ? "(gated)" : (offer?.commercialSurfaceSkimLines.joined(separator: "\n") ?? "")
+        let commercialKeyLines: String = {
+            guard let o = offer else { return "" }
+            if redactCommercialPricing { return "(gated)" }
+            let cf = o.commercialFacts
+            var p: [String] = []
+            if let pd = cf.priceDisplay { p.append("priceDisplay=\(pd)") }
+            if let min = cf.priceMin { p.append("priceMin=\((min as NSDecimalNumber).stringValue)") }
+            if let max = cf.priceMax { p.append("priceMax=\((max as NSDecimalNumber).stringValue)") }
+            if let c = cf.currency { p.append("currency=\(c)") }
+            p.append("packagesCount=\(cf.packages.count)")
+            return p.joined(separator: " | ")
+        }()
+        let publicFacts: String = {
+            guard let profile else { return "" }
+            if redactProfile { return "(gated)" }
+            var p: [String] = []
+            if let n = profile.displayName { p.append("displayName=\(n)") }
+            if let h = profile.headline { p.append("headline=\(h)") }
+            if let s = profile.summary { p.append("summary=\(s)") }
+            return p.joined(separator: " | ")
+        }()
+        let rep = currentSecretaryConstitutionText() ?? ""
+        let styleDbg = currentSecretaryStyleText() ?? ""
+        print("[ProviderInquiryCompare][factsInput]")
+        print("offerID=\(offer?.id ?? "nil")")
+        print("offerTitle=\(offer?.title ?? "")")
+        print("offerSummary=\(compareOfferSummary ?? "")")
+        print("offerDetails=\(offerDetails)")
+        print("usefulDetails=\(usefulLines)")
+        print("commercialFacts=\(commercialKeyLines)")
+        print("publicFacts=\(publicFacts)")
+        print("profileSummary=\(compareProfileSummary ?? "")")
+        print("memoryFacts=\(memorySummary)")
+        print("secretaryConstitutionNote=\(rep)")
+        print("secretaryStyleFreeformNote=\(styleDbg)")
+        print("sellerControlledFactsBlock=\(sellerControlledFacts)")
+        print("requesterAsk=\(requesterAsk)")
+    }
+
+    /// DEBUG-only surface routing diagnostics for provider inquiry compare (no behavior change).
+    private func debugLogProviderInquiryCompareSurfaceInput(
+        thread: ExchangeThread,
+        offer: ExchangeOffer?,
+        profile: ExchangePublicNodeProfile?,
+        sellerControlledFacts: String,
+        requesterAsk: String,
+        primaryOpportunitySurface: String
+    ) {
+        let anchor = thread.intent.resolvedOpportunitySurfaceAnchor(
+            selectedOfferID: thread.selectedOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedCounterpartyID: thread.selectedCounterpartyID
+        )
+        let profileFactsCount = Self.debugSectionNonEmptyLineCount(
+            sellerControlledFacts,
+            start: "=== PROFILE_FACTS ===",
+            end: "=== END PROFILE_FACTS ==="
+        )
+        let offerFactsCount = Self.debugSectionNonEmptyLineCount(
+            sellerControlledFacts,
+            start: "=== OFFER_FACTS ===",
+            end: "=== END OFFER_FACTS ==="
+        )
+        let inferredSurfaceMode: String =
+            switch (offer != nil, profile != nil) {
+            case (true, true): "both_offer_and_profile_hydrated"
+            case (true, false): "offer_only_hydrated"
+            case (false, true): "profile_only_hydrated"
+            case (false, false): "neither_offer_nor_profile_hydrated"
+            }
+        let profileFactsPreview = exchangeDebugAuditBodyPrefix(
+            [
+                profile?.displayName,
+                profile?.headline,
+                profile?.summary
+            ]
+                .compactMap { $0 }
+                .joined(separator: " · "),
+            maxLen: 100
+        )
+        let offerFactsPreview = exchangeDebugAuditBodyPrefix(
+            [
+                offer?.title,
+                offer?.summary
+            ]
+                .compactMap { $0 }
+                .joined(separator: " · "),
+            maxLen: 100
+        )
+        exchFacadeLog(
+            "[ProviderInquiryCompare][surfaceInput] thread=\(thread.id.uuidString) " +
+                "selectedCounterpartyID=\(thread.selectedCounterpartyID ?? "nil") " +
+                "selectedProfileID=\(thread.selectedPublicProfileID ?? "nil") " +
+                "selectedOfferID=\(thread.selectedOfferID ?? "nil") " +
+                "queryClass=\(thread.intent.queryIntentClass.rawValue) " +
+                "surfacePreference=\(thread.intent.surfacePreference.rawValue) " +
+                "resolvedOpportunitySurfaceAnchor=\(anchor.rawValue) " +
+                "primaryOpportunitySurface=\(primaryOpportunitySurface) " +
+                "inferredSurfaceMode=\(inferredSurfaceMode) " +
+                "profileFactsCount=\(profileFactsCount) " +
+                "offerFactsCount=\(offerFactsCount) " +
+                "profileFactsPreview=\(profileFactsPreview) " +
+                "offerFactsPreview=\(offerFactsPreview) " +
+                "requesterAsk=\(exchangeDebugAuditBodyPrefix(requesterAsk, maxLen: 160)) " +
+                "reason=pre_compare_prompt"
+        )
+    }
+
+    private static func debugSectionNonEmptyLineCount(
+        _ full: String,
+        start: String,
+        end: String
+    ) -> Int {
+        guard let sr = full.range(of: start),
+              let er = full.range(of: end, range: sr.upperBound..<full.endIndex) else {
+            return 0
+        }
+        let inner = full[sr.upperBound..<er.lowerBound]
+        return inner.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .count
+    }
+
+    private func debugLogProviderInquiryCompareSurfaceOutput(
+        threadID: ExchangeThread.ID,
+        compare: ExchangeProviderInquiryCompareResult,
+        governed: ProviderInquiryCompareGovernor.Outcome
+    ) {
+        let rd = compare.recommendedDisposition ?? governed.normalizedAction.rawValue
+        exchFacadeLog(
+            "[ProviderInquiryCompare][surfaceOutput] thread=\(threadID.uuidString) " +
+                "surfaceUsed=not_available " +
+                "surfaceConfidence=not_available " +
+                "needsDifferentSurface=not_available " +
+                "suggestedSurface=not_available " +
+                "recommendedDisposition=\(rd) " +
+                "answerableFromOffer=\(compare.answerableFromOffer) " +
+                "answerableFromProfile=not_available " +
+                "missingFactsCount=\(compare.missingFacts.count) " +
+                "governedAction=\(governed.normalizedAction.rawValue) " +
+                "reason=\(exchangeDebugAuditBodyPrefix(compare.reason, maxLen: 160))"
+        )
+    }
+    #endif
+
+    private func overlayProviderAnswerabilityWithLLMCompare(
+        baseline: ExchangeProviderAnswerability,
+        compare: ExchangeProviderInquiryCompareResult?
+    ) -> ExchangeProviderAnswerability {
+        guard let compare else { return baseline }
+        if compare.needsProviderInput || !compare.answerableFromOffer {
+            let mergedMissing = dedupeSecondHalfLines(baseline.missingFacts + compare.missingFacts)
+            let reason = compare.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            let boundary = reason.isEmpty
+                ? "Provider inquiry compare indicates more provider input is needed before answering."
+                : reason
+            return ExchangeProviderAnswerability(
+                answerability: .partiallyAnswerableNeedsClarification,
+                knownFactsUsed: baseline.knownFactsUsed,
+                groundedFacts: baseline.groundedFacts,
+                missingFacts: mergedMissing,
+                proposedAnswer: nil,
+                requiresHumanApproval: false,
+                allowsAutonomousDrafting: true,
+                allowsAutonomousSending: false,
+                boundaryReason: boundary
+            )
+        }
+        return baseline
+    }
+
+    private func mergeProviderAnswerabilityWithGovernor(
+        baseline: ExchangeProviderAnswerability,
+        compare: ExchangeProviderInquiryCompareResult,
+        governed: ProviderInquiryCompareGovernor.Outcome
+    ) -> ExchangeProviderAnswerability {
+        let mergedMissing = dedupeSecondHalfLines(baseline.missingFacts + compare.missingFacts)
+        let reasonPrimary = governed.downgradeReason ?? compare.reason
+
+        switch governed.normalizedAction {
+        case .askProviderInput:
+            return ExchangeProviderAnswerability(
+                answerability: .partiallyAnswerableNeedsClarification,
+                knownFactsUsed: baseline.knownFactsUsed,
+                groundedFacts: baseline.groundedFacts,
+                missingFacts: mergedMissing.isEmpty ? baseline.missingFacts : mergedMissing,
+                proposedAnswer: nil,
+                requiresHumanApproval: false,
+                allowsAutonomousDrafting: baseline.allowsAutonomousDrafting,
+                allowsAutonomousSending: false,
+                boundaryReason: reasonPrimary
+            )
+        case .sendWithinConsent:
+            let draft = compare.draftReply ?? baseline.proposedAnswer
+            let consentLine = compare.consentBasis?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let boundaryLine = consentLine.isEmpty ? baseline.boundaryReason : consentLine
+            let compareDraftTrimmed = compare.draftReply?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let usesCompareFirstFinal = !compareDraftTrimmed.isEmpty
+            let autonomousSend = (baseline.allowsAutonomousSending && draft != nil) || usesCompareFirstFinal
+            return ExchangeProviderAnswerability(
+                answerability: .answerableFromPublicFacts,
+                knownFactsUsed: compare.knownAnswers.isEmpty ? baseline.knownFactsUsed : compare.knownAnswers,
+                groundedFacts: baseline.groundedFacts,
+                missingFacts: [],
+                proposedAnswer: draft,
+                requiresHumanApproval: false,
+                allowsAutonomousDrafting: true,
+                allowsAutonomousSending: autonomousSend,
+                boundaryReason: boundaryLine,
+                usesCompareFirstGroundedFinalBody: usesCompareFirstFinal
+            )
+        case .holdForBoundaryApproval:
+            return ExchangeProviderAnswerability(
+                answerability: .requiresProviderApproval,
+                knownFactsUsed: baseline.knownFactsUsed,
+                groundedFacts: baseline.groundedFacts,
+                missingFacts: mergedMissing,
+                proposedAnswer: compare.draftReply ?? baseline.proposedAnswer,
+                requiresHumanApproval: true,
+                allowsAutonomousDrafting: false,
+                allowsAutonomousSending: false,
+                boundaryReason: compare.boundaryCrossingReason
+                    ?? (reasonPrimary.isEmpty
+                        ? "Crosses a provider approval boundary for this automation posture."
+                        : reasonPrimary)
+            )
+        case .blocked:
+            return ExchangeProviderAnswerability(
+                answerability: .notAnswerable,
+                knownFactsUsed: [],
+                groundedFacts: [],
+                missingFacts: mergedMissing,
+                proposedAnswer: nil,
+                requiresHumanApproval: false,
+                allowsAutonomousDrafting: false,
+                allowsAutonomousSending: false,
+                boundaryReason: reasonPrimary
+            )
+        case .wait:
+            return ExchangeProviderAnswerability(
+                answerability: .partiallyAnswerableNeedsClarification,
+                knownFactsUsed: baseline.knownFactsUsed,
+                groundedFacts: baseline.groundedFacts,
+                missingFacts: mergedMissing,
+                proposedAnswer: nil,
+                requiresHumanApproval: false,
+                allowsAutonomousDrafting: false,
+                allowsAutonomousSending: false,
+                boundaryReason: reasonPrimary.isEmpty ? "Defer outbound reply for now." : reasonPrimary
+            )
+        }
+    }
+
+    private func pass2ConsentAutomationSummary(offer: ExchangeOffer?) -> String? {
+        guard let facts = offer?.commercialFacts else { return nil }
+        let p = facts.permissionOnlyAutoAnswerPolicy()
+        return """
+        automation_permissions: pricing=\(p.canAnswerPricing), availability=\(p.canAnswerAvailability), policies=\(p.canAnswerPolicies), service_area=\(p.canAnswerServiceArea), faqs=\(p.canAnswerFAQs), custom_quote_requires_approval=\(p.requiresApprovalForCustomQuote)
+        """
+    }
+
+    private struct LatestInboundRequesterMessage: Sendable {
+        enum Source: String, Sendable {
+            case latestInboundBody
+            case latestInboundSummary
+            case latestRequestCaptured
+            case fallback
+        }
+
+        var turnID: ExchangeTurn.ID?
+        var kind: ExchangeTurn.Kind?
+        var actor: ExchangeTurn.Actor?
+        var text: String
+        var createdAt: Date?
+        var source: Source
+    }
+
+    private func latestInboundRequesterMessage(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> LatestInboundRequesterMessage? {
+        if let inboundTurn = turns
+            .reversed()
+            .first(where: {
+                $0.actor == .counterparty && ($0.kind == .replyReceived || $0.kind == .clarificationAnswered)
+            }) {
+            if let body = inboundTurn.detail?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty {
+                logProviderLLMInputSource(
+                    threadID: thread.id,
+                    turnID: inboundTurn.id,
+                    source: .latestInboundBody,
+                    bodyText: body
+                )
+                return LatestInboundRequesterMessage(
+                    turnID: inboundTurn.id,
+                    kind: inboundTurn.kind,
+                    actor: inboundTurn.actor,
+                    text: body,
+                    createdAt: inboundTurn.createdAt,
+                    source: .latestInboundBody
+                )
+            }
+
+            if let summary = ExchangeSemanticEvidenceSanitizer.sanitize(inboundTurn.summary) {
+                logProviderLLMInputSource(
+                    threadID: thread.id,
+                    turnID: inboundTurn.id,
+                    source: .latestInboundSummary,
+                    bodyText: summary
+                )
+                return LatestInboundRequesterMessage(
+                    turnID: inboundTurn.id,
+                    kind: inboundTurn.kind,
+                    actor: inboundTurn.actor,
+                    text: summary,
+                    createdAt: inboundTurn.createdAt,
+                    source: .latestInboundSummary
+                )
+            }
+        }
+
+        if let requestTurn = turns
+            .reversed()
+            .first(where: { $0.kind == .requestCaptured && $0.actor == .user }) {
+            let detail = ExchangeSemanticEvidenceSanitizer.sanitize(requestTurn.detail)
+            let summary = ExchangeSemanticEvidenceSanitizer.sanitize(requestTurn.summary)
+            if let text = firstNonBlank(detail, summary) {
+                logProviderLLMInputSource(
+                    threadID: thread.id,
+                    turnID: requestTurn.id,
+                    source: .latestRequestCaptured,
+                    bodyText: text
+                )
+                return LatestInboundRequesterMessage(
+                    turnID: requestTurn.id,
+                    kind: requestTurn.kind,
+                    actor: requestTurn.actor,
+                    text: text,
+                    createdAt: requestTurn.createdAt,
+                    source: .latestRequestCaptured
+                )
+            }
+        }
+
+        if let fallback = turns
+            .reversed()
+            .compactMap({ turn -> (ExchangeTurn, String)? in
+                let detail = ExchangeSemanticEvidenceSanitizer.sanitize(turn.detail)
+                let summary = ExchangeSemanticEvidenceSanitizer.sanitize(turn.summary)
+                guard let text = firstNonBlank(detail, summary) else { return nil }
+                return (turn, text)
+            })
+            .first(where: { pair in
+                // Domain fallback only from turn state; never UI card/title projections.
+                pair.0.actor == .counterparty || pair.0.actor == .user
+            }) {
+            logProviderLLMInputSource(
+                threadID: thread.id,
+                turnID: fallback.0.id,
+                source: .fallback,
+                bodyText: fallback.1
+            )
+            return LatestInboundRequesterMessage(
+                turnID: fallback.0.id,
+                kind: fallback.0.kind,
+                actor: fallback.0.actor,
+                text: fallback.1,
+                createdAt: fallback.0.createdAt,
+                source: .fallback
+            )
+        }
+
+        #if DEBUG
+        exchFacadeLog(
+            "[ProviderLLMInputSource] thread=\(thread.id.uuidString) turnID=nil source=fallback bodyPrefix=Inbound coordination."
+        )
+        #endif
+        return nil
+    }
+
+    private func providerInboundRawRequesterAsk(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> String {
+        let latest = latestInboundRequesterMessage(thread: thread, turns: turns)
+        return latest?.text ?? "Inbound coordination."
+    }
+
+    private func logProviderLLMInputSource(
+        threadID: ExchangeThread.ID,
+        turnID: ExchangeTurn.ID?,
+        source: LatestInboundRequesterMessage.Source,
+        bodyText: String
+    ) {
+        let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safe = trimmed.isEmpty ? "Inbound coordination." : trimmed
+        #if DEBUG
+        exchFacadeLog(
+            "[ProviderLLMInputSource] thread=\(threadID.uuidString) turnID=\(turnID?.uuidString ?? "nil") source=\(source.rawValue) bodyPrefix=\(exchangeDebugAuditBodyPrefix(safe, maxLen: 180))"
+        )
+        #endif
+        debugLogProviderLLMInputLeakIfNeeded(text: safe)
+    }
+
+    private func debugLogProviderLLMInputLeakIfNeeded(text: String) {
+        #if DEBUG
+        let lowered = text.lowercased()
+        let forbidden = [
+            "new inquiry about",
+            "inbound message from node",
+            "response —",
+            "response -",
+            "draft grounded on published facts",
+            "needs your input ·"
+        ]
+        if forbidden.contains(where: { lowered.contains($0) }) {
+            exchFacadeLog(
+                "[ProviderLLMInputLeak] reason=ui_projection_text_in_llm_input prefix=\(exchangeDebugAuditBodyPrefix(text, maxLen: 200))"
+            )
+        }
+        #endif
+    }
+
+    private func resolveHydratedSellerSurfacesForPass2(
+        thread: ExchangeThread
+    ) async -> (offer: ExchangeOffer?, profile: ExchangePublicNodeProfile?) {
+        let trimmedOfferID = snapshotTrimmed(thread.selectedOfferID)
+        var selectedPublicProfileID = snapshotTrimmed(thread.selectedPublicProfileID)
+
+        let resolvedOffer: ExchangeOffer?
+        if let trimmedOfferID {
+            resolvedOffer = try? await store.fetchOffer(id: trimmedOfferID)
+        } else {
+            resolvedOffer = nil
+        }
+
+        if selectedPublicProfileID == nil,
+           let fallbackProfileID = resolvedOffer?.publicProfileID.flatMap({ snapshotTrimmed($0) }) {
+            selectedPublicProfileID = fallbackProfileID
+        }
+
+        let resolvedPublicProfile: ExchangePublicNodeProfile?
+        if let selectedPublicProfileID {
+            resolvedPublicProfile = try? await store.fetchPublicProfile(id: selectedPublicProfileID)
+        } else {
+            resolvedPublicProfile = nil
+        }
+
+        return (resolvedOffer, resolvedPublicProfile)
+    }
+
+    /// Maps seller toggle permission lanes into the governor DTO (avoids coupling governor to `ExchangeOffer` nested types).
+    private func providerGovernorPermissionPolicy(
+        from autoAnswerPolicy: ExchangeOffer.AutoAnswerPolicy
+    ) -> ProviderInquiryCompareGovernor.PermissionPolicy {
+        ProviderInquiryCompareGovernor.PermissionPolicy(
+            canAnswerPricing: autoAnswerPolicy.canAnswerPricing,
+            canAnswerAvailability: autoAnswerPolicy.canAnswerAvailability,
+            canAnswerPolicies: autoAnswerPolicy.canAnswerPolicies,
+            canAnswerServiceArea: autoAnswerPolicy.canAnswerServiceArea,
+            canAnswerFAQs: autoAnswerPolicy.canAnswerFAQs
+        )
+    }
+
+    private func runProviderCompareFirstPrefetch(
+        anchoredThread: ExchangeThread,
+        turns: [ExchangeTurn],
+        provisionalSnapshot: ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot
+    ) async -> ProviderInboundCompareFirstCache {
+        let governor = ProviderInquiryCompareGovernor()
+        let surfaces = await resolveHydratedSellerSurfacesForPass2(thread: anchoredThread)
+        let osm: ExchangeStructuredOperatingMemory
+        do {
+            osm = try await secondHalfFacade.assembledOperatingMemory(for: provisionalSnapshot)
+        } catch {
+            osm = .empty
+            #if DEBUG
+            exchFacadeLog(
+                "[ProviderInboundCompare][fallback] assembledOperatingMemory failed | thread=\(anchoredThread.id.uuidString) | \(error)"
+            )
+            #endif
+        }
+
+        let styleProfile = (try? await secondHalfFacade.secretaryStyleProfile(for: provisionalSnapshot)) ?? .default
+        let rawAsk = providerInboundRawRequesterAsk(thread: anchoredThread, turns: turns)
+        let inquiryPayload = firstNonBlank(rawAsk) ?? "Inbound message."
+
+        let inboundSnap = await providerInboundLatestIntentExtraction(
+            thread: anchoredThread,
+            inquiryText: inquiryPayload
+        )
+        let hasHydratedOffer = surfaces.offer != nil
+        let hasHydratedProfile = surfaces.profile != nil
+        let derivedAllowedSurfaces: ProviderAllowedFactSurfaces = {
+            if inboundSnap.decodeSucceeded, let extraction = inboundSnap.extraction {
+                return ProviderAllowedFactSurfaces.derive(
+                    from: extraction,
+                    hasHydratedOffer: hasHydratedOffer,
+                    hasHydratedProfile: hasHydratedProfile
+                )
+            }
+            return .classificationDecodeFailed
+        }()
+        let surfaceGatingEnabled = exchangeDebugProviderFactSurfaceGatingEnabled()
+        let gatedSurfaces = surfaceGatingEnabled ? derivedAllowedSurfaces : nil
+
+        #if DEBUG
+        let envID = anchoredThread.lastInboundEnvelopeID ?? ""
+        let fr = inboundSnap.fallbackReason ?? "nil"
+        let kind = inboundSnap.extraction?.inquiryKind.rawValue ?? "nil"
+        let surf = inboundSnap.extraction?.requestedFactSurfaces.map(\.rawValue).sorted().joined(separator: ",") ?? "nil"
+        exchFacadeLog(
+            "[ProviderAllowedFactSurfaces] thread=\(anchoredThread.id.uuidString) envelopeID=\(envID) " +
+                "source=providerInboundIntentExtractor inquiryKind=\(kind) requestedSurfaces=\(surf) " +
+                "includePublicProfile=\(derivedAllowedSurfaces.includePublicProfile) " +
+                "includeOffer=\(derivedAllowedSurfaces.includeOffer) " +
+                "includeCommercialOffer=\(derivedAllowedSurfaces.includeCommercialOffer) " +
+                "includeCommercialPricing=\(derivedAllowedSurfaces.includeCommercialPricingFacts) " +
+                "includeCommercialNonPricing=\(derivedAllowedSurfaces.includeCommercialNonPricingFacts) " +
+                "includeContactReachability=\(derivedAllowedSurfaces.includeContactReachability) " +
+                "includeOperatingMemoryDelta=\(derivedAllowedSurfaces.includeOperatingMemoryDelta) " +
+                "reason=\(derivedAllowedSurfaces.reason) decodeSucceeded=\(inboundSnap.decodeSucceeded) fallbackReason=\(fr)"
+        )
+        #endif
+
+        let osmDeltaPack = providerInquiryCompareOperatingMemoryDeltaPack(
+            operatingMemory: osm,
+            offer: surfaces.offer,
+            profile: surfaces.profile,
+            allowedSurfaces: gatedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled
+        )
+        let osmSummary = osmDeltaPack.joined
+        let offerSummaryForCompare = pass2CompactOfferSummary(
+            offer: surfaces.offer,
+            allowedSurfaces: gatedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled
+        )
+        let profileSummaryForCompare = pass2CompactProfileSummary(
+            profile: surfaces.profile,
+            allowedSurfaces: gatedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled
+        )
+        let hasPriceOnOffer = surfaces.offer.map { o in
+            let cf = o.commercialFacts
+            return !(cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                || cf.priceMin != nil
+                || cf.priceMax != nil
+        } ?? false
+        let hasUsefulSkim = !(surfaces.offer?.commercialSurfaceSkimLines.isEmpty ?? true)
+        let channelGatingFlags = ProviderCompareChannelGatingFlags(
+            gatedOfferSummary: surfaceGatingEnabled && !derivedAllowedSurfaces.includeOffer && surfaces.offer != nil,
+            gatedProfileSummary: surfaceGatingEnabled && !derivedAllowedSurfaces.includePublicProfile && surfaces.profile != nil,
+            gatedCommercialFacts: surfaceGatingEnabled && !derivedAllowedSurfaces.includeCommercialPricingFacts && hasPriceOnOffer,
+            gatedUsefulDetails: surfaceGatingEnabled
+                && (!derivedAllowedSurfaces.includeCommercialOffer || !derivedAllowedSurfaces.includeCommercialPricingFacts)
+                && hasUsefulSkim,
+            gatedOSM: surfaceGatingEnabled
+                && (!derivedAllowedSurfaces.includeOperatingMemoryDelta || osmSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        )
+        let sellerControlledFacts = providerInquiryCompareSellerControlledFactsBlock(
+            offer: surfaces.offer,
+            profile: surfaces.profile,
+            operatingMemory: osm,
+            allowedSurfaces: gatedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled,
+            channelGating: channelGatingFlags,
+            threadID: anchoredThread.id
+        )
+        let opportunityAnchor = anchoredThread.intent.resolvedOpportunitySurfaceAnchor(
+            selectedOfferID: anchoredThread.canonicalCommercialOfferAnchor,
+            selectedPublicProfileID: anchoredThread.selectedPublicProfileID,
+            selectedCounterpartyID: anchoredThread.selectedCounterpartyID
+        )
+        let primaryOpportunitySurface = anchoredThread.intent.primaryOpportunitySurfacePromptLabel(
+            resolvedAnchor: opportunityAnchor,
+            hasHydratedOffer: surfaces.offer != nil,
+            hasHydratedProfile: surfaces.profile != nil
+        )
+        let inboundExtraction = inboundSnap.extraction
+        let routingInquiryKind = inboundExtraction?.compareRoutingInquiryKindLabel ?? ProviderInboundInquiryKind.unclear.rawValue
+        let routingSurfaces = inboundExtraction?.compareRoutingRequestedSurfacesLabel ?? ""
+        #if DEBUG
+        debugLogProviderInquiryCompareFactsInput(
+            offer: surfaces.offer,
+            profile: surfaces.profile,
+            compareOfferSummary: offerSummaryForCompare,
+            compareProfileSummary: profileSummaryForCompare,
+            memorySummary: osmSummary,
+            sellerControlledFacts: sellerControlledFacts,
+            requesterAsk: inquiryPayload,
+            gate: gatedSurfaces,
+            surfaceGatingEnabled: surfaceGatingEnabled
+        )
+        debugLogProviderInquiryCompareSurfaceInput(
+            thread: anchoredThread,
+            offer: surfaces.offer,
+            profile: surfaces.profile,
+            sellerControlledFacts: sellerControlledFacts,
+            requesterAsk: inquiryPayload,
+            primaryOpportunitySurface: primaryOpportunitySurface
+        )
+        #endif
+
+        ProviderInquiryCompareProfileSummaryGate.logProfileSummarySurfaceAlignment(
+            profileSummary: profileSummaryForCompare,
+            sellerControlledFacts: sellerControlledFacts,
+            allowedSurfaces: gatedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled,
+            threadID: anchoredThread.id,
+            context: "compare_first_prefetch"
+        )
+
+        let claimBoundaryPacket = evaluateProviderClaimBoundaryLogOnly(
+            requesterText: inquiryPayload,
+            offer: surfaces.offer,
+            profile: surfaces.profile,
+            allowedSurfaces: derivedAllowedSurfaces,
+            applyFactSurfaceGating: surfaceGatingEnabled,
+            sellerControlledFacts: sellerControlledFacts
+        )
+        logProviderClaimBoundaryPacket(
+            claimBoundaryPacket,
+            threadID: anchoredThread.id,
+            phase: "before_compare"
+        )
+
+        var compare: ExchangeProviderInquiryCompareResult
+        if let onDevice = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider {
+            let allowedMeta = surfaceGatingEnabled ? derivedAllowedSurfaces.allowedFactBlocksMetadataLine() : nil
+            compare = await onDevice.compareProviderInquiryVsOffer(
+                inboundInquiry: inquiryPayload,
+                offerSummary: offerSummaryForCompare,
+                profileSummary: profileSummaryForCompare,
+                operatingMemorySummary: osmSummary,
+                styleProfile: styleProfile,
+                consentAutomationSummary: pass2ConsentAutomationSummary(offer: surfaces.offer),
+                sellerControlledFacts: sellerControlledFacts,
+                queryIntentClass: routingInquiryKind,
+                surfacePreference: routingSurfaces,
+                primaryOpportunitySurface: primaryOpportunitySurface,
+                selectedProfileID: snapshotTrimmed(anchoredThread.selectedPublicProfileID),
+                selectedOfferID: snapshotTrimmed(anchoredThread.selectedOfferID),
+                allowedFactBlocksMetadata: allowedMeta,
+                inboundIntentContext: inboundExtraction
+            )
+        } else {
+            compare = ExchangeProviderInquiryCompareResult(
+                answerableFromOffer: false,
+                knownAnswers: [],
+                knownFacts: [],
+                missingFacts: [],
+                needsProviderInput: true,
+                draftReply: nil,
+                reason: "provider_inquiry_compare_skipped_not_on_device",
+                recommendedDisposition: "askProviderInput",
+                canSendWithinConsent: false,
+                requiresBoundaryApproval: false
+            )
+            #if DEBUG
+            exchFacadeLog(
+                "[ProviderInboundCompare][fallback] non_on_device intelligence | thread=\(anchoredThread.id.uuidString)"
+            )
+            #endif
+        }
+
+        logProviderClaimBoundaryPacket(
+            claimBoundaryPacket,
+            threadID: anchoredThread.id,
+            phase: "after_compare"
+        )
+        if let draftBody = compare.draftReply?.trimmingCharacters(in: .whitespacesAndNewlines), !draftBody.isEmpty {
+            let prefetchValidation = ProviderClaimBoundaryValidator.validate(
+                body: draftBody,
+                packet: claimBoundaryPacket,
+                requesterText: inquiryPayload
+            )
+            ProviderClaimBoundaryValidator.logEnforcedGate(
+                result: prefetchValidation,
+                threadID: anchoredThread.id,
+                claimBoundaryAllowsAutoSend: ProviderClaimBoundaryValidator.claimBoundaryAllowsAutoSend(
+                    prefetchValidation
+                ),
+                skippedMissingPacket: false
+            )
+        }
+
+        let togglesPolicy = surfaces.offer?.commercialFacts.permissionOnlyAutoAnswerPolicy()
+        let permissionForGovernor = togglesPolicy.map(providerGovernorPermissionPolicy(from:))
+        let hints = ProviderInquiryCompareGovernor.BoundaryHints(
+            isCustomPricing: provisionalSnapshot.isCustomPricing,
+            includesScheduleCommitment: provisionalSnapshot.includesScheduleCommitment,
+            includesLegalCommercialCommitment: provisionalSnapshot.includesLegalCommercialCommitment,
+            includesSensitiveDisclosure: provisionalSnapshot.includesSensitiveDisclosure,
+            isPolicyException: provisionalSnapshot.isPolicyException
+        )
+        let governed = governor.evaluate(
+            compare: compare,
+            permissionPolicy: permissionForGovernor,
+            boundaryHints: hints
+        )
+
+        #if DEBUG
+        let cls = governed.missingFactsClassification
+        let draftTrim = compare.draftReply?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let safeGrounded = !draftTrim.isEmpty
+        let reqAsk = firstNonBlank(compare.requesterAsk, inquiryPayload) ?? inquiryPayload
+        let missJoined = compare.missingFacts.joined(separator: "|")
+        let exJoin = cls?.explicitlyRequestedMissingFacts.joined(separator: "|") ?? ""
+        let dcJoin = cls?.draftClaimedMissingFacts.joined(separator: "|") ?? ""
+        let nbCount = cls?.nonBlockingMissingFacts.count ?? 0
+        exchFacadeLog(
+            "[ProviderCompareFirstAuthority] thread=\(anchoredThread.id.uuidString) requesterAsk=\(exchangeDebugAuditBodyPrefix(reqAsk, maxLen: 200)) " +
+                "missingFacts=\(exchangeDebugAuditBodyPrefix(missJoined, maxLen: 220)) " +
+                "explicitlyRequestedMissingFacts=\(exchangeDebugAuditBodyPrefix(exJoin, maxLen: 180)) " +
+                "draftClaimedMissingFacts=\(exchangeDebugAuditBodyPrefix(dcJoin, maxLen: 180)) " +
+                "nonBlockingMissingFactsCount=\(nbCount) safeGroundedDraft=\(safeGrounded) " +
+                "recommendedDisposition=\(compare.recommendedDisposition ?? "nil") governedActionAfter=\(governed.normalizedAction.rawValue)"
+        )
+        debugLogProviderInquiryCompareSurfaceOutput(
+            threadID: anchoredThread.id,
+            compare: compare,
+            governed: governed
+        )
+        if let d = governed.downgradeReason, !d.isEmpty {
+            exchFacadeLog(
+                "[ProviderInboundCompare] downgrade thread=\(anchoredThread.id.uuidString) reason=\(d)"
+            )
+        }
+        #endif
+
+        return ProviderInboundCompareFirstCache(
+            compare: compare,
+            governed: governed
+        )
+    }
+
+    private func secondHalfRequesterProviderDirectedQuestionFallbackLinesIfEligible(
+        thread: ExchangeThread,
+        matches: [ExchangeMatch],
+        requestCapturedSupplement: String?
+    ) -> [String] {
+        let blob = secondHalfUserOutboundRequestProbeBlob(
+            thread: thread,
+            requestCapturedSupplement: requestCapturedSupplement
+        )
+        guard secondHalfOutboundProbeIntentDetected(probeBlob: blob) else { return [] }
+        guard secondHalfSelectedOrLoneStrongCandidate(thread: thread, matches: matches) else { return [] }
+        return secondHalfRequesterProviderDirectedQuestionLinesFromProbeBlob(blob: blob, thread: thread)
+    }
+
+    /// Lightweight `ExchangeThreadSituation` for Pass-2 requester agency (second-half display when persisted).
+    private func pass2RequesterEvaluationSituation(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        matches: [ExchangeMatch],
+        resolvedOffer: ExchangeOffer?,
+        resolvedPublicProfile: ExchangePublicNodeProfile?
+    ) -> ExchangeThreadSituation? {
+        let cachedSecondHalf: ExchangeSecondHalfUIAdapter.DisplayModel? = {
+            guard let snap = thread.secondHalf else { return nil }
+            return secondHalfFacade.getCachedDisplayModel(
+                snapshot: snap,
+                thread: thread,
+                selectedCounterpartyName: nil,
+                latestDraft: nil
+            )
+        }()
+
+        let detail = ExchangeModels.ThreadDetail(
+            thread: thread,
+            turns: turns,
+            approvals: [],
+            drafts: [],
+            matches: matches,
+            counterparties: [],
+            artifacts: [],
+            summary: thread.title,
+            secondHalfDisplay: cachedSecondHalf
+        )
+
+        return ExchangeThreadSituationBuilder.build(
+            detail: detail,
+            resolvedOffer: resolvedOffer,
+            resolvedPublicProfile: resolvedPublicProfile
+        )
+    }
+
+    private func pass2SelectedMatchForIntentGaps(thread: ExchangeThread, matches: [ExchangeMatch]) -> ExchangeMatch? {
+        matches.first(where: { match in
+            if let rawOffer = thread.selectedOfferID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawOffer.isEmpty {
+                if match.offerID == rawOffer { return true }
+                if match.matchedOfferIDs.contains(rawOffer) { return true }
+            }
+            if let selectedPublicProfileID = thread.selectedPublicProfileID,
+               match.publicProfileID == selectedPublicProfileID {
+                return true
+            }
+            if let selectedCounterpartyID = thread.selectedCounterpartyID,
+               match.counterpartyID == selectedCounterpartyID {
+                return true
+            }
+            return false
+        })
+    }
+
+    private func resolveRequesterMatchCompareForPass2(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        matches: [ExchangeMatch],
+        requesterIntentLine: String,
+        styleProfile: ExchangeSecretaryStyleProfile,
+        resolvedOffer: ExchangeOffer?,
+        resolvedPublicProfile: ExchangePublicNodeProfile?,
+        counterpartyName: String?,
+        knownFacts: [String]
+    ) async -> (compare: ExchangeRequesterMatchCompareResult?, lines: [String], compareSucceeded: Bool) {
+        let requestCaptured = turns.reversed().first(where: { $0.kind == .requestCaptured })?.summary
+        let fallback = secondHalfRequesterProviderDirectedQuestionFallbackLinesIfEligible(
+            thread: thread,
+            matches: matches,
+            requestCapturedSupplement: requestCaptured
+        )
+        let hasSurface = resolvedOffer != nil || resolvedPublicProfile != nil
+        guard hasSurface else {
+            #if DEBUG
+            exchFacadeLog(
+                "[RequesterCompare] start thread=\(thread.id.uuidString) hasOriginalRequest=true hasMatchedOffer=false hasStyle=true result skipped=no_surface"
+            )
+            #endif
+            return (nil, fallback, false)
+        }
+
+        guard let onDevice = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider else {
+            #if DEBUG
+            exchFacadeLog(
+                "[RequesterCompare] start thread=\(thread.id.uuidString) hasOriginalRequest=true hasMatchedOffer=\(resolvedOffer != nil) hasStyle=true result skipped=not_on_device_runner missingCount=0 questionCount=\(fallback.count) shouldAskProvider=\(!fallback.isEmpty)"
+            )
+            #endif
+            return (nil, fallback, false)
+        }
+
+        let original = requesterIntentLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let offerSummary = pass2CompactOfferSummary(offer: resolvedOffer)
+        let profileSummary = pass2CompactProfileSummary(profile: resolvedPublicProfile)
+        let requirementsSummary = ExchangeRequesterCompareGroundingSummary.render(
+            originalRequesterMessage: original,
+            searchIntent: thread.facets?.searchIntent,
+            thread: thread,
+            facets: thread.facets
+        )
+
+        #if DEBUG
+        exchFacadeLog(
+            "[RequesterCompare] start thread=\(thread.id.uuidString) hasOriginalRequest=\(!original.isEmpty) hasMatchedOffer=\(resolvedOffer != nil) hasStyle=true hasGrounding=\(requirementsSummary != nil)"
+        )
+        #endif
+
+        let compare = await onDevice.compareRequesterMatchToSurface(
+            originalRequesterMessage: original,
+            selectedOfferSummary: offerSummary,
+            selectedProfileSummary: profileSummary,
+            counterpartyDisplayName: counterpartyName,
+            knownFacts: knownFacts,
+            styleProfile: styleProfile,
+            requesterRequirementsSummary: requirementsSummary
+        )
+
+        let failed = compare.reason.lowercased().contains("requester_match_compare_failed")
+        let compareSucceeded = !failed
+        let lines: [String]
+        if compareSucceeded {
+            lines = compare.providerQuestions
+        } else if !fallback.isEmpty {
+            lines = fallback
+        } else {
+            lines = []
+        }
+
+        #if DEBUG
+        let missingCount = compare.missingFacts.count
+        let qCount = lines.count
+        let should = !lines.isEmpty
+        let source = compareSucceeded ? "llm" : (!fallback.isEmpty ? "fallback_named" : "none")
+        exchFacadeLog(
+            "[RequesterCompare] result thread=\(thread.id.uuidString) missingCount=\(missingCount) questionCount=\(qCount) shouldAskProvider=\(should) source=\(source) reason=\(exchangeDebugAuditBodyPrefix(compare.reason, maxLen: 160))"
+        )
+        #endif
+
+        return (compare, lines, compareSucceeded)
+    }
+
+    func buildPass2AgencyAssessment(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        snapshot: ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot,
+        knownFacts: [String],
+        operatingMemory: ExchangeStructuredOperatingMemory,
+        matches: [ExchangeMatch],
+        providerCompareFirstCache: ProviderInboundCompareFirstCache? = nil
+    ) async throws -> Pass2AgencyBuildResult {
+        let trimmedOfferID = snapshotTrimmed(thread.selectedOfferID)
+        var selectedPublicProfileID = snapshotTrimmed(thread.selectedPublicProfileID)
+        let selectedCounterpartyID = snapshotTrimmed(thread.selectedCounterpartyID)
+
+        let resolvedOffer: ExchangeOffer?
+        if let trimmedOfferID {
+            resolvedOffer = try? await store.fetchOffer(id: trimmedOfferID)
+        } else {
+            resolvedOffer = nil
+        }
+
+        // Pass-2 context is canonical for future packet drafting. Packet builders should consume
+        // these typed IDs plus resolved rows from context, and should not perform independent store resolution.
+        if selectedPublicProfileID == nil,
+           let fallbackProfileID = resolvedOffer?.publicProfileID.flatMap({ snapshotTrimmed($0) }) {
+            selectedPublicProfileID = fallbackProfileID
+        }
+
+        let resolvedPublicProfile: ExchangePublicNodeProfile?
+        if let selectedPublicProfileID {
+            resolvedPublicProfile = try? await store.fetchPublicProfile(id: selectedPublicProfileID)
+        } else {
+            resolvedPublicProfile = nil
+        }
+
+        let opportunitySurfaceAnchor = thread.intent.resolvedOpportunitySurfaceAnchor(
+            selectedOfferID: trimmedOfferID ?? snapshotTrimmed(thread.selectedOfferID),
+            selectedPublicProfileID: selectedPublicProfileID ?? snapshotTrimmed(thread.selectedPublicProfileID),
+            selectedCounterpartyID: selectedCounterpartyID ?? snapshotTrimmed(thread.selectedCounterpartyID)
+        )
+
+        let requestCapturedSummary = turns
+            .last(where: { $0.kind == .requestCaptured }).flatMap { snapshotTrimmed($0.summary) }
+        let pass2NonGenericIntentLine = { (_ raw: String?) -> String? in
+            guard let line = ExchangeSemanticEvidenceSanitizer.sanitize(raw) else { return nil }
+            if ExchangeUserFacingCopySanitizer.isGenericExchangeTitle(line) {
+                return nil
+            }
+            return line
+        }
+
+        /// Prefer real request wording over generic workspace titles (`Find Match`, …).
+        let intentForRequester = firstNonBlank(
+            ExchangeSemanticEvidenceSanitizer.sanitize(requestCapturedSummary),
+            pass2NonGenericIntentLine(thread.humanRequesterText),
+            pass2NonGenericIntentLine(thread.intent.objective),
+            pass2NonGenericIntentLine(thread.title),
+            snapshot.subjectMatter.flatMap { pass2NonGenericIntentLine($0) },
+            knownFacts.first.flatMap { snapshotTrimmed($0) },
+            pass2NonGenericIntentLine(thread.intent.objective),
+            pass2NonGenericIntentLine(thread.title)
+        ) ?? "Review surfaced opportunity."
+
+        let intentForProvider = pass2InboundInquiryCombinedText(snapshot.inquiry)
+
+        let secretaryStyleLine = currentSecretaryStyleText()
+        let history = pass2ThreadHistoryLines(from: turns)
+
+        switch snapshot.role {
+        case .requester:
+            let requesterBoundaryHints = pass2RequesterBoundaryHints(from: snapshot)
+            let pass2Situation = pass2RequesterEvaluationSituation(
+                thread: thread,
+                turns: turns,
+                matches: matches,
+                resolvedOffer: resolvedOffer,
+                resolvedPublicProfile: resolvedPublicProfile
+            )
+            let styleProfile = (try? await secondHalfFacade.secretaryStyleProfile(for: snapshot)) ?? .default
+            let (requesterMatchCompare, requesterDirectedQuestionsForAgency, requesterMatchCompareSucceeded) =
+                await resolveRequesterMatchCompareForPass2(
+                    thread: thread,
+                    turns: turns,
+                    matches: matches,
+                    requesterIntentLine: intentForRequester,
+                    styleProfile: styleProfile,
+                    resolvedOffer: resolvedOffer,
+                    resolvedPublicProfile: resolvedPublicProfile,
+                    counterpartyName: snapshot.counterpartyName,
+                    knownFacts: knownFacts
+                )
+            let gapOutput = ExchangeRequesterIntentGapReducer().reduce(
+                input: .init(
+                    thread: thread,
+                    offer: resolvedOffer,
+                    publicProfile: resolvedPublicProfile,
+                    operatingMemory: operatingMemory,
+                    knownFactLines: knownFacts,
+                    selectedMatch: pass2SelectedMatchForIntentGaps(thread: thread, matches: matches),
+                    matchCompare: requesterMatchCompare
+                )
+            )
+            let agencyContext = ExchangeAgencyContextBuilder.buildRequesterContext(
+                threadID: thread.id,
+                selectedOfferID: trimmedOfferID,
+                selectedPublicProfileID: selectedPublicProfileID,
+                selectedCounterpartyID: selectedCounterpartyID,
+                userIntent: intentForRequester,
+                secretaryStyleText: secretaryStyleLine,
+                situation: pass2Situation,
+                publicProfile: resolvedPublicProfile,
+                offer: resolvedOffer,
+                operatingMemory: operatingMemory,
+                threadHistoryLines: history,
+                additionalKnownFacts: knownFacts,
+                additionalBoundaryHints: requesterBoundaryHints,
+                opportunitySurfaceAnchor: opportunitySurfaceAnchor,
+                intentGaps: gapOutput.gaps,
+                intentGapCombinedClarificationQuestion: gapOutput.combinedProviderQuestion,
+                facets: thread.facets
+            )
+
+            let decisionNeeds = ExchangeRequesterDecisionNeedsEngine().evaluate(context: agencyContext)
+
+            #if DEBUG
+            let missingPreview = exchangeDebugAuditBodyPrefix(
+                decisionNeeds.missingDecisionFacts.joined(separator: " | "),
+                maxLen: 220
+            )
+            let recPreview = exchangeDebugAuditBodyPrefix(
+                decisionNeeds.recommendedQuestions.joined(separator: " | "),
+                maxLen: 160
+            )
+            exchFacadeLog(
+                "[SecondHalfPass2Needs] thread=\(thread.id.uuidString) role=requester missingDecisionFactsCount=\(decisionNeeds.missingDecisionFacts.count) missingPreview=\(missingPreview) recommendedQuestionsCount=\(decisionNeeds.recommendedQuestions.count) recommendedPreview=\(recPreview) hydratedOffer=\(resolvedOffer != nil) hydratedProfile=\(resolvedPublicProfile != nil)"
+            )
+            #endif
+
+            let preliminary = ExchangeAgencyAssessment(
+                requesterDecisionNeeds: decisionNeeds,
+                providerAnswerability: nil,
+                groundedFactLines: Array(decisionNeeds.knownDecisionFacts.prefix(10)),
+                suggestedQuestionLines: Array(decisionNeeds.recommendedQuestions.prefix(4)),
+                answerabilityLine: nil,
+                agencySuggestions: []
+            )
+
+            let planned = ExchangeAgencyPlanner.suggest(
+                context: agencyContext,
+                situation: nil,
+                assessment: preliminary,
+                thread: thread,
+                turns: turns
+            )
+
+            let finalDecision = ExchangeAgencyPlanner.buildAgencyDecision(
+                context: agencyContext,
+                assessment: ExchangeAgencyAssessment(
+                    requesterDecisionNeeds: decisionNeeds,
+                    providerAnswerability: nil,
+                    groundedFactLines: preliminary.groundedFactLines,
+                    suggestedQuestionLines: preliminary.suggestedQuestionLines,
+                    answerabilityLine: nil,
+                    agencySuggestions: Array(planned.prefix(5))
+                )
+            )
+
+            let assessment = ExchangeAgencyAssessment(
+                requesterDecisionNeeds: decisionNeeds,
+                providerAnswerability: nil,
+                groundedFactLines: preliminary.groundedFactLines,
+                suggestedQuestionLines: preliminary.suggestedQuestionLines,
+                answerabilityLine: nil,
+                agencySuggestions: Array(planned.prefix(5)),
+                agencyDecision: finalDecision
+            )
+            let executionContext = ExchangeSecondHalfThreadAdapter().makeExecutionContext(
+                from: snapshot,
+                styleProfile: styleProfile,
+                operatingMemory: operatingMemory
+            )
+            let topSummaries = requesterTopRankedMatchSummaryLines(matches: matches, limit: 3)
+            return Pass2AgencyBuildResult(
+                assessment: assessment,
+                requesterContext: agencyContext,
+                requesterExecutionContext: executionContext,
+                requesterStyleProfile: styleProfile,
+                requesterTopRankedCandidateSummaries: topSummaries,
+                requesterMatchCompare: requesterMatchCompare,
+                requesterDirectedQuestionsForAgency: requesterDirectedQuestionsForAgency,
+                requesterMatchCompareSucceeded: requesterMatchCompareSucceeded,
+                requesterIntentGaps: gapOutput.gaps,
+                providerContext: nil,
+                providerExecutionContext: nil,
+                providerStyleProfile: nil,
+                providerInquiryCompare: nil
+            )
+
+        case .provider:
+            let latestInbound = latestInboundRequesterMessage(thread: thread, turns: turns)
+            let providerDomainIntent = firstNonBlank(
+                latestInbound?.text,
+                intentForProvider,
+                snapshot.subjectMatter
+            ) ?? "Inbound coordination."
+            let agencyContext = ExchangeAgencyContextBuilder.buildProviderContext(
+                threadID: thread.id,
+                selectedOfferID: trimmedOfferID,
+                selectedPublicProfileID: selectedPublicProfileID,
+                selectedCounterpartyID: selectedCounterpartyID,
+                userIntent: providerDomainIntent,
+                secretaryStyleText: secretaryStyleLine,
+                situation: nil,
+                publicProfile: resolvedPublicProfile,
+                offer: resolvedOffer,
+                operatingMemory: operatingMemory,
+                threadHistoryLines: history,
+                additionalKnownFacts: knownFacts,
+                opportunitySurfaceAnchor: opportunitySurfaceAnchor
+            )
+
+            let inquiryText = providerDomainIntent
+
+            let styleProfile = (try? await secondHalfFacade.secretaryStyleProfile(for: snapshot)) ?? .default
+            let providerStyleRepChars = styleProfile.compactRepresentationPromptBlock().count
+            let providerStyleSource = styleProfile.isNonDefaultProfile ? "userDefined" : "default"
+
+            var providerInquiryCompare: ExchangeProviderInquiryCompareResult?
+            if let cache = providerCompareFirstCache {
+                providerInquiryCompare = cache.governed.clampedCompare
+                #if DEBUG
+                exchFacadeLog(
+                    "[ProviderAnswerability] pass2_reuse_cached_compare thread=\(thread.id.uuidString) action=\(cache.governed.normalizedAction.rawValue)"
+                )
+                #endif
+            } else if let onDevice = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider {
+                let inboundSnap = await providerInboundLatestIntentExtraction(
+                    thread: thread,
+                    inquiryText: inquiryText
+                )
+                let derivedAllowedSurfaces: ProviderAllowedFactSurfaces = {
+                    if inboundSnap.decodeSucceeded, let extraction = inboundSnap.extraction {
+                        return ProviderAllowedFactSurfaces.derive(
+                            from: extraction,
+                            hasHydratedOffer: resolvedOffer != nil,
+                            hasHydratedProfile: resolvedPublicProfile != nil
+                        )
+                    }
+                    return .classificationDecodeFailed
+                }()
+                let surfaceGatingEnabled = exchangeDebugProviderFactSurfaceGatingEnabled()
+                let gatedSurfaces = surfaceGatingEnabled ? derivedAllowedSurfaces : nil
+
+                #if DEBUG
+                let envID = thread.lastInboundEnvelopeID ?? ""
+                let fr = inboundSnap.fallbackReason ?? "nil"
+                let kind = inboundSnap.extraction?.inquiryKind.rawValue ?? "nil"
+                let surf = inboundSnap.extraction?.requestedFactSurfaces.map(\.rawValue).sorted().joined(separator: ",") ?? "nil"
+                exchFacadeLog(
+                    "[ProviderAllowedFactSurfaces] thread=\(thread.id.uuidString) envelopeID=\(envID) " +
+                        "source=providerInboundIntentExtractor inquiryKind=\(kind) requestedSurfaces=\(surf) " +
+                        "includePublicProfile=\(derivedAllowedSurfaces.includePublicProfile) " +
+                        "includeOffer=\(derivedAllowedSurfaces.includeOffer) " +
+                        "includeCommercialOffer=\(derivedAllowedSurfaces.includeCommercialOffer) " +
+                        "includeCommercialPricing=\(derivedAllowedSurfaces.includeCommercialPricingFacts) " +
+                        "includeCommercialNonPricing=\(derivedAllowedSurfaces.includeCommercialNonPricingFacts) " +
+                        "includeContactReachability=\(derivedAllowedSurfaces.includeContactReachability) " +
+                        "includeOperatingMemoryDelta=\(derivedAllowedSurfaces.includeOperatingMemoryDelta) " +
+                        "reason=\(derivedAllowedSurfaces.reason) decodeSucceeded=\(inboundSnap.decodeSucceeded) fallbackReason=\(fr)"
+                )
+                #endif
+
+                let osmDeltaPack = providerInquiryCompareOperatingMemoryDeltaPack(
+                    operatingMemory: operatingMemory,
+                    offer: resolvedOffer,
+                    profile: resolvedPublicProfile,
+                    allowedSurfaces: gatedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled
+                )
+                let osmSummary = osmDeltaPack.joined
+                let offerSummary = pass2CompactOfferSummary(
+                    offer: resolvedOffer,
+                    allowedSurfaces: gatedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled
+                )
+                let profileSummary = pass2CompactProfileSummary(
+                    profile: resolvedPublicProfile,
+                    allowedSurfaces: gatedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled
+                )
+                let hasPriceOnOfferPass2 = resolvedOffer.map { o in
+                    let cf = o.commercialFacts
+                    return !(cf.priceDisplay?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                        || cf.priceMin != nil
+                        || cf.priceMax != nil
+                } ?? false
+                let hasUsefulSkimPass2 = !(resolvedOffer?.commercialSurfaceSkimLines.isEmpty ?? true)
+                let channelGatingFlagsPass2 = ProviderCompareChannelGatingFlags(
+                    gatedOfferSummary: surfaceGatingEnabled && !derivedAllowedSurfaces.includeOffer && resolvedOffer != nil,
+                    gatedProfileSummary: surfaceGatingEnabled && !derivedAllowedSurfaces.includePublicProfile && resolvedPublicProfile != nil,
+                    gatedCommercialFacts: surfaceGatingEnabled && !derivedAllowedSurfaces.includeCommercialPricingFacts && hasPriceOnOfferPass2,
+                    gatedUsefulDetails: surfaceGatingEnabled
+                        && (!derivedAllowedSurfaces.includeCommercialOffer || !derivedAllowedSurfaces.includeCommercialPricingFacts)
+                        && hasUsefulSkimPass2,
+                    gatedOSM: surfaceGatingEnabled
+                        && (!derivedAllowedSurfaces.includeOperatingMemoryDelta || osmSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                )
+                let sellerControlledFacts = providerInquiryCompareSellerControlledFactsBlock(
+                    offer: resolvedOffer,
+                    profile: resolvedPublicProfile,
+                    operatingMemory: operatingMemory,
+                    allowedSurfaces: gatedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled,
+                    channelGating: channelGatingFlagsPass2,
+                    threadID: thread.id
+                )
+                let primaryOpportunitySurface = thread.intent.primaryOpportunitySurfacePromptLabel(
+                    resolvedAnchor: opportunitySurfaceAnchor,
+                    hasHydratedOffer: resolvedOffer != nil,
+                    hasHydratedProfile: resolvedPublicProfile != nil
+                )
+                let inboundExtractionPass2 = inboundSnap.extraction
+                let routingInquiryKindPass2 = inboundExtractionPass2?.compareRoutingInquiryKindLabel
+                    ?? ProviderInboundInquiryKind.unclear.rawValue
+                let routingSurfacesPass2 = inboundExtractionPass2?.compareRoutingRequestedSurfacesLabel ?? ""
+                #if DEBUG
+                debugLogProviderInquiryCompareFactsInput(
+                    offer: resolvedOffer,
+                    profile: resolvedPublicProfile,
+                    compareOfferSummary: offerSummary,
+                    compareProfileSummary: profileSummary,
+                    memorySummary: osmSummary,
+                    sellerControlledFacts: sellerControlledFacts,
+                    requesterAsk: inquiryText,
+                    gate: gatedSurfaces,
+                    surfaceGatingEnabled: surfaceGatingEnabled
+                )
+                debugLogProviderInquiryCompareSurfaceInput(
+                    thread: thread,
+                    offer: resolvedOffer,
+                    profile: resolvedPublicProfile,
+                    sellerControlledFacts: sellerControlledFacts,
+                    requesterAsk: inquiryText,
+                    primaryOpportunitySurface: primaryOpportunitySurface
+                )
+                exchFacadeLog(
+                    "[ProviderAnswerability] start thread=\(thread.id.uuidString) hasInquiry=\(!inquiryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) hasOffer=\(resolvedOffer != nil) styleChars=\(providerStyleRepChars) styleSource=\(providerStyleSource)"
+                )
+                #endif
+                ProviderInquiryCompareProfileSummaryGate.logProfileSummarySurfaceAlignment(
+                    profileSummary: profileSummary,
+                    sellerControlledFacts: sellerControlledFacts,
+                    allowedSurfaces: gatedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled,
+                    threadID: thread.id,
+                    context: "pass2_agency_compare"
+                )
+                let pass2ClaimBoundaryPacket = evaluateProviderClaimBoundaryLogOnly(
+                    requesterText: inquiryText,
+                    offer: resolvedOffer,
+                    profile: resolvedPublicProfile,
+                    allowedSurfaces: derivedAllowedSurfaces,
+                    applyFactSurfaceGating: surfaceGatingEnabled,
+                    sellerControlledFacts: sellerControlledFacts
+                )
+                logProviderClaimBoundaryPacket(pass2ClaimBoundaryPacket, threadID: thread.id, phase: "pass2_before_compare")
+                let allowedMeta = surfaceGatingEnabled ? derivedAllowedSurfaces.allowedFactBlocksMetadataLine() : nil
+                providerInquiryCompare = await onDevice.compareProviderInquiryVsOffer(
+                    inboundInquiry: inquiryText,
+                    offerSummary: offerSummary,
+                    profileSummary: profileSummary,
+                    operatingMemorySummary: osmSummary,
+                    styleProfile: styleProfile,
+                    consentAutomationSummary: pass2ConsentAutomationSummary(offer: resolvedOffer),
+                    sellerControlledFacts: sellerControlledFacts,
+                    queryIntentClass: routingInquiryKindPass2,
+                    surfacePreference: routingSurfacesPass2,
+                    primaryOpportunitySurface: primaryOpportunitySurface,
+                    selectedProfileID: selectedPublicProfileID,
+                    selectedOfferID: trimmedOfferID,
+                    allowedFactBlocksMetadata: allowedMeta,
+                    inboundIntentContext: inboundExtractionPass2
+                )
+                #if DEBUG
+                let c = providerInquiryCompare
+                let ans = c?.answerableFromOffer == true
+                let miss = c?.missingFacts.count ?? 0
+                let needs = c?.needsProviderInput == true
+                exchFacadeLog(
+                    "[ProviderAnswerability] result thread=\(thread.id.uuidString) answerableFromOffer=\(ans) missingCount=\(miss) needsProviderInput=\(needs)"
+                )
+                #endif
+                logProviderClaimBoundaryPacket(pass2ClaimBoundaryPacket, threadID: thread.id, phase: "pass2_after_compare")
+            }
+
+            let answerabilityBaseline = ExchangeProviderAnswerabilityEngine().evaluate(
+                context: agencyContext,
+                inquiryText: inquiryText,
+                prefersDeterministicComposer: true
+            )
+            let answerability: ExchangeProviderAnswerability
+            if let cache = providerCompareFirstCache {
+                answerability = mergeProviderAnswerabilityWithGovernor(
+                    baseline: answerabilityBaseline,
+                    compare: cache.governed.clampedCompare,
+                    governed: cache.governed
+                )
+            } else {
+                answerability = overlayProviderAnswerabilityWithLLMCompare(
+                    baseline: answerabilityBaseline,
+                    compare: providerInquiryCompare
+                )
+            }
+
+            let grounded = Array(answerability.knownFactsUsed.prefix(14))
+
+            let suggestedClarifiers = Array(answerability.missingFacts.prefix(4))
+
+            let preliminary = ExchangeAgencyAssessment(
+                requesterDecisionNeeds: nil,
+                providerAnswerability: answerability,
+                groundedFactLines: grounded,
+                suggestedQuestionLines: suggestedClarifiers,
+                answerabilityLine: answerability.answerability.pass2DisplayLabel,
+                agencySuggestions: []
+            )
+
+            let planned = ExchangeAgencyPlanner.suggest(
+                context: agencyContext,
+                situation: nil,
+                assessment: preliminary,
+                thread: thread,
+                turns: turns
+            )
+
+            let finalDecision = ExchangeAgencyPlanner.buildAgencyDecision(
+                context: agencyContext,
+                assessment: ExchangeAgencyAssessment(
+                    requesterDecisionNeeds: nil,
+                    providerAnswerability: answerability,
+                    groundedFactLines: grounded,
+                    suggestedQuestionLines: suggestedClarifiers,
+                    answerabilityLine: answerability.answerability.pass2DisplayLabel,
+                    agencySuggestions: Array(planned.prefix(5))
+                )
+            )
+
+            let executionContext = ExchangeSecondHalfThreadAdapter().makeExecutionContext(
+                from: snapshot,
+                styleProfile: styleProfile,
+                operatingMemory: operatingMemory
+            )
+
+            return Pass2AgencyBuildResult(
+                assessment: ExchangeAgencyAssessment(
+                requesterDecisionNeeds: nil,
+                providerAnswerability: answerability,
+                groundedFactLines: grounded,
+                suggestedQuestionLines: suggestedClarifiers,
+                answerabilityLine: answerability.answerability.pass2DisplayLabel,
+                agencySuggestions: Array(planned.prefix(5)),
+                agencyDecision: finalDecision
+                ),
+                requesterContext: nil,
+                requesterExecutionContext: nil,
+                requesterStyleProfile: nil,
+                requesterTopRankedCandidateSummaries: [],
+                requesterMatchCompare: nil,
+                requesterDirectedQuestionsForAgency: [],
+                requesterMatchCompareSucceeded: false,
+                requesterIntentGaps: [],
+                providerContext: agencyContext,
+                providerExecutionContext: executionContext,
+                providerStyleProfile: styleProfile,
+                providerInquiryCompare: providerInquiryCompare
+            )
+        }
+    }
+
+    func applyRequesterClarificationRewriteIfEligible(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        pass2Result: Pass2AgencyBuildResult
+    ) async -> ExchangeSecondHalfUIAdapter.DisplayModel {
+        guard
+            display.status.role == ExchangeSecondHalfRole.requester.displayTitle,
+            ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+                == ExchangeSecondHalfAction.askClarification.rawValue,
+            let draft = display.draft,
+            let requesterNeeds = pass2Result.assessment.requesterDecisionNeeds,
+            let context = pass2Result.requesterContext,
+            let executionContext = pass2Result.requesterExecutionContext
+        else {
+            return display
+        }
+
+        let baseBody = draft.bodyPreview.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseBody.isEmpty else { return display }
+
+        let styleProfile = pass2Result.requesterStyleProfile
+            ?? pass2Result.requesterExecutionContext?.styleProfile
+            ?? .default
+
+        let directedResolved: [String]? = pass2ProviderDirectedLinesResolved(pass2Result)
+        let packet = ExchangeAgencyDraftPacketBuilder.buildRequesterClarificationPacket(
+            context: context,
+            decisionNeeds: requesterNeeds,
+            executionContext: executionContext,
+            styleProfile: styleProfile,
+            maxLength: 220,
+            topRankedCandidateSummaries: pass2Result.requesterTopRankedCandidateSummaries,
+            providerDirectedQuestionLinesResolved: directedResolved,
+            pass2LLMCompareSucceeded: pass2Result.requesterMatchCompareSucceeded
+        )
+
+        let rewriteResult: ExchangeAgencyDraftRewriteResult
+        if let onDeviceProvider = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider {
+            rewriteResult = await onDeviceProvider.rewriteRequesterClarificationDraft(
+                packet: packet,
+                deterministicBaseDraft: baseBody
+            )
+        } else {
+            rewriteResult = await ExchangeAgencyDraftRewriteEngine.rewriteRequesterClarification(
+                packet: packet,
+                deterministicBaseDraft: baseBody
+            )
+        }
+
+        guard rewriteResult.accepted else {
+            #if DEBUG
+            exchFacadeLog(
+                "requester clarification rewrite skipped | thread=\(display.threadID?.uuidString ?? "nil") | reasons=\(rewriteResult.rejectionReasons.joined(separator: ","))"
+            )
+            #endif
+            return display
+        }
+
+        var updatedDisplay = display
+        if var updatedDraft = updatedDisplay.draft {
+            updatedDraft.bodyPreview = rewriteResult.body
+            updatedDisplay.draft = updatedDraft
+        }
+        #if DEBUG
+        exchFacadeLog(
+            "requester clarification rewrite accepted | thread=\(display.threadID?.uuidString ?? "nil") | chars=\(rewriteResult.body.count)"
+        )
+        #endif
+        return updatedDisplay
+    }
+
+    func applyProviderResponseRewriteIfEligible(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        pass2Result: Pass2AgencyBuildResult
+    ) async -> ExchangeSecondHalfUIAdapter.DisplayModel {
+        guard
+            display.status.role == ExchangeSecondHalfRole.provider.displayTitle,
+            ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+                == ExchangeSecondHalfAction.autoRespond.rawValue,
+            let draft = display.draft,
+            let providerAnswerability = pass2Result.assessment.providerAnswerability,
+            let context = pass2Result.providerContext,
+            let executionContext = pass2Result.providerExecutionContext
+        else {
+            return display
+        }
+
+        let baseBody = draft.bodyPreview.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseBody.isEmpty else { return display }
+
+        let styleProfile = pass2Result.providerStyleProfile
+            ?? pass2Result.providerExecutionContext?.styleProfile
+            ?? .default
+
+        let packet = ExchangeAgencyDraftPacketBuilder.buildProviderResponsePacket(
+            context: context,
+            providerAnswerability: providerAnswerability,
+            executionContext: executionContext,
+            styleProfile: styleProfile,
+            maxLength: 280
+        )
+
+        let rewriteResult: ExchangeAgencyDraftRewriteResult
+        if let onDeviceProvider = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider {
+            rewriteResult = await onDeviceProvider.rewriteProviderResponseDraft(
+                packet: packet,
+                deterministicBaseDraft: baseBody
+            )
+        } else {
+            rewriteResult = await ExchangeAgencyDraftRewriteEngine.rewriteProviderResponse(
+                packet: packet,
+                deterministicBaseDraft: baseBody
+            )
+        }
+
+        guard rewriteResult.accepted else {
+            #if DEBUG
+            exchFacadeLog(
+                "provider response rewrite skipped | thread=\(display.threadID?.uuidString ?? "nil") | reasons=\(rewriteResult.rejectionReasons.joined(separator: ","))"
+            )
+            #endif
+            return display
+        }
+
+        var updatedDisplay = display
+        if var updatedDraft = updatedDisplay.draft {
+            updatedDraft.bodyPreview = rewriteResult.body
+            updatedDisplay.draft = updatedDraft
+        }
+        #if DEBUG
+        exchFacadeLog(
+            "provider response rewrite accepted | thread=\(display.threadID?.uuidString ?? "nil") | chars=\(rewriteResult.body.count)"
+        )
+        #endif
+        return updatedDisplay
+    }
+
+    func pass2InboundInquiryCombinedText(_ inquiry: ExchangeInboundInquiry?) -> String? {
+        guard let inquiry else {
+            return nil
+        }
+
+        let pieces = [
+            inquiry.requesterAsk,
+            inquiry.inquirySummary
+        ]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !pieces.isEmpty else {
+            return nil
+        }
+
+        return pieces.joined(separator: " ")
+    }
+
+    func pass2RequesterBoundaryHints(
+        from snapshot: ExchangeSecondHalfThreadAdapter.LegacyThreadSnapshot
+    ) -> [String] {
+        var hints: [String] = []
+
+        if snapshot.includesLegalCommercialCommitment {
+            hints.append("Boundary: legal/commercial commitment")
+        }
+        if snapshot.includesScheduleCommitment {
+            hints.append("Boundary: schedule commitment")
+        }
+        if snapshot.isCustomPricing {
+            hints.append("Boundary: custom pricing")
+        }
+        if snapshot.includesSensitiveDisclosure {
+            hints.append("Boundary: sensitive disclosure")
+        }
+        if snapshot.isPolicyException {
+            hints.append("Boundary: policy exception")
+        }
+
+        if hints.isEmpty {
+            hints.append("Boundary: safe")
+            hints.append("Routine non-binding coordination")
+        }
+
+        return hints
+    }
+
+    func snapshotTrimmed(_ raw: String?) -> String? {
+        guard let raw else {
+            return nil
+        }
+
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func detailRoleForSecondHalf(thread: ExchangeThread) -> ExchangeSecondHalfRole? {
+        guard let raw = snapshotTrimmed(thread.secondHalf?.roleRaw) else { return nil }
+        return ExchangeSecondHalfRole(rawValue: raw)
+    }
+
+    func firstNonBlank(_ values: String?...) -> String? {
+        for value in values {
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+
+        return nil
+    }
+    
+    func makePreviousSecondHalfDecisionFrame(
+        from snapshot: ExchangeThread.SecondHalfSnapshot?
+    ) -> ExchangeDecisionFrame? {
+        guard let snapshot else { return nil }
+
+        let hasContent =
+            snapshot.decisionSummary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            snapshot.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ||
+            !snapshot.clarifiedFacts.isEmpty ||
+            !snapshot.unresolvedIssues.isEmpty ||
+            !snapshot.whatChanged.isEmpty ||
+            !snapshot.tradeoffs.isEmpty
+
+        guard hasContent else { return nil }
+
+        let nextMove: ExchangeSecondHalfAction?
+        if let raw = snapshot.nextMoveActionRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            nextMove = ExchangeSecondHalfAction(rawValue: raw)
+        } else {
+            nextMove = nil
+        }
+
+        return ExchangeDecisionFrame(
+            summary: snapshot.decisionSummary ?? snapshot.recommendation ?? snapshot.postureSummary ?? "",
+            clarifiedFacts: snapshot.clarifiedFacts,
+            whatChanged: snapshot.whatChanged,
+            unresolvedIssues: snapshot.unresolvedIssues,
+            recommendation: snapshot.recommendation ?? snapshot.previousRecommendation ?? "",
+            tradeoffs: snapshot.tradeoffs,
+            nextMove: nextMove,
+            needsUserJudgment: snapshot.needsHumanAttention,
+            needsCommitmentApproval: snapshot.requiresHumanApproval
+        )
+    }
+
+    func makePreviousSecondHalfDelta(
+        from snapshot: ExchangeThread.SecondHalfSnapshot?
+    ) -> ExchangeThreadDelta? {
+        guard let snapshot else { return nil }
+
+        let hasDelta =
+            !snapshot.whatChanged.isEmpty ||
+            snapshot.recommendation != snapshot.previousRecommendation
+
+        guard hasDelta else { return nil }
+
+        return ExchangeThreadDelta(
+            newFactsLearned: snapshot.whatChanged,
+            riskChange: .unchanged,
+            readinessShift: .unchanged,
+            recommendationChanged: snapshot.recommendation != snapshot.previousRecommendation,
+            nextStepChanged: false,
+            significanceExplanation: snapshot.whatChanged.joined(separator: " ")
+        )
+    }
+
+    func makePreviousSecondHalfStance(
+        from snapshot: ExchangeThread.SecondHalfSnapshot?
+    ) -> ExchangeThreadStance? {
+        guard let snapshot else { return nil }
+
+        let readiness = snapshot.readiness
+            .flatMap { ExchangeReadinessLevel(rawValue: $0) }
+            ?? .incomplete
+
+        let urgency = snapshot.urgency
+            .flatMap { ExchangeUrgencyLevel(rawValue: $0) }
+            ?? .normal
+
+        let trust = snapshot.trust
+            .flatMap { ExchangeTrustLevel(rawValue: $0) }
+            ?? .guarded
+
+        let priceSensitivity = snapshot.priceSensitivity
+            .flatMap { ExchangePriceSensitivity(rawValue: $0) }
+            ?? .moderate
+
+        let flexibility = snapshot.flexibility
+            .flatMap { ExchangeFlexibilityLevel(rawValue: $0) }
+            ?? .moderate
+
+        let nextMove: ExchangeSecondHalfAction?
+        if let raw = snapshot.nextMoveActionRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            nextMove = ExchangeSecondHalfAction(rawValue: raw)
+        } else {
+            nextMove = nil
+        }
+
+        return ExchangeThreadStance(
+            interestLevel: readiness == .decisionReady || readiness == .commitmentReady ? .high : .medium,
+            urgencyLevel: urgency,
+            trustLevel: trust,
+            priceSensitivity: priceSensitivity,
+            flexibilityLevel: flexibility,
+            readinessLevel: readiness,
+            postureSummary: snapshot.postureSummary ?? "",
+            recommendedNextMove: nextMove,
+            followUpHints: snapshot.requiredInputs
+        )
+    }
+    
+    enum SecondHalfAutoResponseQueueResult: String {
+        case notProviderRole
+        case notAutoRespond
+        case disabledByUserSetting
+        case needsUserApproval
+        case needsProviderSetup
+        case insufficientGrounding
+        case missingDraft
+        case missingCounterparty
+        case alreadyQueued
+        case deliveryUnavailable
+        case duplicate
+        case notEligible
+        case queued
+    }
+
+    enum SecondHalfRequesterOutboundQueueResult: String, Sendable {
+        case notRequesterRole
+        case unsupportedAction
+        case escalationBlocked
+        case providerAnswerabilityBlocked
+        case boundaryRequiresApproval
+        case moveNeedsHumanInput
+        case disabledByUserSetting
+        case duplicate
+        case deliveryUnavailable
+        case agencyBlocked
+        case missingVerifiedContextHold
+        case missingCounterparty
+        case missingDraft
+        case alreadyQueued
+        case notEligible
+        case queued
+    }
+
+    func queueSecondHalfAutoResponseIfEligible(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        execution: ExchangeSecondHalfActionExecutor.Result,
+        threadID: ExchangeThread.ID,
+        selectedCounterparty: ExchangeCounterparty?,
+        now: Date = Date(),
+        pass2Agency: Pass2AgencyBuildResult? = nil,
+        lastMaterializeResult: AgencyOutboundMaterializationResult? = nil
+    ) async throws -> SecondHalfAutoResponseQueueResult {
+        let providerTitle = ExchangeSecondHalfRole.provider.displayTitle
+        guard display.status.role == providerTitle else {
+            return .notProviderRole
+        }
+
+        _ = display.nextMove?.action.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue else {
+            return .notAutoRespond
+        }
+
+        let pass3OutboundGate = ExchangeAgencyPlanner.evaluateAutonomousOutboundGate(display: display)
+        let thread = try await store.requireThread(id: threadID)
+
+        let staleDraftSnapshot: ExchangeMessageDraft?
+        if let created = execution.createdDraft,
+           created.metadata["second_half_generated"] == "true",
+           created.metadata["second_half_action"] == ExchangeSecondHalfAction.autoRespond.rawValue,
+           created.isActionable {
+            staleDraftSnapshot = created
+        } else {
+            let drafts = try await store.listDrafts(threadID: threadID)
+            staleDraftSnapshot = drafts
+                .filter { $0.metadata["second_half_generated"] == "true" }
+                .filter { $0.metadata["second_half_action"] == ExchangeSecondHalfAction.autoRespond.rawValue }
+                .filter { $0.isActionable }
+                .sorted { lhs, rhs in
+                    if lhs.updatedAt != rhs.updatedAt {
+                        return lhs.updatedAt > rhs.updatedAt
+                    }
+                    return lhs.id.uuidString < rhs.id.uuidString
+                }
+                .first
+        }
+
+        let resolvedCounterpartyID = selectedCounterparty?.id
+        let threadOutboxItems = try await store.listOutboxItems(filter: .init(threadID: threadID))
+
+        var providerDraftForGates: ExchangeMessageDraft?
+        var staleMarkersStripped = false
+        if let snap = staleDraftSnapshot {
+            var reloaded = try await store.requireDraft(id: snap.id)
+            if let cpID = resolvedCounterpartyID {
+                let liveForDraft = Self.hasLiveOutboxForSecondHalfSignature(
+                    outboxItems: threadOutboxItems,
+                    draftID: reloaded.id,
+                    counterpartyID: cpID
+                )
+                let outboundQueued = reloaded.metadata["second_half_outbound_queued"] == "true"
+                let autoQueued = reloaded.metadata["second_half_auto_response_queued"] == "true"
+                if !liveForDraft, outboundQueued || autoQueued {
+                    reloaded.metadata.removeValue(forKey: "second_half_outbound_queued")
+                    reloaded.metadata.removeValue(forKey: "second_half_outbound_queue_signature")
+                    reloaded.metadata.removeValue(forKey: "second_half_outbound_queued_at")
+                    reloaded.metadata.removeValue(forKey: "second_half_auto_response_queued")
+                    reloaded.metadata.removeValue(forKey: "second_half_auto_response_queued_at")
+                    staleMarkersStripped = true
+                    try await store.saveDraft(reloaded)
+                    reloaded = try await store.requireDraft(id: reloaded.id)
+                }
+            }
+            providerDraftForGates = reloaded
+        }
+
+        let outboundSig = providerDraftForGates.flatMap { resolvedDraft in
+            resolvedCounterpartyID.map { counterpartyID in
+                Self.secondHalfOutboundQueueSignature(
+                    threadID: threadID,
+                    draftID: resolvedDraft.id,
+                    counterpartyID: counterpartyID
+                )
+            }
+        }
+
+        let duplicateEval = Self.evaluateProviderAutoResponseDuplicateOutboxAnchored(
+            draft: providerDraftForGates,
+            thread: thread,
+            counterpartyID: resolvedCounterpartyID,
+            outboxItems: threadOutboxItems
+        )
+        let isDuplicate = duplicateEval.isDuplicate
+
+        #if DEBUG
+        let sigStr = outboundSig ?? "nil"
+        let liveIDs = duplicateEval.matchedLiveOutboxIDs.map(\.uuidString).joined(separator: ",")
+        let pendIDs = duplicateEval.matchedPendingOutboxIDs.map(\.uuidString).joined(separator: ",")
+        let sentIDs = duplicateEval.matchedSentOutboxIDs.map(\.uuidString).joined(separator: ",")
+        let draftStr = providerDraftForGates?.id.uuidString ?? "nil"
+        let lastInbound = thread.lastInboundEnvelopeID ?? "nil"
+        exchFacadeLog(
+            "[AutoSendDuplicateCheck] thread=\(threadID.uuidString) currentDraft=\(draftStr) counterparty=\(resolvedCounterpartyID ?? "nil") " +
+                "signature=\(sigStr) latestInboundTurnID=nil latestInboundEnvelopeID=\(lastInbound) matchedDraftIDs=n/a " +
+                "matchedOutboxIDs_live=\(liveIDs) matchedOutboxIDs_pending=\(pendIDs) matchedOutboxIDs_sent=\(sentIDs) " +
+                "matchedPendingToCounterparty=\(duplicateEval.matchedPendingCounterpartyWide) matchedLiveSignature=\(duplicateEval.matchedLiveForSignature) " +
+                "staleMarkersStripped=\(staleMarkersStripped) decision=\(isDuplicate ? "duplicate" : "clear") reason=\(duplicateEval.reason)"
+        )
+        #endif
+
+        let draftForCompareFirstGate = providerDraftForGates ?? staleDraftSnapshot
+        let existingCompareFirstAllowed = isCompareFirstDirectAutoSendEligibleWithoutClaimBoundary(
+            display: display,
+            staleDraftSnapshot: draftForCompareFirstGate,
+            pass2: pass2Agency,
+            materializeResult: lastMaterializeResult
+        )
+        let claimBoundaryGate = evaluateCompareFirstClaimBoundaryAutoSendGate(
+            draft: draftForCompareFirstGate,
+            pass2: pass2Agency,
+            requesterText: nil
+        )
+        let hasCompareFirstDirectBody = existingCompareFirstAllowed && claimBoundaryGate.claimBoundaryAllowsAutoSend
+        let compareFirstClaimBoundaryBlocked =
+            existingCompareFirstAllowed && !claimBoundaryGate.claimBoundaryAllowsAutoSend
+        #if DEBUG
+        exchFacadeLog(
+            "[ProviderAutoSendGate] thread=\(threadID.uuidString) existingAllowed=\(existingCompareFirstAllowed) " +
+                "claimBoundaryAllowed=\(claimBoundaryGate.claimBoundaryAllowsAutoSend) " +
+                "finalAllowed=\(hasCompareFirstDirectBody) claimBoundaryBlocked=\(compareFirstClaimBoundaryBlocked)"
+        )
+        #endif
+        let providerAnswerability = try await resolveProviderAnswerabilityForAutonomousDecision(
+            display: display,
+            thread: thread
+        )
+
+        let decision = ExchangeAutonomousSendPolicy.evaluateProviderAutoResponse(
+            .init(
+                userAuthority: ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority(),
+                actionRaw: actionRaw.nilIfBlank,
+                canRunAutonomously: display.canRunAutonomously,
+                needsHumanAttention: display.needsHumanAttention,
+                boundaryRequiresApproval: display.boundary.requiresHumanApproval,
+                pass3GateAllowed: pass3OutboundGate.allowed,
+                hasVerifiedContextHold: thread.metadata["inbound_requires_verified_context_hold"] == "true",
+                hasCounterparty: selectedCounterparty != nil,
+                hasDraft: providerDraftForGates != nil,
+                isDuplicate: isDuplicate,
+                hasSelectedOfferAnchor: thread.selectedOfferID?.nilIfBlank != nil,
+                hasSelectedPublicProfileAnchor: thread.selectedPublicProfileID?.nilIfBlank != nil,
+                providerAnswerability: providerAnswerability,
+                canonicalCompareFirstDirectGroundedSend: hasCompareFirstDirectBody,
+                compareFirstDirectClaimBoundaryBlocked: compareFirstClaimBoundaryBlocked
+            )
+        )
+        #if DEBUG
+        let bypassElig = pass2Agency?.providerExecutionContext?.providerCompareFirstStructuredPillarBypassPacket?.isEligible
+        let matAccepted: Bool = {
+            guard let lastMaterializeResult else { return false }
+            if case .composedAndSaved = lastMaterializeResult { return true }
+            return false
+        }()
+        let groundedCount = providerAnswerability?.groundedFacts.count ?? 0
+        exchFacadeLog(
+            "[ProviderAutoRespondGate] thread=\(threadID.uuidString) hasCompareFirstDirectBody=\(hasCompareFirstDirectBody) materializeAccepted=\(matAccepted) bypassEligible=\(bypassElig ?? false) oldStructuredGroundedFactsCount=\(groundedCount) oldPendingApproval=\(!pass3OutboundGate.allowed) oldNeedsHumanAttention=\(display.needsHumanAttention) decision=\(decision.allowed ? "allow" : "block") reason=\(exchangeDebugAuditBodyPrefix(decision.reason, maxLen: 160))"
+        )
+        let bodyClean = !(providerDraftForGates?.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let targetKnown = selectedCounterparty != nil
+        exchFacadeLog(
+            "[CanonicalAutoSendAuthority] thread=\(threadID.uuidString) providerCompareFirst=\(hasCompareFirstDirectBody) bypassEligible=\(bypassElig ?? false) materializeAccepted=\(matAccepted) bodyClean=\(bodyClean) targetKnown=\(targetKnown) duplicate=\(isDuplicate) decision=\(decision.allowed ? "allow" : "block") reason=\(exchangeDebugAuditBodyPrefix(decision.reason, maxLen: 160))"
+        )
+        if hasCompareFirstDirectBody {
+            for gate in [
+                "structuredAnswerability",
+                "pendingApproval",
+                "needsHumanAttention",
+                "displayBoundary",
+                "pass3",
+                "recipientPosture"
+            ] {
+                exchFacadeLog(
+                    "[LegacyGateSkipped] thread=\(threadID.uuidString) gate=\(gate) reason=removed_from_canonical_path"
+                )
+            }
+        }
+        if actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue, !decision.allowed, !hasCompareFirstDirectBody {
+            let intakeCard = display.providerReception?.answerabilityStatus ?? "nil"
+            let pass2Ans = providerAnswerability?.answerability.rawValue ?? "nil"
+            let grounded = providerAnswerability?.groundedFacts.isEmpty == false
+            let proposed = !(providerAnswerability?.proposedAnswer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            exchFacadeLog(
+                "[ProviderAutoRespondDrift] plan=autoRespond blocked=\(decision.outcome) reason=\(exchangeDebugAuditBodyPrefix(decision.reason, maxLen: 160)) intakeAnswerability=\(intakeCard) pass2Answerability=\(pass2Ans) groundedFacts=\(grounded) proposedAnswerPresent=\(proposed)"
+            )
+        }
+        #endif
+        try await persistAutonomousDecision(
+            decision,
+            on: thread,
+            lane: "provider_auto_response",
+            now: now
+        )
+
+        #if DEBUG
+        ExchangeBilateralConversationDebugTrace.logProviderAutoReplyDecision(
+            thread: thread,
+            inboundEnvelopeID: thread.lastInboundEnvelopeID,
+            inboundTurnID: nil,
+            allowed: decision.allowed,
+            reason: decision.reason,
+            intakeAction: actionRaw,
+            draftID: providerDraftForGates?.id,
+            outboxID: nil,
+            autonomyAuthority: ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority(),
+            commitmentBoundaryHit: compareFirstClaimBoundaryBlocked,
+            requiresHumanApproval: display.boundary.requiresHumanApproval
+        )
+        #endif
+
+        guard decision.allowed else {
+            secSendBridgeLog(
+                "autonomous check | thread=\(threadID.uuidString) | blocked=\(String(describing: decision.outcome)) | reason=\(decision.reason)"
+            )
+            switch decision.outcome {
+            case .disabledByUserSetting:
+                return .disabledByUserSetting
+            case .needsUserApproval:
+                return .needsUserApproval
+            case .needsProviderSetup:
+                return .needsProviderSetup
+            case .insufficientGrounding:
+                return .insufficientGrounding
+            case .deliveryUnavailable:
+                if selectedCounterparty == nil { return .missingCounterparty }
+                if providerDraftForGates == nil { return .missingDraft }
+                return .deliveryUnavailable
+            case .duplicate:
+                return .duplicate
+            case .blocked:
+                if actionRaw != ExchangeSecondHalfAction.autoRespond.rawValue {
+                    return .notAutoRespond
+                }
+                return .notEligible
+            case .allowed:
+                return .notEligible
+            }
+        }
+
+        guard let counterparty = selectedCounterparty else {
+            return .missingCounterparty
+        }
+        guard let staleDraft = providerDraftForGates else {
+            return .missingDraft
+        }
+        var draft = try await store.requireDraft(id: staleDraft.id)
+        #if DEBUG
+        let pqObs = draft.metadata["agency_authored_body"] ?? "nil"
+        let pqAct = actionRaw
+        let pqHash = exchangeDebugBodyShortHash(draft.body)
+        let pqPickSource: String = {
+            if let created = execution.createdDraft, created.id == draft.id {
+                return "executionCreated"
+            }
+            return "storePick"
+        }()
+        exchFacadeLog(
+            "[AgencyOutboundBody] providerQueueReload thread=\(threadID.uuidString) draft=\(draft.id.uuidString) pickSource=\(pqPickSource) reloadSource=storeReload actionRaw=\(pqAct) agency_obs=\(pqObs) bodyHash=\(pqHash) bodyLen=\(draft.body.count) bodyPrefix=\(exchangeDebugAuditBodyPrefix(draft.body))"
+        )
+        ExchangeAgencyOutboundMaterializeDebugAnchor.logIfQueueReloadMismatchesMaterialization(
+            threadID: threadID,
+            draftID: draft.id,
+            bodyHash: pqHash,
+            context: "providerQueueReload"
+        )
+        #endif
+
+        if draft.status != .approved {
+            draft = draft.approving(at: now)
+            draft.metadata["second_half_auto_response_approved"] = "true"
+            draft.metadata["second_half_auto_response_approved_at"] = ISO8601DateFormatter().string(from: now)
+            try await store.saveDraft(draft)
+        }
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            let deliveryDecision = ExchangeAutonomousSendDecision(
+                outcome: .deliveryUnavailable,
+                allowed: false,
+                reason: eligibility.reason,
+                userAuthoritySummary: decision.userAuthoritySummary,
+                groundingSummary: decision.groundingSummary,
+                deliverySummary: "Federation eligibility denied."
+            )
+            try await persistAutonomousDecision(
+                deliveryDecision,
+                on: thread,
+                lane: "provider_auto_response",
+                now: now
+            )
+            await recordAutonomousSendAttempt(
+                AutonomousSendAttempt(
+                    lane: "queueSecondHalfAutoResponseIfEligible",
+                    role: providerTitle,
+                    threadID: threadID,
+                    draftID: draft.id,
+                    selectedOfferID: thread.selectedOfferID,
+                    selectedPublicProfileID: thread.selectedPublicProfileID,
+                    lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                    pass3Allowed: pass3OutboundGate.allowed,
+                    pass3BlockReason: pass3OutboundGate.agencyBlockReason,
+                    pass3Veto: pass3OutboundGate.vetoReason,
+                    policyAllowed: true,
+                    policyOutcome: String(describing: decision.outcome),
+                    eligibilityAllowed: false,
+                    eligibilityReason: eligibility.reason,
+                    permitKind: "agencyAutonomy",
+                    queued: false,
+                    skipReason: "send_eligibility_denied",
+                    errorSummary: nil
+                )
+            )
+            #if DEBUG
+            exchFacadeLog(
+                "queueSecondHalfAutoResponseIfEligible notEligible | thread=\(threadID.uuidString) | reason=\(eligibility.reason)"
+            )
+            #endif
+            secSendBridgeLog(
+                "autonomous check | thread=\(threadID.uuidString) | earlyReturn=sendEligibilityFailed | reason=\(eligibility.reason)"
+            )
+            return .notEligible
+        }
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Auto-approved safe provider response.",
+            rationale: firstNonBlank(
+                display.nextMove?.rationale,
+                display.recommendation,
+                "Second-half policy allowed this routine provider response to be sent automatically."
+            ) ?? "Second-half policy allowed this routine provider response to be sent automatically.",
+            decidedAt: now,
+            decisionNote: "Approved automatically by your secretary settings.",
+            metadata: [
+                "second_half_generated": "true",
+                "second_half_auto_response": "true",
+                "second_half_no_human_approval_required": "true",
+                "second_half_boundary_kind": display.boundary.kind,
+                "second_half_boundary_requires_approval": "false"
+            ]
+        )
+
+        try await store.saveApproval(approval)
+        let queuePermitGate = ExchangeAgencyAutonomousOutboundGateResult(
+            allowed: true,
+            vetoReason: nil,
+            agencySuggestionKind: pass3OutboundGate.agencySuggestionKind ?? "autonomous_send_decision_allowed",
+            agencyBlockReason: nil,
+            usedPublicFactsCount: pass3OutboundGate.usedPublicFactsCount
+        )
+
+        let queueResult = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: .agencyAutonomy(
+                source: "queueSecondHalfAutoResponseIfEligible",
+                gate: queuePermitGate
+            ),
+            disclosureLevel: .balanced,
+            priority: .userInitiated,
+            now: now
+        )
+
+        #if DEBUG
+        ExchangeBilateralConversationDebugTrace.logProviderAutoReplyDecision(
+            thread: thread,
+            inboundEnvelopeID: thread.lastInboundEnvelopeID,
+            inboundTurnID: nil,
+            allowed: true,
+            reason: decision.reason,
+            intakeAction: actionRaw,
+            draftID: draft.id,
+            outboxID: queueResult.outboxItem.id,
+            autonomyAuthority: ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority(),
+            commitmentBoundaryHit: compareFirstClaimBoundaryBlocked,
+            requiresHumanApproval: display.boundary.requiresHumanApproval
+        )
+        ExchangeBilateralConversationDebugTrace.logProviderAutoReplySend(
+            threadID: thread.id,
+            draftID: draft.id,
+            outboxID: queueResult.outboxItem.id,
+            envelopeID: queueResult.outboxItem.envelopeID,
+            parentEnvelopeID: queueResult.outboxItem.metadata["parent_envelope_id"],
+            conversationID: thread.metadata["conversation_id"],
+            routeKey: queueResult.outboxItem.metadata["route_key"],
+            queued: true,
+            flushedInline: false,
+            flushPassID: ExchangeBilateralConversationDebugTrace.activeFlushPassID
+        )
+        #endif
+
+        draft.metadata["second_half_auto_response_queued"] = "true"
+        draft.metadata["second_half_auto_response_queued_at"] = ISO8601DateFormatter().string(from: now)
+        draft.metadata["second_half_outbound_queued"] = "true"
+        if let outboundSig {
+            draft.metadata["second_half_outbound_queue_signature"] = outboundSig
+        }
+        draft.metadata["second_half_outbound_queued_at"] = ISO8601DateFormatter().string(from: now)
+        try await store.saveDraft(draft)
+
+        #if DEBUG
+        exchFacadeLog(
+            "queueSecondHalfAutoResponseIfEligible queued | thread=\(threadID.uuidString) | draft=\(draft.id.uuidString) | counterparty=\(counterparty.id)"
+        )
+        #endif
+        secSendBridgeLog(
+            "autonomous check | thread=\(threadID.uuidString) | queuedOutbox=provider_autoRespond | draft=\(draft.id.uuidString) | counterparty=\(counterparty.id)"
+        )
+
+        return .queued
+    }
+
+    func queueSecondHalfRequesterOutboundIfEligible(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        execution: ExchangeSecondHalfActionExecutor.Result,
+        threadID: ExchangeThread.ID,
+        selectedCounterparty: ExchangeCounterparty?,
+        now: Date = Date()
+    ) async throws -> SecondHalfRequesterOutboundQueueResult {
+        let requesterTitle = ExchangeSecondHalfRole.requester.displayTitle
+        guard display.status.role == requesterTitle else {
+            return .notRequesterRole
+        }
+        let actionTitle = display.nextMove?.action.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let supportedRequesterOutbound: Set<String> = [
+            ExchangeSecondHalfAction.frameDecision.rawValue,
+            ExchangeSecondHalfAction.askClarification.rawValue,
+            ExchangeSecondHalfAction.recommendNextMove.rawValue
+        ]
+
+        let requesterGate = ExchangeAgencyPlanner.evaluateRequesterAutonomousOutboundGate(display: display)
+        let thread = try await store.requireThread(id: threadID)
+
+        let requesterDraftPickSource: String
+        let resolvedDraft: ExchangeMessageDraft?
+        if let created = execution.createdDraft,
+           created.metadata["second_half_generated"] == "true",
+           created.isActionable {
+            requesterDraftPickSource = "executionCreated"
+            resolvedDraft = created
+        } else {
+            requesterDraftPickSource = "storePick"
+            let drafts = try await store.listDrafts(threadID: threadID)
+            resolvedDraft = Self.pickLatestSendableSecondHalfGeneratedDraft(
+                drafts: drafts,
+                matchingActionRaw: actionRaw
+            )
+        }
+
+        let signature = resolvedDraft.flatMap { resolved in
+            selectedCounterparty.map { counterparty in
+                Self.secondHalfOutboundQueueSignature(
+                    threadID: threadID,
+                    draftID: resolved.id,
+                    counterpartyID: counterparty.id
+                )
+            }
+        }
+        let threadOutboxItems = try await store.listOutboxItems(filter: .init(threadID: threadID))
+
+        var hasLiveQueuedItem = false
+        if let resolvedDraft,
+           let counterparty = selectedCounterparty,
+           let signature,
+           resolvedDraft.metadata["second_half_outbound_queue_signature"] == signature,
+           resolvedDraft.metadata["second_half_outbound_queued"] == "true" {
+            hasLiveQueuedItem = Self.hasLiveOutboxForSecondHalfSignature(
+                outboxItems: threadOutboxItems,
+                draftID: resolvedDraft.id,
+                counterpartyID: counterparty.id
+            )
+        }
+
+        // Re-evaluation can produce a newer second-half draft id; still treat a pending outbox leg as duplicate.
+        let hasPendingOutboundToSameCounterparty = Self.hasPendingOutboundToCounterpartyForDuplicateDetection(
+            outboxItems: threadOutboxItems,
+            counterpartyID: selectedCounterparty?.id
+        )
+
+        let isDuplicate =
+            hasLiveQueuedItem ||
+            hasPendingOutboundToSameCounterparty ||
+            (resolvedDraft?.metadata["second_half_auto_response_queued"] == "true")
+
+        let userAuthority = ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority()
+        let decision = ExchangeAutonomousSendPolicy.evaluateRequesterOutbound(
+            .init(
+                userAuthority: userAuthority,
+                isRequesterRole: display.status.role == requesterTitle,
+                hasEscalationReason: display.escalationReason != nil,
+                providerAnswerabilityRequiresApproval: display.agencyAssessment?.providerAnswerability?.requiresHumanApproval == true,
+                actionRaw: actionRaw.nilIfBlank,
+                actionSupported: !actionRaw.isEmpty && supportedRequesterOutbound.contains(actionRaw),
+                boundaryRequiresApproval: display.boundary.requiresHumanApproval,
+                boundaryAllowsAutonomousSending: display.boundary.allowsAutonomousSending,
+                moveNeedsUserInput: display.nextMove?.needsUserInput == true,
+                moveNeedsApproval: display.nextMove?.needsApproval == true,
+                moveIsAutonomous: display.nextMove?.isAutonomous == true,
+                pass3GateAllowed: requesterGate.allowed,
+                hasVerifiedContextHold: thread.metadata["inbound_requires_verified_context_hold"] == "true",
+                hasCounterparty: selectedCounterparty != nil,
+                hasDraft: resolvedDraft != nil,
+                isDuplicate: isDuplicate
+            )
+        )
+        try await persistAutonomousDecision(
+            decision,
+            on: thread,
+            lane: "requester_outbound",
+            userAuthority: userAuthority,
+            now: now
+        )
+
+        #if DEBUG
+        ExchangeBilateralConversationDebugTrace.logAutoSendQuery(
+            thread: thread,
+            draftID: resolvedDraft?.id,
+            allowed: decision.allowed,
+            blockReason: decision.allowed ? nil : decision.reason,
+            autonomyAuthority: userAuthority
+        )
+        #endif
+
+        guard decision.allowed else {
+            secSendBridgeLog(
+                "autonomous requester bridge | thread=\(threadID.uuidString) | blocked=\(String(describing: decision.outcome)) | blockedRaw=\(decision.outcome) | reason=\(decision.reason)"
+            )
+            switch decision.outcome {
+            case .disabledByUserSetting:
+                return .disabledByUserSetting
+            case .needsUserApproval:
+                return .moveNeedsHumanInput
+            case .deliveryUnavailable:
+                if selectedCounterparty == nil { return .missingCounterparty }
+                if resolvedDraft == nil { return .missingDraft }
+                return .deliveryUnavailable
+            case .duplicate:
+                return .duplicate
+            case .insufficientGrounding, .needsProviderSetup, .blocked:
+                if display.status.role != requesterTitle { return .notRequesterRole }
+                if display.escalationReason != nil { return .escalationBlocked }
+                if display.agencyAssessment?.providerAnswerability?.requiresHumanApproval == true {
+                    return .providerAnswerabilityBlocked
+                }
+                if actionRaw.isEmpty || !supportedRequesterOutbound.contains(actionRaw) {
+                    return .unsupportedAction
+                }
+                if display.boundary.requiresHumanApproval || !display.boundary.allowsAutonomousSending {
+                    return .boundaryRequiresApproval
+                }
+                if display.nextMove?.needsUserInput == true || display.nextMove?.needsApproval == true || display.nextMove?.isAutonomous != true {
+                    return .moveNeedsHumanInput
+                }
+                if !requesterGate.allowed { return .agencyBlocked }
+                if thread.metadata["inbound_requires_verified_context_hold"] == "true" { return .missingVerifiedContextHold }
+                return .notEligible
+            case .allowed:
+                return .notEligible
+            }
+        }
+
+        guard let counterparty = selectedCounterparty else { return .missingCounterparty }
+        guard let staleRequesterDraft = resolvedDraft else { return .missingDraft }
+        var draft = try await store.requireDraft(id: staleRequesterDraft.id)
+        #if DEBUG
+        let rqObs = draft.metadata["agency_authored_body"] ?? "nil"
+        let rqHash = exchangeDebugBodyShortHash(draft.body)
+        exchFacadeLog(
+            "[AgencyOutboundBody] requesterQueueReload thread=\(threadID.uuidString) draft=\(draft.id.uuidString) pickSource=\(requesterDraftPickSource) reloadSource=storeReload actionRaw=\(actionRaw) actionTitle=\(actionTitle) agency_obs=\(rqObs) bodyHash=\(rqHash) bodyLen=\(draft.body.count) bodyPrefix=\(exchangeDebugAuditBodyPrefix(draft.body))"
+        )
+        ExchangeAgencyOutboundMaterializeDebugAnchor.logIfQueueReloadMismatchesMaterialization(
+            threadID: threadID,
+            draftID: draft.id,
+            bodyHash: rqHash,
+            context: "requesterQueueReload"
+        )
+        #endif
+
+        if hasLiveQueuedItem {
+            return .alreadyQueued
+        }
+        if draft.metadata["second_half_outbound_queued"] == "true" {
+            draft.metadata.removeValue(forKey: "second_half_outbound_queued")
+            draft.metadata.removeValue(forKey: "second_half_outbound_queue_signature")
+            draft.metadata.removeValue(forKey: "second_half_outbound_queued_at")
+            draft.metadata["second_half_requester_outbound_retry_after_stale_queue"] = "true"
+            draft.metadata["second_half_requester_outbound_retry_after_stale_queue_at"] = ISO8601DateFormatter().string(from: now)
+            try await store.saveDraft(draft)
+        }
+
+        if draft.status != .approved {
+            draft = draft.approving(at: now)
+            draft.metadata["second_half_requester_outbound_approved"] = "true"
+            draft.metadata["second_half_requester_outbound_approved_at"] = ISO8601DateFormatter().string(from: now)
+            try await store.saveDraft(draft)
+        }
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            let deliveryDecision = ExchangeAutonomousSendDecision(
+                outcome: .deliveryUnavailable,
+                allowed: false,
+                reason: eligibility.reason,
+                userAuthoritySummary: decision.userAuthoritySummary,
+                groundingSummary: decision.groundingSummary,
+                deliverySummary: "Federation eligibility denied."
+            )
+            try await persistAutonomousDecision(
+                deliveryDecision,
+                on: thread,
+                lane: "requester_outbound",
+                userAuthority: userAuthority,
+                now: now
+            )
+            await recordAutonomousSendAttempt(
+                AutonomousSendAttempt(
+                    lane: "queueSecondHalfRequesterOutboundIfEligible",
+                    role: requesterTitle,
+                    threadID: threadID,
+                    draftID: draft.id,
+                    selectedOfferID: thread.selectedOfferID,
+                    selectedPublicProfileID: thread.selectedPublicProfileID,
+                    lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                    pass3Allowed: requesterGate.allowed,
+                    pass3BlockReason: requesterGate.agencyBlockReason,
+                    pass3Veto: requesterGate.vetoReason,
+                    policyAllowed: true,
+                    policyOutcome: String(describing: decision.outcome),
+                    eligibilityAllowed: false,
+                    eligibilityReason: eligibility.reason,
+                    permitKind: "agencyAutonomy",
+                    queued: false,
+                    skipReason: "send_eligibility_denied",
+                    errorSummary: nil
+                )
+            )
+            secSendBridgeLog(
+                "autonomous requester bridge | thread=\(threadID.uuidString) | earlyReturn=sendEligibilityFailed | reason=\(eligibility.reason)"
+            )
+            return .deliveryUnavailable
+        }
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Auto-approved safe requester second-half outbound.",
+            rationale: firstNonBlank(
+                display.nextMove?.rationale,
+                display.recommendation,
+                "Second-half requester policy allowed this bounded outbound message to be sent automatically."
+            ) ?? "Second-half requester policy allowed this bounded outbound message to be sent automatically.",
+            decidedAt: now,
+            decisionNote: "Approved automatically by your secretary settings.",
+            metadata: [
+                "second_half_generated": "true",
+                "second_half_requester_autonomous_outbound": "true",
+                "second_half_no_human_approval_required": "true",
+                "second_half_boundary_kind": display.boundary.kind,
+                "second_half_boundary_requires_approval": "false",
+                "second_half_outbound_action": actionRaw,
+                "agency_suggestion_kind": requesterGate.agencySuggestionKind ?? ""
+            ]
+        )
+
+        try await store.saveApproval(approval)
+        let queuePermitGate = ExchangeAgencyAutonomousOutboundGateResult(
+            allowed: true,
+            vetoReason: nil,
+            agencySuggestionKind: requesterGate.agencySuggestionKind ?? "autonomous_send_decision_allowed",
+            agencyBlockReason: nil,
+            usedPublicFactsCount: requesterGate.usedPublicFactsCount
+        )
+
+        let queueResult = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: .agencyAutonomy(
+                source: "queueSecondHalfRequesterOutboundIfEligible",
+                gate: queuePermitGate
+            ),
+            disclosureLevel: .balanced,
+            priority: .userInitiated,
+            now: now
+        )
+
+        #if DEBUG
+        ExchangeBilateralConversationDebugTrace.logAutoSendQuery(
+            thread: thread,
+            draftID: draft.id,
+            outboxID: queueResult.outboxItem.id,
+            envelopeID: queueResult.outboxItem.envelopeID,
+            allowed: true,
+            blockReason: nil,
+            autonomyAuthority: userAuthority
+        )
+        #endif
+
+        draft.metadata["second_half_outbound_queued"] = "true"
+        if let signature {
+            draft.metadata["second_half_outbound_queue_signature"] = signature
+        }
+        draft.metadata["second_half_outbound_queued_at"] = ISO8601DateFormatter().string(from: now)
+        try await store.saveDraft(draft)
+
+        do {
+            #if DEBUG
+            ExchangeBilateralConversationDebugTrace.activeFlushPassID = "requester-inline-\(threadID.uuidString)"
+            defer { ExchangeBilateralConversationDebugTrace.activeFlushPassID = nil }
+            #endif
+            let flushResult = try await flushOutbox(now: now)
+            secSendBridgeLog(
+                "queued outbox flush | thread=\(threadID.uuidString) | attempted=\(flushResult.attempted) acknowledged=\(flushResult.acknowledged) failed=\(flushResult.failed)"
+            )
+        } catch {
+            secSendBridgeLog(
+                "queued outbox flush error non-fatal | thread=\(threadID.uuidString) | error=\(error)"
+            )
+        }
+
+        secSendBridgeLog(
+            "autonomous requester bridge | thread=\(threadID.uuidString) | queuedOutbound=success | draft=\(draft.id.uuidString) | counterparty=\(counterparty.id)"
+        )
+
+        return .queued
+    }
+
+    func refreshRequesterDisplayAfterDraftOnlyOutboundBlock(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        threadID: ExchangeThread.ID,
+        execution: ExchangeSecondHalfActionExecutor.Result
+    ) async throws -> ExchangeSecondHalfUIAdapter.DisplayModel {
+        let thread = try await store.requireThread(id: threadID)
+        guard ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority()
+            .shouldSurfacePreparedDraftWhenSendBlocked else {
+            return display
+        }
+
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedDraft: ExchangeMessageDraft?
+        if let created = execution.createdDraft,
+           created.metadata["second_half_generated"] == "true",
+           created.isActionable {
+            resolvedDraft = created
+        } else {
+            let drafts = try await store.listDrafts(threadID: threadID)
+            resolvedDraft = Self.pickLatestSendableSecondHalfGeneratedDraft(
+                drafts: drafts,
+                matchingActionRaw: actionRaw
+            )
+        }
+
+        guard resolvedDraft != nil else {
+            return display
+        }
+
+        return secondHalfFacade.refreshDisplayAfterRequesterOutboundSendBlocked(
+            display: display,
+            thread: thread,
+            latestDraft: resolvedDraft
+        )
+    }
+
+    func persistAutonomousDecision(
+        _ decision: ExchangeAutonomousSendDecision,
+        on thread: ExchangeThread,
+        lane: String,
+        userAuthority: ExchangeAutonomousUserAuthority? = nil,
+        now: Date
+    ) async throws {
+        var updated = thread
+        updated.metadata["autonomous_send_lane"] = lane
+        updated.metadata["autonomous_send_outcome"] = decision.outcomeSlug
+        updated.metadata["autonomous_send_allowed"] = decision.allowed ? "true" : "false"
+        updated.metadata["autonomous_send_reason"] = decision.reason
+        updated.metadata["autonomous_send_user_authority"] = decision.userAuthoritySummary
+        if let userAuthority {
+            updated.metadata["autonomous_send_user_authority_mode"] = userAuthority.rawValue
+            if !decision.allowed,
+               userAuthority.shouldSurfacePreparedDraftWhenSendBlocked {
+                updated.metadata["autonomous_send_draft_review_required"] = "true"
+            } else {
+                updated.metadata.removeValue(forKey: "autonomous_send_draft_review_required")
+            }
+        }
+        updated.metadata["autonomous_send_grounding"] = decision.groundingSummary
+        updated.metadata["autonomous_send_delivery"] = decision.deliverySummary
+        updated.metadata["autonomous_send_recorded_at"] = ISO8601DateFormatter().string(from: now)
+        updated.updatedAt = now
+        try await store.updateThread(updated)
+    }
+
+    func resolveProviderAnswerabilityForAutonomousDecision(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        thread: ExchangeThread
+    ) async throws -> ExchangeProviderAnswerability? {
+        if let provider = display.agencyAssessment?.providerAnswerability {
+            return provider
+        }
+        if let persisted = try await secondHalfFacade
+            .loadSecondHalfAgencySnapshot(forThreadID: thread.id, role: .provider)?
+            .toAssessment()
+            .providerAnswerability {
+            return persisted
+        }
+
+        let offerID = thread.selectedOfferID?.nilIfBlank
+        let profileID = thread.selectedPublicProfileID?.nilIfBlank
+        guard offerID != nil || profileID != nil else {
+            return nil
+        }
+
+        let offer: ExchangeOffer?
+        if let offerID {
+            offer = try? await store.fetchOffer(id: offerID)
+        } else {
+            offer = nil
+        }
+        let profile: ExchangePublicNodeProfile? = if let profileID {
+            try? await store.fetchPublicProfile(id: profileID)
+        } else if let fallbackProfileID = offer?.publicProfileID?.nilIfBlank {
+            try? await store.fetchPublicProfile(id: fallbackProfileID)
+        } else {
+            nil
+        }
+
+        let turns = try await store.listTurns(threadID: thread.id, limit: nil, ascending: true)
+        let inquiryText = providerInboundRawRequesterAsk(thread: thread, turns: turns)
+
+        let memory = ExchangeSellerSurfaceOperatingMemoryHydrator.hydrate(
+            publicProfile: profile,
+            offer: offer
+        )
+        let history = pass2ThreadHistoryLines(from: turns)
+        let context = ExchangeAgencyContextBuilder.buildProviderContext(
+            threadID: thread.id,
+            selectedOfferID: offerID,
+            selectedPublicProfileID: profileID,
+            selectedCounterpartyID: thread.selectedCounterpartyID?.nilIfBlank,
+            userIntent: inquiryText,
+            secretaryStyleText: currentSecretaryStyleText(),
+            situation: nil,
+            publicProfile: profile,
+            offer: offer,
+            operatingMemory: memory,
+            threadHistoryLines: history,
+            additionalKnownFacts: []
+        )
+
+        return ExchangeProviderAnswerabilityEngine().evaluate(
+            context: context,
+            inquiryText: inquiryText,
+            prefersDeterministicComposer: true
+        )
+    }
+
+    private func persistedDraftRequestsCompareFirstDirectComposeSkip(
+        _ draft: ExchangeMessageDraft
+    ) -> Bool {
+        draft.metadata["agency_compose_policy"]
+            == ExchangeDraftAgencyComposePolicy.skipFullComposeCompareFirstGrounded.rawValue
+            && draft.metadata["provider_compare_first_eligible"] == "true"
+    }
+
+    /// Returns a human-readable block reason when compare-first direct materialization must not run; `nil` means eligible.
+    ///
+    /// Canonical safety proof for this narrow path is `ProviderCompareFirstStructuredPillarBypassPacket.isEligible`
+    /// (built from governed compare + snapshot gates upstream). Do **not** re-interpret `DisplayModel.boundary` labels here —
+    /// they can lag the bypass packet and duplicate boundary classification.
+    private func compareFirstDirectOutboundBlockedReason(
+        pass2: Pass2AgencyBuildResult?,
+        persistedDraft: ExchangeMessageDraft
+    ) -> String? {
+        guard let pass2 else { return "missing_pass2" }
+        guard let pkt = pass2.providerExecutionContext?.providerCompareFirstStructuredPillarBypassPacket, pkt.isEligible else {
+            return "bypass_packet_not_eligible"
+        }
+        guard persistedDraftRequestsCompareFirstDirectComposeSkip(persistedDraft) else {
+            return "compose_policy_not_skip_full_compose"
+        }
+        guard let cmp = pass2.providerInquiryCompare else { return "missing_provider_inquiry_compare" }
+        if !cmp.missingFacts.isEmpty { return "missing_facts_non_empty" }
+        if cmp.needsProviderInput { return "needs_provider_input" }
+        if cmp.canSendWithinConsent == false { return "can_send_within_consent_false" }
+        if cmp.requiresBoundaryApproval == true { return "boundary_requires_approval" }
+        let body = persistedDraft.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty { return "empty_body" }
+        if !persistedDraft.isActionable { return "draft_not_actionable" }
+        return nil
+    }
+
+    /// Existing compare-first direct eligibility (before claim-boundary additive gate).
+    private func isCompareFirstDirectAutoSendEligibleWithoutClaimBoundary(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        staleDraftSnapshot: ExchangeMessageDraft?,
+        pass2: Pass2AgencyBuildResult?,
+        materializeResult: AgencyOutboundMaterializationResult?
+    ) -> Bool {
+        let providerTitle = ExchangeSecondHalfRole.provider.displayTitle
+        guard display.status.role == providerTitle else { return false }
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue else { return false }
+        guard let draft = staleDraftSnapshot else { return false }
+        if draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        let md = draft.metadata
+        guard md["agency_body_source"] == "providerInquiryCompare.draftReply" else { return false }
+        let skippedLLM = md["agency_materialize_skipped_llm"] == "true"
+        let materializeOK: Bool = {
+            guard let materializeResult else { return false }
+            if case .composedAndSaved = materializeResult { return true }
+            return false
+        }()
+        guard skippedLLM || materializeOK else { return false }
+        guard let pass2 else { return false }
+        guard let pkt = pass2.providerExecutionContext?.providerCompareFirstStructuredPillarBypassPacket, pkt.isEligible else {
+            return false
+        }
+        guard let cmp = pass2.providerInquiryCompare else { return false }
+        if !cmp.missingFacts.isEmpty { return false }
+        if cmp.needsProviderInput { return false }
+        if cmp.canSendWithinConsent == false { return false }
+        if cmp.requiresBoundaryApproval == true { return false }
+        return true
+    }
+
+    /// Canonical compare-first direct-body auto-send: existing eligibility AND claim-boundary validator.
+    private func isCanonicalProviderCompareFirstDirectAutoSend(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        staleDraftSnapshot: ExchangeMessageDraft?,
+        pass2: Pass2AgencyBuildResult?,
+        materializeResult: AgencyOutboundMaterializationResult?
+    ) -> Bool {
+        let existingAllowed = isCompareFirstDirectAutoSendEligibleWithoutClaimBoundary(
+            display: display,
+            staleDraftSnapshot: staleDraftSnapshot,
+            pass2: pass2,
+            materializeResult: materializeResult
+        )
+        let claimGate = evaluateCompareFirstClaimBoundaryAutoSendGate(
+            draft: staleDraftSnapshot,
+            pass2: pass2,
+            requesterText: nil
+        )
+        let finalAllowed = existingAllowed && claimGate.claimBoundaryAllowsAutoSend
+        #if DEBUG
+        if existingAllowed || !claimGate.skippedMissingPacket {
+            let tid = staleDraftSnapshot?.id.uuidString ?? "nil"
+            exchFacadeLog(
+                "[ProviderAutoSendGate] thread=\(tid) existingAllowed=\(existingAllowed) " +
+                    "claimBoundaryAllowed=\(claimGate.claimBoundaryAllowsAutoSend) finalAllowed=\(finalAllowed)"
+            )
+        }
+        #endif
+        return finalAllowed
+    }
+
+    /// Compare-first was otherwise eligible but claim-boundary validator blocked auto-send for this draft only.
+    private func isCompareFirstDirectClaimBoundaryBlockedForAutoSend(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        staleDraftSnapshot: ExchangeMessageDraft?,
+        pass2: Pass2AgencyBuildResult?,
+        materializeResult: AgencyOutboundMaterializationResult?
+    ) -> Bool {
+        let existingAllowed = isCompareFirstDirectAutoSendEligibleWithoutClaimBoundary(
+            display: display,
+            staleDraftSnapshot: staleDraftSnapshot,
+            pass2: pass2,
+            materializeResult: materializeResult
+        )
+        guard existingAllowed else { return false }
+        let claimGate = evaluateCompareFirstClaimBoundaryAutoSendGate(
+            draft: staleDraftSnapshot,
+            pass2: pass2,
+            requesterText: nil
+        )
+        return !claimGate.claimBoundaryAllowsAutoSend
+    }
+
+    private func applyProviderCompareFirstDirectGroundedOutboundBody(
+        threadID: ExchangeThread.ID,
+        resolvedDraftID: ExchangeMessageDraft.ID,
+        display: inout ExchangeSecondHalfUIAdapter.DisplayModel,
+        body: String,
+        compare: ExchangeProviderInquiryCompareResult?,
+        actionRaw: String,
+        actionTitle: String,
+        now: Date,
+        claimBoundaryPacket: ProviderClaimBoundaryPacket? = nil,
+        requesterText: String? = nil
+    ) async throws -> Bool {
+        let cleaned = Self.cleanProviderCompareFirstDirectBody(body)
+        let validation = ExchangeProviderInquiryCompareDraftReplyValidator.validate(
+            rawDraft: cleaned,
+            compare: compare
+        )
+        #if DEBUG
+        ExchangeProviderInquiryCompareDraftReplyValidator.debugLogValidation(
+            threadID: threadID,
+            outcome: validation,
+            before: cleaned
+        )
+        #endif
+        let trimmed = validation.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        guard validation.allowsCompareFirstDirectSend else { return false }
+        #if DEBUG
+        exchFacadeLog(
+            "[EnvelopeBodyClean] thread=\(threadID.uuidString) draft=\(resolvedDraftID.uuidString) source=providerInquiryCompare.draftReply originalLen=\(body.count) cleanLen=\(trimmed.count) removedScaffold=\(cleaned != body) bodyPrefix=\(exchangeDebugAuditBodyPrefix(trimmed))"
+        )
+        #endif
+
+        #if DEBUG
+        let acceptedHash = exchangeDebugBodyShortHash(trimmed)
+        exchFacadeLog(
+            "[AgencyOutboundBody] compareFirstDirectBody thread=\(threadID.uuidString) draftID=\(resolvedDraftID.uuidString) bodyHash=\(acceptedHash) bodyPrefix=\(exchangeDebugAuditBodyPrefix(trimmed)) source=providerInquiryCompare.draftReply skippedDraftLLM=true eligibilitySource=structured_pillar_bypass_packet decision=use_direct_grounded_body"
+        )
+        #endif
+
+        var draft = try await store.requireDraft(id: resolvedDraftID)
+        draft.body = trimmed
+        draft.updatedAt = now
+        applyClaimBoundaryValidationMetadata(
+            to: &draft,
+            body: trimmed,
+            packet: claimBoundaryPacket,
+            requesterText: requesterText ?? compare?.requesterAsk ?? "",
+            threadID: threadID
+        )
+        draft.metadata["agency_authored_body"] = "true"
+        draft.metadata["agency_authored_body_at"] = ISO8601DateFormatter().string(from: now)
+        draft.metadata["agency_authored_body_source"] = actionRaw
+        draft.metadata["agency_body_source"] = "providerInquiryCompare.draftReply"
+        draft.metadata["agency_materialize_skipped_llm"] = "true"
+        draft.metadata["deterministic_body_replaced"] = "true"
+        try await store.saveDraft(draft)
+
+        #if DEBUG
+        let reloadedAfterSave = try await store.requireDraft(id: resolvedDraftID)
+        let afterHash = exchangeDebugBodyShortHash(reloadedAfterSave.body)
+        exchFacadeLog(
+            "[AgencyOutboundBody] afterSaveReload | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reloadSource=storeReload | agency_obs=\(reloadedAfterSave.metadata["agency_authored_body"] ?? "nil") | bodyHash=\(afterHash) | bodyLen=\(reloadedAfterSave.body.count) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(reloadedAfterSave.body))"
+        )
+        ExchangeAgencyOutboundMaterializeDebugAnchor.record(
+            threadID: threadID,
+            draftID: resolvedDraftID,
+            bodyHash: afterHash
+        )
+        #endif
+
+        if var draftSection = display.draft {
+            draftSection.bodyPreview = trimmed
+            display.draft = draftSection
+        }
+
+        let thread = try await store.requireThread(id: threadID)
+        await persistSecondHalfDisplayIfChanged(display, for: thread)
+        return true
+    }
+
+    private static func cleanProviderCompareFirstDirectBody(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "Draft grounded on published facts:"
+        guard trimmed.hasPrefix(prefix) else { return trimmed }
+
+        var remainder = String(trimmed.dropFirst(prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let sep = remainder.range(of: "\n---\n") {
+            remainder = String(remainder[..<sep.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return remainder.isEmpty ? trimmed : remainder
+    }
+
+    func materializeAgencyAuthoredOutboundDraftIfNeeded(
+        threadID: ExchangeThread.ID,
+        display: inout ExchangeSecondHalfUIAdapter.DisplayModel,
+        pass2Result: Pass2AgencyBuildResult?,
+        execution: ExchangeSecondHalfActionExecutor.Result,
+        secondHalfSource: String? = nil,
+        now: Date
+    ) async throws -> AgencyOutboundMaterializationResult {
+        let actionTitleEarly = display.nextMove?.action
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actionRawEarly = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard shouldMaterializeAgencyOutboundDraft(display: display) else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRawEarly) actionTitle=\(actionTitleEarly) | draft=nil | reason=not_target_action"
+            )
+            #endif
+            return .skipped("not_target_action")
+        }
+        let anchoredThreadRow = try await store.requireThread(id: threadID)
+        guard ExchangeOutboundRecipientAnchor.hasRecipientSurface(for: anchoredThreadRow) else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | reason=no_recipient_surface"
+            )
+            #endif
+            return .skipped("no_recipient_surface")
+        }
+        guard let pass2Result else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRawEarly) actionTitle=\(actionTitleEarly) | reason=no_pass2_agency_context"
+            )
+            #endif
+            return .skipped("no_pass2")
+        }
+        guard let onDevice = intelligenceProvider as? OnDeviceExchangeIntelligenceProvider else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRawEarly) actionTitle=\(actionTitleEarly) | reason=no_on_device_runner | policy=fallback_to_existing_gates_with_deterministic_draft_body_if_eligible"
+            )
+            #endif
+            return .failed("no_on_device_runner")
+        }
+
+        let actionTitle = display.nextMove?.action
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let draftPickSource: String
+        let draftID: ExchangeMessageDraft.ID?
+        if let created = execution.createdDraft,
+           created.metadata["second_half_generated"] == "true",
+           created.isActionable {
+            draftPickSource = "executionCreated"
+            draftID = created.id
+        } else {
+            draftPickSource = "storePick"
+            let drafts = try await store.listDrafts(threadID: threadID)
+            if display.status.role == ExchangeSecondHalfRole.provider.displayTitle,
+               actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue {
+                draftID = drafts
+                    .filter { $0.metadata["second_half_generated"] == "true" }
+                    .filter { $0.metadata["second_half_action"] == ExchangeSecondHalfAction.autoRespond.rawValue }
+                    .filter { $0.isActionable }
+                    .sorted { lhs, rhs in
+                        if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                        return lhs.id.uuidString < rhs.id.uuidString
+                    }
+                    .first?.id
+            } else {
+                draftID = Self.pickLatestSendableSecondHalfGeneratedDraft(
+                    drafts: drafts,
+                    matchingActionRaw: actionRaw
+                )?.id
+            }
+        }
+
+        guard let resolvedDraftID = draftID else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=nil | draftPickSource=\(draftPickSource) | reason=no_draft_id"
+            )
+            #endif
+            return .skipped("no_draft_id")
+        }
+
+        #if DEBUG
+        do {
+            let pickSnap = try await store.requireDraft(id: resolvedDraftID)
+            let obsPick = pickSnap.metadata["agency_authored_body"] ?? "nil"
+            let hashPick = exchangeDebugBodyShortHash(pickSnap.body)
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize attemptStart | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | source=\(draftPickSource) | agency_obs=\(obsPick) | bodyHash=\(hashPick) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(pickSnap.body))"
+            )
+        } catch {
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize attemptStart | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | source=\(draftPickSource) | agency_obs=error | bodyHash=na | bodyPrefix=| loadError=\(error)"
+            )
+        }
+        #endif
+
+        var materializeUsedRequesterDeterministicFallback = false
+        var materializeRequesterInquiryPacket: RequesterClarificationDraftPacket?
+        let compose: ExchangeAgencyDraftRewriteEngine.ExchangeAgencyAutonomousComposeResult
+        let requesterTitle = ExchangeSecondHalfRole.requester.displayTitle
+        if display.status.role == requesterTitle {
+            guard let ctx = pass2Result.requesterContext,
+                  let needs = pass2Result.assessment.requesterDecisionNeeds,
+                  let execCtx = pass2Result.requesterExecutionContext else {
+                #if DEBUG
+                exchFacadeLog(
+                    "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reason=missing_requester_pass2 | detail=incomplete_pass2_packet | policy=fallback_to_existing_gates_with_deterministic_draft_body_if_eligible"
+                )
+                #endif
+                return .failed("missing_requester_pass2")
+            }
+            let style = pass2Result.requesterStyleProfile
+                ?? pass2Result.requesterExecutionContext?.styleProfile
+                ?? .default
+            guard let composeMode = requesterAutonomousComposeMode(for: actionRaw) else {
+                #if DEBUG
+                exchFacadeLog(
+                    "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reason=unsupported_requester_action"
+                )
+                #endif
+                return .skipped("unsupported_requester_action")
+            }
+
+            let materializationTrigger = RequesterDraftMaterializationPolicy.trigger(
+                fromSecondHalfSource: secondHalfSource ?? ""
+            )
+            let materializationPolicy = RequesterDraftMaterializationPolicy.evaluate(
+                userAuthority: ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority(),
+                trigger: materializationTrigger,
+                boundaryRequiresHumanApproval: display.boundary.requiresHumanApproval,
+                moveNeedsApproval: display.nextMove?.needsApproval == true
+            )
+            guard materializationPolicy.shouldRunLLMCompose else {
+                #if DEBUG
+                exchFacadeLog(
+                    "[RequesterDraftMaterialization] thread=\(threadID.uuidString) " +
+                    "action=skipLLMCompose " +
+                    "decision=\(materializationPolicy.decision) " +
+                    "reason=\(materializationPolicy.reason) " +
+                    "trigger=\(materializationTrigger.rawValue) " +
+                    "authority=\(ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority().rawValue) " +
+                    "source=\(secondHalfSource ?? "nil")"
+                )
+                exchFacadeLog(
+                    "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reason=requester_materialization_policy | policyReason=\(materializationPolicy.reason)"
+                )
+                #endif
+                return .skipped("requester_materialization_policy:\(materializationPolicy.reason)")
+            }
+
+            let directedResolved: [String]? = pass2ProviderDirectedLinesResolved(pass2Result)
+            let packet = ExchangeAgencyDraftPacketBuilder.buildRequesterAutonomousOutboundPacket(
+                context: ctx,
+                decisionNeeds: needs,
+                executionContext: execCtx,
+                styleProfile: style,
+                composeMode: composeMode,
+                maxLength: 420,
+                topRankedCandidateSummaries: pass2Result.requesterTopRankedCandidateSummaries,
+                providerDirectedQuestionLinesResolved: directedResolved,
+                pass2LLMCompareSucceeded: pass2Result.requesterMatchCompareSucceeded,
+                counterpartyDisplayNameHint: execCtx.counterpartyName
+            )
+            #if DEBUG
+            if actionRaw == ExchangeSecondHalfAction.askClarification.rawValue {
+                let pql = packet.providerDirectedQuestionLines ?? []
+                let joined = pql.joined(separator: " || ")
+                let constitutionChars = currentSecretaryConstitutionText()?.count ?? 0
+                let typedStyleGuide = ExchangeSecretaryPromptInstructionBlocks.secretaryStyleGuideBlock(
+                    styleFreeform: style.freeformInstructions
+                )
+                let grounded = RequesterInquiryOpportunityLabel.resolve(
+                    offer: ctx.offer,
+                    publicProfile: ctx.publicProfile,
+                    counterpartyDisplayName: execCtx.counterpartyName
+                )
+                exchFacadeLog(
+                    "[AgencyOutboundBody] providerDirectedQuestionLines thread=\(threadID.uuidString) actionRaw=\(actionRaw) count=\(pql.count) lines=\(exchangeDebugAuditBodyPrefix(joined, maxLen: 360))"
+                )
+                exchFacadeLog(
+                    "[RequesterInquiryDraftInput] thread=\(threadID.uuidString) hasOriginalRequest=\(!packet.originalUserRequest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) hasOfferTitle=\(!(ctx.offer?.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) groundedSource=\(grounded.source.rawValue) groundedValue=\(exchangeDebugAuditBodyPrefix(grounded.label, maxLen: 120)) questionCount=\(pql.count) constitutionChars=\(constitutionChars) styleChars=\(typedStyleGuide.count)"
+                )
+                exchFacadeLog(
+                    "[SecretaryInstructionInjection] task=draft thread=\(threadID.uuidString) hasUserConstitution=\(currentSecretaryConstitutionText() != nil) hasStyleGuide=\(!typedStyleGuide.isEmpty) constitutionChars=\(constitutionChars) styleChars=\(typedStyleGuide.count)"
+                )
+            }
+            #endif
+            materializeRequesterInquiryPacket = packet
+            compose = await onDevice.composeRequesterAutonomousOutbound(packet: packet)
+        } else if display.status.role == ExchangeSecondHalfRole.provider.displayTitle {
+            let persistedProviderDraft = try await store.requireDraft(id: resolvedDraftID)
+            if actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue,
+               persistedDraftRequestsCompareFirstDirectComposeSkip(persistedProviderDraft) {
+                if let blockReason = compareFirstDirectOutboundBlockedReason(
+                    pass2: pass2Result,
+                    persistedDraft: persistedProviderDraft
+                ) {
+                    #if DEBUG
+                    let cmp = pass2Result.providerInquiryCompare
+                    let missCount = cmp?.missingFacts.count ?? -1
+                    let pkt = pass2Result.providerExecutionContext?.providerCompareFirstStructuredPillarBypassPacket
+                    exchFacadeLog(
+                        "[AgencyOutboundBody] compareFirstDirectBodyBlocked thread=\(threadID.uuidString) draftID=\(resolvedDraftID.uuidString) reason=\(blockReason) bypassPacketEligible=\(pkt?.isEligible ?? false) missingFactsCount=\(missCount) needsProviderInput=\(cmp?.needsProviderInput ?? false) canSendWithinConsent=\(String(describing: cmp?.canSendWithinConsent)) requiresBoundaryApproval=\(String(describing: cmp?.requiresBoundaryApproval))"
+                    )
+                    #endif
+                } else {
+                    let inboundAsk = pass2Result.providerExecutionContext?.inquiry?.requesterAsk
+                        ?? pass2Result.providerContext?.userIntent
+                        ?? ""
+                    let claimPacket = providerClaimBoundaryPacketForReportOnly(
+                        pass2: pass2Result,
+                        requesterText: inboundAsk
+                    )
+                    let applied = try await applyProviderCompareFirstDirectGroundedOutboundBody(
+                        threadID: threadID,
+                        resolvedDraftID: resolvedDraftID,
+                        display: &display,
+                        body: persistedProviderDraft.body,
+                        compare: pass2Result.providerInquiryCompare,
+                        actionRaw: actionRaw,
+                        actionTitle: actionTitle,
+                        now: now,
+                        claimBoundaryPacket: claimPacket,
+                        requesterText: inboundAsk
+                    )
+                    if applied {
+                        return .composedAndSaved(draftID: resolvedDraftID)
+                    }
+                    #if DEBUG
+                    exchFacadeLog(
+                        "[AgencyOutboundBody] compareFirstDirectBody validation_blocked thread=\(threadID.uuidString) draftID=\(resolvedDraftID.uuidString) policy=no_autonomous_compare_first_direct_body"
+                    )
+                    #endif
+                    return .failed("provider_draft_reply_validation")
+                }
+            }
+            guard let ctx = pass2Result.providerContext,
+                  let pa = pass2Result.assessment.providerAnswerability,
+                  let execCtx = pass2Result.providerExecutionContext else {
+                #if DEBUG
+                exchFacadeLog(
+                    "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reason=missing_provider_pass2 | detail=incomplete_pass2_packet | policy=fallback_to_existing_gates_with_deterministic_draft_body_if_eligible"
+                )
+                #endif
+                return .failed("missing_provider_pass2")
+            }
+            let style = pass2Result.providerStyleProfile
+                ?? pass2Result.providerExecutionContext?.styleProfile
+                ?? .default
+            let packet = ExchangeAgencyDraftPacketBuilder.buildProviderResponsePacket(
+                context: ctx,
+                providerAnswerability: pa,
+                executionContext: execCtx,
+                styleProfile: style,
+                maxLength: 520
+            )
+            compose = await onDevice.composeProviderAutonomousOutbound(packet: packet)
+        } else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] materialize skipped | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reason=unknown_role"
+            )
+            #endif
+            return .skipped("unknown_role")
+        }
+
+        guard compose.accepted else {
+            #if DEBUG
+            let rsn = compose.rejectionReasons.joined(separator: ",")
+            exchFacadeLog(
+                "[AgencyOutboundBody] composeRejected | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | llmAccepted=false | reasons=\(exchangeDebugAuditBodyPrefix(rsn, maxLen: 220)) | policy=fallback_to_existing_gates_with_deterministic_draft_body_if_eligible"
+            )
+            #endif
+            if display.status.role == requesterTitle,
+               let execCtx = pass2Result.requesterExecutionContext {
+                if actionRaw == ExchangeSecondHalfAction.askClarification.rawValue,
+                   let fb = requesterDeterministicOutboundBodyForMaterializeFallback(
+                       display: display,
+                       execCtx: execCtx,
+                       style: pass2Result.requesterStyleProfile ?? execCtx.styleProfile,
+                       directedQuestionLines: pass2Result.requesterDirectedQuestionsForAgency,
+                       requesterContext: pass2Result.requesterContext
+                   ),
+                   !fb.isEmpty {
+                    try await applyRequesterMaterializeFallbackBody(
+                        threadID: threadID,
+                        resolvedDraftID: resolvedDraftID,
+                        display: &display,
+                        body: fb,
+                        actionRaw: actionRaw,
+                        actionTitle: actionTitle,
+                        now: now,
+                        logLabel: "fallbackAccepted",
+                        pass2: pass2Result
+                    )
+                    return .composedAndSaved(draftID: resolvedDraftID)
+                }
+                if [ExchangeSecondHalfAction.frameDecision.rawValue, ExchangeSecondHalfAction.recommendNextMove.rawValue].contains(actionRaw),
+                   let fb = requesterFirstContactOutboundBodyForMaterializeFallback(
+                       display: display,
+                       execCtx: execCtx,
+                       style: pass2Result.requesterStyleProfile ?? execCtx.styleProfile,
+                       requesterContext: pass2Result.requesterContext
+                   ),
+                   !fb.isEmpty {
+                    try await applyRequesterMaterializeFallbackBody(
+                        threadID: threadID,
+                        resolvedDraftID: resolvedDraftID,
+                        display: &display,
+                        body: fb,
+                        actionRaw: actionRaw,
+                        actionTitle: actionTitle,
+                        now: now,
+                        logLabel: "firstContactFallbackAccepted",
+                        pass2: pass2Result
+                    )
+                    return .composedAndSaved(draftID: resolvedDraftID)
+                }
+            }
+            return .failed("compose_rejected")
+        }
+
+        var body = compose.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty,
+           display.status.role == requesterTitle,
+           let execCtx = pass2Result.requesterExecutionContext {
+            if actionRaw == ExchangeSecondHalfAction.askClarification.rawValue,
+               let fb = requesterDeterministicOutboundBodyForMaterializeFallback(
+                   display: display,
+                   execCtx: execCtx,
+                   style: pass2Result.requesterStyleProfile ?? execCtx.styleProfile,
+                   directedQuestionLines: pass2Result.requesterDirectedQuestionsForAgency,
+                   requesterContext: pass2Result.requesterContext
+               ),
+               !fb.isEmpty {
+                body = fb
+                materializeUsedRequesterDeterministicFallback = true
+            } else if [ExchangeSecondHalfAction.frameDecision.rawValue, ExchangeSecondHalfAction.recommendNextMove.rawValue].contains(actionRaw),
+                      let fb = requesterFirstContactOutboundBodyForMaterializeFallback(
+                          display: display,
+                          execCtx: execCtx,
+                          style: pass2Result.requesterStyleProfile ?? execCtx.styleProfile,
+                          requesterContext: pass2Result.requesterContext
+                      ),
+                      !fb.isEmpty {
+                body = fb
+                materializeUsedRequesterDeterministicFallback = true
+            }
+        }
+        guard !body.isEmpty else {
+            #if DEBUG
+            exchFacadeLog(
+                "[AgencyOutboundBody] composeRejected | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | llmAccepted=false | reason=empty_compose_body | policy=fallback_to_existing_gates_with_deterministic_draft_body_if_eligible"
+            )
+            #endif
+            return .failed("empty_compose_body")
+        }
+
+        #if DEBUG
+        let acceptedHash = exchangeDebugBodyShortHash(body)
+        if materializeUsedRequesterDeterministicFallback {
+            exchFacadeLog(
+                "[AgencyOutboundBody] fallbackAccepted | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | llmAccepted=false | reason=empty_compose_body_replaced | bodyLen=\(body.count) | bodyHash=\(acceptedHash) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(body))"
+            )
+        } else {
+            exchFacadeLog(
+                "[AgencyOutboundBody] composeAccepted | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | llmAccepted=true | bodyLen=\(body.count) | bodyHash=\(acceptedHash) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(body))"
+            )
+        }
+        if display.status.role == requesterTitle,
+           actionRaw == ExchangeSecondHalfAction.askClarification.rawValue {
+            let qn = pass2Result.requesterDirectedQuestionsForAgency.count
+            let pathLabel = materializeUsedRequesterDeterministicFallback ? "deterministic_body" : "llm_compose"
+            let styleProbe = ExchangeSecretaryPromptInstructionBlocks.secretaryStyleGuideBlock(
+                styleFreeform: (
+                    pass2Result.requesterStyleProfile ?? pass2Result.requesterExecutionContext?.styleProfile
+                )?.freeformInstructions
+            )
+            exchFacadeLog(
+                "[RequesterDraft] thread=\(threadID.uuidString) styleApplied=\(!styleProbe.isEmpty) styleChars=\(styleProbe.count) questionCount=\(qn) path=\(pathLabel)"
+            )
+        }
+        if display.status.role == ExchangeSecondHalfRole.provider.displayTitle,
+           actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue {
+            let needs = pass2Result.providerInquiryCompare?.needsProviderInput == true
+            let src = needs ? "manualNeeded" : "offerFactsOnly"
+            exchFacadeLog(
+                "[ProviderDraft] thread=\(threadID.uuidString) styleApplied=true source=\(src)"
+            )
+        }
+        #endif
+
+        var draft = try await store.requireDraft(id: resolvedDraftID)
+        draft.body = body
+        if let sub = compose.subject?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sub.isEmpty {
+            draft.subject = sub
+        }
+        draft.updatedAt = now
+        // Observability only — autonomous queue does not require this flag (existing safety gates apply).
+        draft.metadata["agency_authored_body"] = "true"
+        draft.metadata["agency_authored_body_at"] = ISO8601DateFormatter().string(from: now)
+        draft.metadata["agency_authored_body_source"] = actionRaw
+        draft.metadata["deterministic_body_replaced"] = "true"
+        if display.status.role == requesterTitle,
+           actionRaw == ExchangeSecondHalfAction.askClarification.rawValue,
+           let rp = materializeRequesterInquiryPacket {
+            augmentDraftWithRequesterInquirySafeOutboundMetadata(draft: &draft, packet: rp)
+        }
+
+        try await store.saveDraft(draft)
+
+        #if DEBUG
+        let reloadedAfterSave = try await store.requireDraft(id: resolvedDraftID)
+        let afterHash = exchangeDebugBodyShortHash(reloadedAfterSave.body)
+        exchFacadeLog(
+            "[AgencyOutboundBody] afterSaveReload | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reloadSource=storeReload | agency_obs=\(reloadedAfterSave.metadata["agency_authored_body"] ?? "nil") | bodyHash=\(afterHash) | bodyLen=\(reloadedAfterSave.body.count) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(reloadedAfterSave.body))"
+        )
+        ExchangeAgencyOutboundMaterializeDebugAnchor.record(
+            threadID: threadID,
+            draftID: resolvedDraftID,
+            bodyHash: afterHash
+        )
+        #endif
+
+        if var draftSection = display.draft {
+            draftSection.bodyPreview = body
+            display.draft = draftSection
+        }
+
+        let thread = try await store.requireThread(id: threadID)
+        await persistSecondHalfDisplayIfChanged(display, for: thread)
+
+        return .composedAndSaved(draftID: resolvedDraftID)
+    }
+
+    private func resolvedRequesterOutboundSubjectMatterLabel(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        selectedCounterparty: ExchangeCounterparty?
+    ) async -> String {
+        async let offer: ExchangeOffer? = {
+            guard let oid = thread.selectedOfferID else { return nil }
+            return try? await store.fetchOffer(id: oid)
+        }()
+        async let profile: ExchangePublicNodeProfile? = {
+            guard let pid = thread.selectedPublicProfileID else { return nil }
+            return try? await store.fetchPublicProfile(id: pid)
+        }()
+        let (resolvedOffer, resolvedProfile) = await (offer, profile)
+        return RequesterOutboundSubjectResolver.resolve(
+            thread: thread,
+            turns: turns,
+            offer: resolvedOffer,
+            publicProfile: resolvedProfile,
+            counterpartyDisplayName: selectedCounterparty?.bestDisplayLine
+        ).label
+    }
+
+    private func requesterFirstContactOutboundBodyForMaterializeFallback(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        execCtx: ExchangeSecondHalfExecutionContext,
+        style: ExchangeSecretaryStyleProfile,
+        requesterContext: ExchangeAgencyContext?
+    ) -> String? {
+        guard execCtx.isFirstExternalContact else { return nil }
+        let subject = resolvedRequesterMaterializeOpportunitySubjectForOutbound(
+            requesterContext: requesterContext,
+            execCtx: execCtx
+        )
+        let greeting = "Hi\(execCtx.counterpartyName.map { " \($0)" } ?? ""),"
+        let signoff = "Thank you,"
+        let body = RequesterOutboundFirstContactComposer.compose(
+            .init(
+                greeting: greeting,
+                signoff: signoff,
+                capturedRequestText: execCtx.requestCapturedText,
+                subjectMatter: subject,
+                counterpartyName: execCtx.counterpartyName,
+                offerTitle: requesterContext?.offer?.title,
+                profileDisplayName: requesterContext?.publicProfile?.displayName ?? execCtx.counterpartyName
+            )
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        #if DEBUG
+        RequesterOutboundBodySourceDebugLog.log(
+            threadID: execCtx.threadID,
+            actionRaw: ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display),
+            firstContact: true,
+            bodySource: "firstContactInquiry",
+            titleSource: subject,
+            containsGenericTitle: false
+        )
+        #endif
+        _ = style
+        return body
+    }
+
+    private func resolvedRequesterMaterializeOpportunitySubjectForOutbound(
+        requesterContext: ExchangeAgencyContext?,
+        execCtx: ExchangeSecondHalfExecutionContext
+    ) -> String {
+        if let execLine = execCtx.subjectMatter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !execLine.isEmpty,
+           !ExchangeUserFacingCopySanitizer.isGenericExchangeTitle(execLine) {
+            #if DEBUG
+            exchFacadeLog(
+                "[RequesterInquiryTitle] source=subjectMatterNonGeneric value=\(exchangeDebugAuditBodyPrefix(execLine, maxLen: 160))"
+            )
+            #endif
+            return execLine
+        }
+        let grounded = RequesterInquiryOpportunityLabel.resolve(
+            offer: requesterContext?.offer,
+            publicProfile: requesterContext?.publicProfile,
+            counterpartyDisplayName: execCtx.counterpartyName
+        )
+        #if DEBUG
+        exchFacadeLog(
+            "[RequesterInquiryTitle] source=\(grounded.source.rawValue) value=\(exchangeDebugAuditBodyPrefix(grounded.label, maxLen: 160))"
+        )
+        #endif
+        return grounded.label
+    }
+
+    private func materializeRebuildRequesterInquiryDraftPacketForSafeEnvelope(
+        pass2: Pass2AgencyBuildResult?,
+        actionRaw: String,
+        autonomousComposeMaxLength: Int
+    ) -> RequesterClarificationDraftPacket? {
+        guard let pass2 else { return nil }
+        guard let ctx = pass2.requesterContext,
+              let needs = pass2.assessment.requesterDecisionNeeds,
+              let execCtx = pass2.requesterExecutionContext else {
+            return nil
+        }
+        let style = pass2.requesterStyleProfile ?? execCtx.styleProfile
+        guard let composeMode = requesterAutonomousComposeMode(for: actionRaw) else { return nil }
+        let directedResolved: [String]? = pass2ProviderDirectedLinesResolved(pass2)
+        return ExchangeAgencyDraftPacketBuilder.buildRequesterAutonomousOutboundPacket(
+            context: ctx,
+            decisionNeeds: needs,
+            executionContext: execCtx,
+            styleProfile: style,
+            composeMode: composeMode,
+            maxLength: autonomousComposeMaxLength,
+            topRankedCandidateSummaries: pass2.requesterTopRankedCandidateSummaries,
+            providerDirectedQuestionLinesResolved: directedResolved,
+            pass2LLMCompareSucceeded: pass2.requesterMatchCompareSucceeded,
+            counterpartyDisplayNameHint: execCtx.counterpartyName
+        )
+    }
+
+    /// When LLM compare succeeded, use its lines (possibly empty). Otherwise allow gap-template seeding.
+    private func pass2ProviderDirectedLinesResolved(_ pass2: Pass2AgencyBuildResult) -> [String]? {
+        if pass2.requesterMatchCompareSucceeded {
+            return pass2.requesterDirectedQuestionsForAgency
+        }
+        return pass2.requesterDirectedQuestionsForAgency.isEmpty
+            ? nil
+            : pass2.requesterDirectedQuestionsForAgency
+    }
+
+    private func augmentDraftWithRequesterInquirySafeOutboundMetadata(
+        draft: inout ExchangeMessageDraft,
+        packet: RequesterClarificationDraftPacket
+    ) {
+        let oppTrimmed = packet.groundedOpportunityLabelForPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let opportunity = oppTrimmed.isEmpty ? "this opportunity" : oppTrimmed
+        let questions = packet.providerDirectedQuestionLines ?? []
+        draft.metadata["agency_inquiry_safe_enabled"] = "true"
+        draft.metadata["agency_inquiry_safe_opportunity"] = opportunity
+        draft.metadata["agency_inquiry_safe_questions"] = questions.joined(
+            separator: ExchangeUserFacingCopySanitizer.requesterSafeQuestionMetadataSeparator
+        )
+    }
+
+    private func requesterCommitmentBoundaryForMaterializeFallback(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel
+    ) -> ExchangeCommitmentBoundary {
+        let b = display.boundary
+        if let kind = ExchangeCommitmentBoundaryKind(rawValue: b.kind) {
+            return ExchangeCommitmentBoundary(
+                kind: kind,
+                reason: b.reason,
+                requiresHumanApproval: b.requiresHumanApproval,
+                allowsAutonomousDrafting: b.allowsAutonomousDrafting,
+                allowsAutonomousSending: b.allowsAutonomousSending
+            )
+        }
+        if b.requiresHumanApproval {
+            return .obligationBearing(reason: b.reason)
+        }
+        return .safe
+    }
+
+    private func requesterDeterministicOutboundBodyForMaterializeFallback(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        execCtx: ExchangeSecondHalfExecutionContext,
+        style: ExchangeSecretaryStyleProfile,
+        directedQuestionLines: [String] = [],
+        requesterContext: ExchangeAgencyContext?
+    ) -> String? {
+        if execCtx.isFirstExternalContact,
+           let firstContact = requesterFirstContactOutboundBodyForMaterializeFallback(
+               display: display,
+               execCtx: execCtx,
+               style: style,
+               requesterContext: requesterContext
+           ),
+           !firstContact.isEmpty {
+            return firstContact
+        }
+
+        let mergedIssues: [String]
+        if directedQuestionLines.isEmpty {
+            mergedIssues = execCtx.unresolvedIssues
+        } else {
+            mergedIssues = dedupeSecondHalfLines(directedQuestionLines + execCtx.unresolvedIssues)
+        }
+        #if DEBUG
+        let qCount = directedQuestionLines.isEmpty
+            ? (ExchangeAgencyDraftPacketBuilder.providerDirectedQuestionLines(from: execCtx)?.count ?? 0)
+            : directedQuestionLines.count
+        exchFacadeLog(
+            "[AgencyOutboundBody] deterministicFallbackInput thread=\(execCtx.threadID.uuidString) actionRaw=\(ExchangeSecondHalfAction.askClarification.rawValue) questionLineCount=\(qCount)"
+        )
+        #endif
+        let subjectSurface = resolvedRequesterMaterializeOpportunitySubjectForOutbound(
+            requesterContext: requesterContext,
+            execCtx: execCtx
+        )
+        let input = ExchangeDraftComposer.Input(
+            role: .requester,
+            action: .askClarification,
+            priors: ExchangeThreadPriors(
+                priorQuestionsAsked: execCtx.priorQuestionsAsked,
+                priorAnswersReceived: execCtx.priorAnswersReceived,
+                currentConstraints: execCtx.currentConstraints,
+                priorNonCommitments: execCtx.priorNonCommitments,
+                lastKnownRecommendation: execCtx.previousRecommendation,
+                latestDelta: execCtx.latestDelta,
+                threadStanceSnapshot: execCtx.lastKnownStance
+            ),
+            style: style,
+            operatingMemory: execCtx.operatingMemory,
+            boundary: requesterCommitmentBoundaryForMaterializeFallback(display: display),
+            counterpartyName: execCtx.counterpartyName,
+            subjectMatter: subjectSurface,
+            requestedItems: execCtx.requestedItems,
+            clarifiedFacts: execCtx.clarifiedFacts,
+            unresolvedIssues: mergedIssues,
+            customInstructions: execCtx.customInstructions,
+            isFirstExternalContact: execCtx.isFirstExternalContact,
+            requestCapturedText: execCtx.requestCapturedText,
+            offerTitle: requesterContext?.offer?.title,
+            profileDisplayName: requesterContext?.publicProfile?.displayName ?? execCtx.counterpartyName
+        )
+        let trimmed = ExchangeDraftComposer().compose(input: input).body
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func applyRequesterMaterializeFallbackBody(
+        threadID: ExchangeThread.ID,
+        resolvedDraftID: ExchangeMessageDraft.ID,
+        display: inout ExchangeSecondHalfUIAdapter.DisplayModel,
+        body: String,
+        actionRaw: String,
+        actionTitle: String,
+        now: Date,
+        logLabel: String,
+        pass2: Pass2AgencyBuildResult?
+    ) async throws {
+        #if DEBUG
+        let fbHash = exchangeDebugBodyShortHash(body)
+        exchFacadeLog(
+            "[AgencyOutboundBody] \(logLabel) | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | llmAccepted=false | bodyLen=\(body.count) | bodyHash=\(fbHash) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(body))"
+        )
+        #endif
+
+        var draft = try await store.requireDraft(id: resolvedDraftID)
+        draft.body = body
+        draft.updatedAt = now
+        draft.metadata["agency_authored_body"] = "true"
+        draft.metadata["agency_authored_body_at"] = ISO8601DateFormatter().string(from: now)
+        draft.metadata["agency_authored_body_source"] = actionRaw
+        draft.metadata["deterministic_body_replaced"] = "true"
+        if actionRaw == ExchangeSecondHalfAction.askClarification.rawValue,
+           let packet = materializeRebuildRequesterInquiryDraftPacketForSafeEnvelope(
+               pass2: pass2,
+               actionRaw: actionRaw,
+               autonomousComposeMaxLength: 420
+           ) {
+            augmentDraftWithRequesterInquirySafeOutboundMetadata(draft: &draft, packet: packet)
+        }
+        try await store.saveDraft(draft)
+
+        #if DEBUG
+        let reloadedAfterSave = try await store.requireDraft(id: resolvedDraftID)
+        let afterHash = exchangeDebugBodyShortHash(reloadedAfterSave.body)
+        exchFacadeLog(
+            "[AgencyOutboundBody] afterSaveReload | thread=\(threadID.uuidString) | role=\(display.status.role) | actionRaw=\(actionRaw) actionTitle=\(actionTitle) | draft=\(resolvedDraftID.uuidString) | reloadSource=storeReload | agency_obs=\(reloadedAfterSave.metadata["agency_authored_body"] ?? "nil") | bodyHash=\(afterHash) | bodyLen=\(reloadedAfterSave.body.count) | bodyPrefix=\(exchangeDebugAuditBodyPrefix(reloadedAfterSave.body))"
+        )
+        ExchangeAgencyOutboundMaterializeDebugAnchor.record(
+            threadID: threadID,
+            draftID: resolvedDraftID,
+            bodyHash: afterHash
+        )
+        #endif
+
+        if var draftSection = display.draft {
+            draftSection.bodyPreview = body
+            display.draft = draftSection
+        }
+
+        let thread = try await store.requireThread(id: threadID)
+        await persistSecondHalfDisplayIfChanged(display, for: thread)
+    }
+
+    private func requesterAutonomousComposeMode(
+        for actionRaw: String
+    ) -> RequesterAutonomousOutboundComposeMode? {
+        guard let action = ExchangeSecondHalfAction(rawValue: actionRaw) else { return nil }
+        switch action {
+        case .askClarification:
+            return .askClarification
+        case .recommendNextMove:
+            return .recommendNextMove
+        case .frameDecision:
+            return .frameDecision
+        default:
+            return nil
+        }
+    }
+
+    /// When true, `materializeAgencyAuthoredOutboundDraftIfNeeded` may enter the materialization path.
+    /// Requester LLM compose is additionally gated by `RequesterDraftMaterializationPolicy`.
+    /// Autonomous send still relies on existing queue/policy/federation gates.
+    private func shouldMaterializeAgencyOutboundDraft(
+        display: ExchangeSecondHalfUIAdapter.DisplayModel
+    ) -> Bool {
+        let actionRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let requesterTitle = ExchangeSecondHalfRole.requester.displayTitle
+        let providerTitle = ExchangeSecondHalfRole.provider.displayTitle
+        if display.status.role == requesterTitle {
+            return requesterAutonomousComposeMode(for: actionRaw) != nil
+        }
+        if display.status.role == providerTitle {
+            return actionRaw == ExchangeSecondHalfAction.autoRespond.rawValue
+        }
+        return false
+    }
+    
+    func runSecondHalfAfterDiscoveryResponse(
+        _ response: ExchangeOrchestrator.Response,
+        source: String,
+        now: Date = Date()
+    ) async {
+        #if DEBUG
+        if ExchangeE2EActiveRun.shouldSuppressDiscoveryAutoSecondHalf {
+            discoveryChildSecondHalfLog(
+                "action=skipSecondHalf " +
+                "reason=e2e_execution_mode " +
+                "mode=\(ExchangeE2EActiveRun.currentMode?.rawValue ?? "nil") " +
+                "source=\(source)"
+            )
+            return
+        }
+        #endif
+
+        if !response.coordinationChildThreadIDs.isEmpty {
+            let umbrellaThread = response.thread
+            let umbrellaThreadID = umbrellaThread.id.uuidString
+            let umbrellaMatches = response.matches
+
+            for childThreadID in response.coordinationChildThreadIDs {
+                do {
+                    let childThread = try await store.requireThread(id: childThreadID)
+                    let childMatches = try await store.listMatches(
+                        threadID: childThreadID,
+                        status: nil
+                    )
+                    let childMatch = resolveChildCoordinationMatch(
+                        childThread: childThread,
+                        childMatches: childMatches
+                    )
+
+                    let eligibility = DiscoveryChildSecondHalfEligibility.evaluate(
+                        childThread: childThread,
+                        childMatch: childMatch,
+                        umbrellaThread: umbrellaThread,
+                        umbrellaMatches: umbrellaMatches,
+                        trigger: .discoveryAuto
+                    )
+
+                    let childSource = "\(source).childCoordination"
+                    let entryGate = SecondHalfAutomaticEntryGate.evaluate(source: childSource)
+                    #if DEBUG
+                    SecondHalfAutomaticEntryGate.logGate(
+                        source: childSource,
+                        decision: entryGate,
+                        eligible: eligibility.shouldRunSecondHalf
+                    )
+                    #endif
+
+                    if !entryGate.shouldRun {
+                        discoveryChildSecondHalfLog(
+                            "umbrellaThreadID=\(umbrellaThreadID) " +
+                            "childThreadID=\(childThreadID.uuidString) " +
+                            "action=skip " +
+                            "reason=\(entryGate.reason)"
+                        )
+                        continue
+                    }
+
+                    if eligibility.shouldRunSecondHalf {
+                        discoveryChildSecondHalfLog(
+                            "umbrellaThreadID=\(umbrellaThreadID) " +
+                            "childThreadID=\(childThreadID.uuidString) " +
+                            "action=runSecondHalf " +
+                            "reason=\(eligibility.reason)"
+                        )
+                        await runSecondHalfAfterThreadMutation(
+                            threadID: childThreadID,
+                            source: childSource,
+                            now: now
+                        )
+                    } else {
+                        discoveryChildSecondHalfLog(
+                            "umbrellaThreadID=\(umbrellaThreadID) " +
+                            "childThreadID=\(childThreadID.uuidString) " +
+                            "action=skipSecondHalf " +
+                            "decision=\(eligibility.decision) " +
+                            "reason=\(eligibility.reason) " +
+                            "sourceRank=\(childThread.sourceRank.map(String.init) ?? "nil") " +
+                            "matchStrength=\(childMatch?.strength.rawValue ?? "nil") " +
+                            "fitScore=\(childMatch.map { String(format: "%.3f", $0.score) } ?? "nil")"
+                        )
+                    }
+                } catch {
+                    discoveryChildSecondHalfLog(
+                        "umbrellaThreadID=\(umbrellaThreadID) " +
+                        "childThreadID=\(childThreadID.uuidString) " +
+                        "action=skipSecondHalf " +
+                        "decision=blocked " +
+                        "reason=eligibility_load_failed " +
+                        "error=\(error)"
+                    )
+                }
+            }
+            return
+        }
+
+        await runSecondHalfAfterThreadMutation(
+            threadID: response.thread.id,
+            source: source,
+            now: now
+        )
+    }
+
+    func resolveChildCoordinationMatch(
+        childThread: ExchangeThread,
+        childMatches: [ExchangeMatch]
+    ) -> ExchangeMatch? {
+        if let sourceMatchID = childThread.sourceMatchID,
+           let matched = childMatches.first(where: { $0.id == sourceMatchID }) {
+            return matched
+        }
+
+        if let selectedCounterpartyID = childThread.selectedCounterpartyID {
+            let scoped = childMatches.filter { $0.counterpartyID == selectedCounterpartyID }
+            if let selected = scoped.first(where: { $0.status == .selected }) {
+                return selected
+            }
+            if let first = scoped.first {
+                return first
+            }
+        }
+
+        return childMatches.first
+    }
+
+    func resolveSecondHalfProofPolicyThread(for thread: ExchangeThread) async throws -> ExchangeThread {
+        if thread.threadRole == .candidateCoordination,
+           let parentThreadID = thread.parentThreadID {
+            return try await store.requireThread(id: parentThreadID)
+        }
+        return thread
+    }
+
+    func resolveSecondHalfProofSelectedMatch(
+        thread: ExchangeThread,
+        matches: [ExchangeMatch]
+    ) -> ExchangeMatch? {
+        if thread.threadRole == .candidateCoordination {
+            return resolveChildCoordinationMatch(
+                childThread: thread,
+                childMatches: matches
+            )
+        }
+        if let anchorOfferID = ExchangeCanonicalSelectionResolution.resolveOfferID(
+            anchors: ExchangeCanonicalSelectionResolution.anchors(from: thread, allowChildCoordinationAnchor: false),
+            thread: thread,
+            matches: matches,
+            location: "ExchangeFacade.secondHalfProofSelectedMatch"
+        ),
+           let selected = matches.first(where: { matchContainsSelectedOfferID($0, selectedOfferID: anchorOfferID) }) {
+            return selected
+        }
+        if let selectedID = thread.selectedCounterpartyID,
+           let selected = matches.first(where: { $0.counterpartyID == selectedID }) {
+            return selected
+        }
+        return matches.first
+    }
+
+    func resolveSecondHalfProofUmbrellaMatches(
+        thread: ExchangeThread,
+        policyThread: ExchangeThread
+    ) async throws -> [ExchangeMatch] {
+        guard thread.threadRole == .candidateCoordination,
+              thread.id != policyThread.id else {
+            return []
+        }
+        return try await store.listMatches(
+            threadID: policyThread.id,
+            status: nil
+        )
+    }
+
+    func resolveSecondHalfProofActivatedChildThreads(
+        thread: ExchangeThread,
+        policyThread: ExchangeThread
+    ) async throws -> [ExchangeThread] {
+        guard thread.threadRole == .candidateCoordination,
+              thread.id != policyThread.id else {
+            return []
+        }
+        let indexedThreads = try await store.listThreads(filter: ExchangeThreadFilter(limit: 500))
+        let coordinationIndex = ExchangeCoordinationThreadIndex(threads: indexedThreads)
+        return coordinationIndex.coordinationChildThreads(
+            forWorkbench: policyThread.id,
+            rootThreadID: policyThread.rootThreadID ?? policyThread.id
+        )
+    }
+
+    func resolveSecondHalfProofOfferSurfaceTokens(
+        selectedMatch: ExchangeMatch?
+    ) async -> Set<String>? {
+        guard let offerID = selectedMatch?.offerID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !offerID.isEmpty,
+              let offer = try? await store.fetchOffer(id: offerID) else {
+            return nil
+        }
+        return SecondHalfProofTargetCoverage.offerSurfaceTokens(from: offer)
+    }
+
+    func runSecondHalfAfterThreadMutation(
+        threadID: ExchangeThread.ID,
+        source: String,
+        now: Date = Date()
+    ) async {
+        let start = CFAbsoluteTimeGetCurrent()
+
+        do {
+            let thread = try await store.requireThread(id: threadID)
+
+            if thread.threadRole == .umbrellaSearch {
+                #if DEBUG
+                exchFacadeLog(
+                    "runSecondHalfAfterThreadMutation skipped | source=\(source) | thread=\(threadID.uuidString) | reason=umbrella_search_workbench"
+                )
+                #endif
+                return
+            }
+
+            let threadLane = ExchangeThreadLaneResolver.lane(for: thread)
+            if ExchangeThreadLaneResolver.skipsSecondHalfMutation(for: threadLane) {
+                #if DEBUG
+                let inboundThread = thread.metadata["inbound_thread"] ?? "nil"
+                let lastInbound = thread.lastInboundEnvelopeID ?? "nil"
+                let profileID = thread.selectedPublicProfileID ?? "nil"
+                let offerID = thread.selectedOfferID ?? "nil"
+                exchFacadeLog(
+                    "[SecondHalfLaneGuard] thread=\(threadID.uuidString) source=\(source) lane=\(threadLane.rawValue) inboundThread=\(inboundThread) lastInboundEnvelopeID=\(lastInbound) selectedPublicProfileID=\(profileID) selectedOfferID=\(offerID) decision=skip reason=lane_skips_second_half"
+                )
+                #endif
+                return
+            }
+
+            let entryGate = SecondHalfAutomaticEntryGate.evaluate(source: source)
+            if !entryGate.shouldRun {
+                #if DEBUG
+                SecondHalfAutomaticEntryGate.logGate(
+                    source: source,
+                    decision: entryGate,
+                    eligible: true
+                )
+                #endif
+                return
+            }
+
+            let turns = try await store.listTurns(
+                threadID: threadID,
+                limit: nil,
+                ascending: true
+            )
+
+            if shouldSkipSecondHalfAfterRelayOutboundConfirmed(
+                source: source,
+                thread: thread,
+                turns: turns
+            ) {
+                #if DEBUG
+                exchFacadeLog(
+                    "[SecondHalfSkip] source=\(source) reason=outbound_already_sent_waiting_for_response thread=\(threadID.uuidString)"
+                )
+                #endif
+                return
+            }
+
+            let approvals = try await loadApprovals(threadID: threadID)
+            let latestApproval = approvals.sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }.first
+
+            let drafts = try await store.listDrafts(threadID: threadID)
+            let latestDraft = drafts.sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }.first
+
+            let matches = try await store.listMatches(
+                threadID: threadID,
+                status: nil
+            )
+
+            let proofPolicyThread = try await resolveSecondHalfProofPolicyThread(for: thread)
+            let proofSelectedMatch = resolveSecondHalfProofSelectedMatch(
+                thread: thread,
+                matches: matches
+            )
+            let proofUmbrellaMatches = try await resolveSecondHalfProofUmbrellaMatches(
+                thread: thread,
+                policyThread: proofPolicyThread
+            )
+            let proofActivatedChildThreads = try await resolveSecondHalfProofActivatedChildThreads(
+                thread: thread,
+                policyThread: proofPolicyThread
+            )
+            let proofOfferSurfaceTokens = await resolveSecondHalfProofOfferSurfaceTokens(
+                selectedMatch: proofSelectedMatch
+            )
+            let proofTrigger = RequesterDraftMaterializationPolicy.trigger(fromSecondHalfSource: source)
+            let proofGate = SecondHalfProofGate.evaluate(
+                SecondHalfProofGate.Input(
+                    source: source,
+                    trigger: proofTrigger,
+                    thread: thread,
+                    policyThread: proofPolicyThread,
+                    selectedMatch: proofSelectedMatch,
+                    umbrellaMatches: proofUmbrellaMatches,
+                    activatedChildThreads: proofActivatedChildThreads,
+                    offerSurfaceTokens: proofOfferSurfaceTokens
+                )
+            )
+            if proofGate.applies && !proofGate.shouldRun {
+                #if DEBUG
+                exchFacadeLog(
+                    "runSecondHalfAfterThreadMutation skipped | source=\(source) | thread=\(threadID.uuidString) | reason=\(proofGate.reason)"
+                )
+                #endif
+                return
+            }
+
+            let selectedCounterparty = try await loadSelectedCounterparty(for: thread)
+
+            guard let outcome = await buildSecondHalfMutationDisplayOutcome(
+                thread: thread,
+                turns: turns,
+                matches: matches,
+                selectedCounterparty: selectedCounterparty,
+                latestDraft: latestDraft,
+                latestApproval: latestApproval
+            ) else {
+                #if DEBUG
+                exchFacadeLog(
+                    "runSecondHalfAfterThreadMutation skipped | source=\(source) | thread=\(threadID.uuidString) | reason=noDisplay"
+                )
+                #endif
+                secSendBridgeLog(
+                    "runSecondHalf | thread=\(threadID.uuidString) | earlyReturn=noDisplay | source=\(source)"
+                )
+                return
+            }
+
+            var display = outcome.display
+
+            let refreshedThread = try await store.requireThread(id: threadID)
+
+            let execution = try await secondHalfActionExecutor.apply(
+                display: display,
+                to: refreshedThread,
+                store: store,
+                now: now
+            )
+
+            let materializeResult = try await materializeAgencyAuthoredOutboundDraftIfNeeded(
+                threadID: threadID,
+                display: &display,
+                pass2Result: outcome.pass2Agency,
+                execution: execution,
+                secondHalfSource: source,
+                now: now
+            )
+
+            #if DEBUG
+            let materializeLabel: String
+            let materializeDraftID: String?
+            let materializeDetail: String
+            switch materializeResult {
+            case .composedAndSaved(let id):
+                materializeLabel = "accepted"
+                materializeDraftID = id.uuidString
+                materializeDetail = ""
+            case .skipped(let reason):
+                materializeLabel = "skipped"
+                materializeDraftID = nil
+                materializeDetail = " detail=\(exchangeDebugAuditBodyPrefix(reason, maxLen: 120))"
+            case .failed(let reason):
+                materializeLabel = "failed"
+                materializeDraftID = nil
+                materializeDetail = " detail=\(exchangeDebugAuditBodyPrefix(reason, maxLen: 120))"
+            }
+            let postMatDraft = materializeDraftID ?? execution.createdDraft?.id.uuidString ?? "nil"
+            let postMatTitle = display.nextMove?.action
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let postMatRaw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            exchFacadeLog(
+                "[AgencyOutboundBody] materializeResult thread=\(threadID.uuidString) result=\(materializeLabel) role=\(display.status.role) actionRaw=\(postMatRaw) actionTitle=\(postMatTitle) draft=\(postMatDraft)\(materializeDetail)"
+            )
+            #endif
+
+            let autoResponseQueueResult = try await queueSecondHalfAutoResponseIfEligible(
+                display: display,
+                execution: execution,
+                threadID: threadID,
+                selectedCounterparty: selectedCounterparty,
+                now: now,
+                pass2Agency: outcome.pass2Agency,
+                lastMaterializeResult: materializeResult
+            )
+
+            let requesterOutboundResult = try await queueSecondHalfRequesterOutboundIfEligible(
+                display: display,
+                execution: execution,
+                threadID: threadID,
+                selectedCounterparty: selectedCounterparty,
+                now: now
+            )
+
+            if requesterOutboundResult == .disabledByUserSetting {
+                display = try await refreshRequesterDisplayAfterDraftOnlyOutboundBlock(
+                    display: display,
+                    threadID: threadID,
+                    execution: execution
+                )
+                let threadAfterQueue = try await store.requireThread(id: threadID)
+                await persistSecondHalfDisplayIfChanged(display, for: threadAfterQueue)
+            }
+
+            await emitDeskRefreshAfterSecondHalfCompleted(threadID: threadID)
+
+            #if DEBUG
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "runSecondHalfAfterThreadMutation done | source=\(source) | thread=\(threadID.uuidString) | command=\(execution.command.rawValue) | threadChanged=\(execution.updatedThread != nil) | draft=\(execution.createdDraft?.id.uuidString ?? "nil") | approval=\(execution.createdApproval?.id.uuidString ?? "nil") | autoResponse=\(autoResponseQueueResult.rawValue) | requesterOutbound=\(requesterOutboundResult.rawValue) | elapsed=\(elapsedMs)ms | reason=\(execution.reason)"
+            )
+            #endif
+        } catch {
+            #if DEBUG
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "runSecondHalfAfterThreadMutation failed | source=\(source) | thread=\(threadID.uuidString) | elapsed=\(elapsedMs)ms | error=\(error)"
+            )
+            #endif
+        }
+    }
+
+    private func shouldSkipSecondHalfAfterRelayOutboundConfirmed(
+        source: String,
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> Bool {
+        guard source == "relayOutboundConfirmed" || source == "sendConfirmed" else { return false }
+        guard case .awaitingResponse = thread.state else { return false }
+
+        guard let lastSendConfirmedAt = turns
+            .last(where: { $0.kind == .sendConfirmed })?
+            .createdAt else { return false }
+
+        let hasNewerInbound = turns.contains {
+            $0.kind == .replyReceived && $0.createdAt > lastSendConfirmedAt
+        }
+        return !hasNewerInbound
+    }
+    
+    func persistSecondHalfDisplayIfChanged(
+        _ display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        for thread: ExchangeThread
+    ) async {
+        let now = Date()
+
+        let nextSnapshot = makeSecondHalfSnapshot(
+            from: display,
+            existing: thread.secondHalf,
+            now: now
+        )
+
+        guard shouldPersistSecondHalfSnapshot(
+            existing: thread.secondHalf,
+            candidate: nextSnapshot
+        ) else {
+            #if DEBUG
+            exchFacadeLog(
+                "persistSecondHalfDisplayIfChanged unchanged | thread=\(thread.id.uuidString) | existingRevision=\(thread.secondHalf?.revision.description ?? "nil")"
+            )
+            #endif
+            return
+        }
+
+        do {
+            let updated = thread.settingSecondHalf(nextSnapshot, at: now)
+            try await store.updateThread(updated)
+
+            #if DEBUG
+            exchFacadeLog(
+                "persistSecondHalfDisplayIfChanged saved | thread=\(thread.id.uuidString) | revision=\(nextSnapshot.revision) | state=\(nextSnapshot.currentStateRaw) | role=\(nextSnapshot.roleRaw)"
+            )
+            #endif
+        } catch {
+            #if DEBUG
+            exchFacadeLog(
+                "persistSecondHalfDisplayIfChanged failed | thread=\(thread.id.uuidString) | error=\(error)"
+            )
+            #endif
+        }
+    }
+
+    /// Maps localized `DisplayModel.Status` labels to durable `ExchangeSecondHalfState.rawValue` tokens.
+    private func secondHalfStatePersistenceToken(fromDisplayStateLabel label: String) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return ExchangeSecondHalfState.matchFound.rawValue }
+        if let parsed = ExchangeSecondHalfState(rawValue: trimmed) { return parsed.rawValue }
+        if let parsed = ExchangeSecondHalfState.allCases.first(where: { $0.displayTitle == trimmed }) {
+            return parsed.rawValue
+        }
+        if let parsed = ExchangeSecondHalfState.allCases.first(where: {
+            $0.displayTitle.caseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
+            return parsed.rawValue
+        }
+        return trimmed
+    }
+
+    func makeSecondHalfSnapshot(
+        from display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        existing: ExchangeThread.SecondHalfSnapshot?,
+        now: Date
+    ) -> ExchangeThread.SecondHalfSnapshot {
+        ExchangeThread.SecondHalfSnapshot(
+            schemaVersion: max(2, existing?.schemaVersion ?? 1),
+            currentStateRaw: secondHalfStatePersistenceToken(fromDisplayStateLabel: display.status.state),
+            roleRaw: display.status.role,
+
+            postureSummary: display.postureSummary,
+            readiness: display.status.readiness,
+            urgency: display.operatingContext.urgency,
+            trust: display.operatingContext.trust,
+            priceSensitivity: display.operatingContext.priceSensitivity,
+            flexibility: display.operatingContext.flexibility,
+
+            quality: display.status.quality,
+            strengthReasons: display.operatingContext.strengthReasons,
+            weaknessReasons: display.operatingContext.weaknessReasons,
+            missingFacts: display.operatingContext.userFacingMissingFacts,
+            userFacingMissingFacts: display.operatingContext.userFacingMissingFacts,
+            diagnosticMissingFacts: display.operatingContext.diagnosticMissingFacts,
+            clarifiedFacts: {
+                if let facts = display.decision?.clarifiedFacts, !facts.isEmpty { return facts }
+                let pause = display.decision?.requesterPause ?? display.requesterReview?.pauseFrame
+                if let pause, !pause.answeredFacts.isEmpty { return pause.answeredFacts }
+                return []
+            }(),
+            unresolvedIssues: display.decision?.unresolvedIssues
+                ?? display.operatingContext.userFacingMissingFacts,
+
+            decisionSummary: display.decision?.summary,
+            recommendation: display.recommendation,
+            previousRecommendation: existing?.recommendation
+                ?? existing?.previousRecommendation,
+            whatChanged: display.decision?.whatChanged ?? [],
+            tradeoffs: display.decision?.tradeoffs ?? [],
+
+            escalationReason: display.escalationReason,
+            boundaryKind: display.boundary.kind,
+            boundaryReason: display.boundary.reason,
+            externalEffectLine: display.boundary.externalEffectLine,
+            requiresHumanApproval: display.boundary.requiresHumanApproval,
+
+            nextMoveTitle: display.nextMove?.title ?? display.actionTitle,
+            nextMoveRationale: display.nextMove?.rationale,
+            nextMoveActionRaw: ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: display)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank,
+            requiredInputs: display.nextMove?.requiredInputs ?? [],
+            canRunAutonomously: display.canRunAutonomously,
+            needsHumanAttention: display.needsHumanAttention,
+
+            providerReceptionSummary: display.providerReception?.inquirySummary
+                ?? display.providerReception?.subtitle,
+            providerLeadStrength: display.providerReception?.leadStrength,
+            requesterReviewSummary: display.requesterReview?.subtitle,
+            requesterReviewStrength: display.requesterReview?.reviewStrength,
+
+            draftSubject: display.draft?.subject,
+            draftPreview: display.draft?.bodyPreview,
+            draftFactsUsed: display.draft?.usedStructuredFacts ?? [],
+            requesterPauseFrame: display.decision?.requesterPause ?? display.requesterReview?.pauseFrame,
+            requesterClosureComposedCopy: display.requesterClosureComposedCopy,
+
+            revision: (existing?.revision ?? 0) + 1,
+            lastEvaluatedAt: now,
+            updatedAt: now
+        )
+    }
+
+    func shouldPersistSecondHalfSnapshot(
+        existing: ExchangeThread.SecondHalfSnapshot?,
+        candidate: ExchangeThread.SecondHalfSnapshot
+    ) -> Bool {
+        guard let existing else {
+            return true
+        }
+
+        return secondHalfContentKey(existing) != secondHalfContentKey(candidate)
+    }
+
+    func secondHalfContentKey(
+        _ snapshot: ExchangeThread.SecondHalfSnapshot
+    ) -> String {
+        let parts: [String] = [
+            snapshot.currentStateRaw,
+            snapshot.roleRaw,
+            snapshot.postureSummary ?? "",
+            snapshot.readiness ?? "",
+            snapshot.urgency ?? "",
+            snapshot.trust ?? "",
+            snapshot.priceSensitivity ?? "",
+            snapshot.flexibility ?? "",
+            snapshot.quality ?? "",
+            snapshot.strengthReasons.joined(separator: "|"),
+            snapshot.weaknessReasons.joined(separator: "|"),
+            snapshot.missingFacts.joined(separator: "|"),
+            (snapshot.userFacingMissingFacts ?? []).joined(separator: "|"),
+            (snapshot.diagnosticMissingFacts ?? []).joined(separator: "|"),
+            snapshot.clarifiedFacts.joined(separator: "|"),
+            snapshot.unresolvedIssues.joined(separator: "|"),
+            snapshot.decisionSummary ?? "",
+            snapshot.recommendation ?? "",
+            snapshot.previousRecommendation ?? "",
+            snapshot.whatChanged.joined(separator: "|"),
+            snapshot.tradeoffs.joined(separator: "|"),
+            snapshot.escalationReason ?? "",
+            snapshot.boundaryKind ?? "",
+            snapshot.boundaryReason ?? "",
+            snapshot.externalEffectLine ?? "",
+            String(snapshot.requiresHumanApproval),
+            snapshot.nextMoveTitle ?? "",
+            snapshot.nextMoveRationale ?? "",
+            snapshot.nextMoveActionRaw ?? "",
+            snapshot.requiredInputs.joined(separator: "|"),
+            String(snapshot.canRunAutonomously),
+            String(snapshot.needsHumanAttention),
+            snapshot.providerReceptionSummary ?? "",
+            snapshot.providerLeadStrength ?? "",
+            snapshot.requesterReviewSummary ?? "",
+            snapshot.requesterReviewStrength ?? "",
+            snapshot.draftSubject ?? "",
+            snapshot.draftPreview ?? "",
+            snapshot.draftFactsUsed.joined(separator: "|"),
+            snapshot.requesterPauseFrame?.pauseReason.rawValue ?? "",
+            snapshot.requesterPauseFrame?.summaryLine ?? "",
+            snapshot.requesterPauseFrame?.recommendationLine ?? "",
+            snapshot.requesterClosureComposedCopy.map { copy in
+                [
+                    copy.title,
+                    copy.summary,
+                    copy.recommendation,
+                    copy.nextActionLabel,
+                    copy.answeredBullets.joined(separator: "|"),
+                    copy.stillOpenBullets.joined(separator: "|")
+                ].joined(separator: "¦")
+            } ?? ""
+        ]
+
+        return parts.joined(separator: "§")
+    }
+    
+    func currentSecretaryConstitutionText() -> String? {
+        let trimmed = secretaryConstitutionProvider?()?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func currentSecretaryStyleText() -> String? {
+        let trimmed = secretaryStyleTextProvider?()?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func isSecondHalfEligible(
+        thread: ExchangeThread,
+        matches: [ExchangeMatch],
+        latestDraft: ExchangeMessageDraft?
+    ) -> Bool {
+        let lane = ExchangeThreadLaneResolver.lane(for: thread)
+        if ExchangeThreadLaneResolver.skipsSecondHalfMutation(for: lane) {
+            #if DEBUG
+            exchFacadeLog(
+                "[LLMSkipLaneThread] entry=secondHalfEligibility threadID=\(thread.id.uuidString) lane=\(lane.rawValue)"
+            )
+            #endif
+            return false
+        }
+
+        if latestDraft != nil { return true }
+        if !matches.isEmpty { return true }
+        if thread.selectedCounterpartyID != nil { return true }
+        if thread.selectedPublicProfileID != nil { return true }
+        if thread.selectedOfferID != nil { return true }
+
+        switch thread.state {
+        case .matchFound,
+             .drafting,
+             .draftReady,
+             .awaitingApproval,
+             .sending,
+             .awaitingResponse,
+             .blockedByDeliveryFailure,
+             .declined,
+             .stalled,
+             .resolved,
+             .blockedBySystemFailure:
+            return true
+
+        case .needsClarification,
+             .searching,
+             .matchCandidatesWeak,
+             .noViableMatch:
+            return false
+        }
+    }
+
+    func inferSecondHalfRole(thread: ExchangeThread) -> ExchangeSecondHalfRole {
+        ExchangeThreadLaneResolver.inferSecondHalfRole(for: thread)
+    }
+
+    func mapSecondHalfState(
+        thread: ExchangeThread,
+        latestDraft: ExchangeMessageDraft?,
+        latestApproval: ExchangeApproval?
+    ) -> ExchangeSecondHalfState {
+        if latestApproval?.status == .pending {
+            return .awaitingCommitmentApproval
+        }
+
+        switch thread.state {
+        case .matchFound:
+            return .matchFound
+
+        case .drafting:
+            return .qualifying
+
+        case .draftReady:
+            return .decisionReady
+
+        case .awaitingApproval:
+            return .awaitingCommitmentApproval
+
+        case .sending:
+            return .awaitingCommitmentApproval
+
+        case .awaitingResponse:
+            return .awaitingProviderClarification
+
+        case .blockedByDeliveryFailure,
+             .blockedBySystemFailure:
+            return .blocked
+
+        case .declined:
+            return .declined
+
+        case .stalled:
+            return .stalled
+
+        case .resolved:
+            return .completed
+
+        case .needsClarification:
+            return .awaitingRequesterClarification
+
+        case .searching:
+            return .qualifying
+
+        case .matchCandidatesWeak:
+            return .requesterReview
+
+        case .noViableMatch:
+            return .stalled
+        }
+    }
+    
+    func makeSelectedMatchPublicSurfaceFacts(_ match: ExchangeMatch) -> [String] {
+        var facts: [String] = []
+
+        func put(_ label: String, _ key: String) {
+            guard let value = match.metadata[key]?.nilIfBlank else { return }
+            facts.append("\(label): \(value)")
+        }
+
+        put("Selected offer", "selected_offer_title")
+        put("Selected offer summary", "selected_offer_summary")
+        put("Selected offer category", "selected_offer_category")
+        put("Selected offer tags", "selected_offer_tags")
+        put("Selected offer regions", "selected_offer_regions")
+        put("Selected offer status", "selected_offer_status")
+        put("Selected offer visibility", "selected_offer_visibility")
+
+        put("Selected public profile", "public_profile_display_name")
+        put("Public profile headline", "public_profile_headline")
+        put("Public profile summary", "public_profile_summary")
+        put("Public profile offers", "public_profile_offers")
+        put("Public profile open to", "public_profile_open_to")
+        put("Public profile interests", "public_profile_interests")
+        put("Public profile activity tags", "public_profile_activity_tags")
+        put("Public profile regions", "public_profile_regions")
+        put("Public profile visibility", "public_profile_visibility")
+        put("Public profile availability", "public_profile_availability")
+        put("Public profile access mode", "public_profile_access_mode")
+
+        put("Counterparty", "counterparty_name")
+
+        if !match.matchedOfferIDs.isEmpty {
+            facts.append("Matched offer IDs: \(match.matchedOfferIDs.joined(separator: ", "))")
+        }
+
+        if let offerID = match.offerID?.nilIfBlank {
+            facts.append("Primary offer ID: \(offerID)")
+        }
+
+        if let profileID = match.publicProfileID?.nilIfBlank {
+            facts.append("Public profile ID: \(profileID)")
+        }
+
+        if let recommendation = match.recommendation?.nilIfBlank {
+            facts.append("Match recommendation: \(recommendation)")
+        }
+
+        facts.append(contentsOf: match.reasons.compactMap { reason in
+            reason.summary.nilIfBlank.map { "Match reason: \($0)" }
+        })
+
+        facts.append(contentsOf: match.cautions.compactMap { caution in
+            caution.summary.nilIfBlank.map { "Match caution: \($0)" }
+        })
+
+        return dedupeSecondHalfLines(facts)
+    }
+
+    private func collapseWhitespaceForSecondHalfFacts(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizedForSecondHalfInboundDedupe(_ text: String) -> String {
+        collapseWhitespaceForSecondHalfFacts(text).lowercased()
+    }
+
+    private func secondHalfInboundDetailIsRedundantVsSummary(detail: String, summary: String?) -> Bool {
+        let normalizedDetail = normalizedForSecondHalfInboundDedupe(detail)
+        guard !normalizedDetail.isEmpty else { return true }
+        guard let summaryText = summary?.nilIfBlank else { return false }
+        let normalizedSummary = normalizedForSecondHalfInboundDedupe(summaryText)
+        guard !normalizedSummary.isEmpty else { return false }
+        if normalizedDetail == normalizedSummary { return true }
+        if normalizedDetail.hasPrefix(normalizedSummary), normalizedDetail.count - normalizedSummary.count <= 10 {
+            return true
+        }
+        if normalizedSummary.hasPrefix(normalizedDetail), normalizedSummary.count - normalizedDetail.count <= 10 {
+            return true
+        }
+        return false
+    }
+
+    private func capStringForSecondHalfKnownFactBody(_ text: String, maxCharacters: Int) -> String {
+        let collapsed = collapseWhitespaceForSecondHalfFacts(text)
+        guard collapsed.count > maxCharacters else { return collapsed }
+        let head = String(collapsed.prefix(maxCharacters)).trimmingCharacters(in: .whitespacesAndNewlines)
+        if head.isEmpty { return "" }
+        return head + "…"
+    }
+
+    private func secondHalfInboundDetailFactLabel(turn: ExchangeTurn) -> String {
+        switch turn.kind {
+        case .replyReceived:
+            if turn.actor == .counterparty { return "Provider answer" }
+            return "Reply"
+        case .clarificationAnswered:
+            switch turn.actor {
+            case .counterparty: return "Provider answer"
+            case .user: return "Your answer"
+            default: return "Clarification answer"
+            }
+        default:
+            return "Reply"
+        }
+    }
+
+    private func allowedSecondHalfInboundDetailTurnIDs(
+        turns: [ExchangeTurn],
+        kinds: Set<ExchangeTurn.Kind>
+    ) -> Set<ExchangeTurn.ID> {
+        Set(
+            turns
+                .filter { kinds.contains($0.kind) && ($0.detail?.nilIfBlank != nil) }
+                .suffix(ExchangeFacadeSecondHalfInboundFacts.replyDetailMaxTurnsContributingFullBody)
+                .map(\.id)
+        )
+    }
+
+    private func appendSecondHalfKnownFactsForInboundStyleTurn(
+        _ turn: ExchangeTurn,
+        allowedDetailTurnIDs: Set<ExchangeTurn.ID>,
+        into facts: inout [String]
+    ) {
+        let summaryLine = ExchangeSemanticEvidenceSanitizer.sanitize(turn.summary)
+        let sanitizedDetail = ExchangeSemanticEvidenceSanitizer.sanitize(turn.detail)
+
+        guard let detail = sanitizedDetail, !detail.isEmpty else {
+            if let summaryLine {
+                facts.append(summaryLine)
+            }
+            return
+        }
+
+        guard allowedDetailTurnIDs.contains(turn.id) else {
+            if let summaryLine {
+                facts.append(summaryLine)
+            }
+            return
+        }
+
+        let cappedBody = capStringForSecondHalfKnownFactBody(
+            detail,
+            maxCharacters: ExchangeFacadeSecondHalfInboundFacts.replyDetailMaxCharacters
+        )
+        guard !cappedBody.isEmpty else {
+            if let summaryLine {
+                facts.append(summaryLine)
+            }
+            return
+        }
+
+        let redundant = secondHalfInboundDetailIsRedundantVsSummary(detail: detail, summary: summaryLine)
+        let label = secondHalfInboundDetailFactLabel(turn: turn)
+        let labeled = "\(label): \(cappedBody)"
+
+        if redundant {
+            facts.append(labeled)
+        } else {
+            if let summaryLine {
+                facts.append(summaryLine)
+            }
+            facts.append(labeled)
+        }
+    }
+
+    func makeSecondHalfKnownFacts(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        matches: [ExchangeMatch],
+        selectedCounterparty: ExchangeCounterparty?,
+        latestDraft: ExchangeMessageDraft?
+    ) async -> [String] {
+        var facts: [String] = []
+
+        if let summary = ExchangeSemanticEvidenceSanitizer.sanitize(thread.visibleSummary) {
+            facts.append(summary)
+        }
+
+        if let interpretation = thread.interpretation?.userSummary?.nilIfBlank {
+            facts.append(interpretation)
+        }
+
+        if let counterparty = selectedCounterparty?.bestDisplayLine.nilIfBlank {
+            facts.append("Selected counterparty: \(counterparty)")
+        }
+
+        if let selectedOfferID = thread.selectedOfferID?.nilIfBlank {
+            facts.append("Selected offer ID: \(selectedOfferID)")
+        }
+
+        if let selectedProfileID = thread.selectedPublicProfileID?.nilIfBlank {
+            facts.append("Selected public profile ID: \(selectedProfileID)")
+        }
+
+        if let inboundEnvelopeID = thread.lastInboundEnvelopeID?.nilIfBlank {
+            facts.append("Last inbound envelope: \(inboundEnvelopeID)")
+        }
+
+        if let outboundEnvelopeID = thread.lastOutboundEnvelopeID?.nilIfBlank {
+            facts.append("Last outbound envelope: \(outboundEnvelopeID)")
+        }
+
+        if !matches.isEmpty {
+            facts.append("\(matches.count) candidate path\(matches.count == 1 ? "" : "s") surfaced.")
+        }
+        
+        if let selectedMatch = preferredMatch(
+            for: thread,
+            matches: matches,
+            selectedCounterparty: selectedCounterparty
+        ) {
+            facts.append(contentsOf: makeSelectedMatchPublicSurfaceFacts(selectedMatch))
+        }
+
+        if latestDraft != nil {
+            facts.append("A local draft exists.")
+        }
+
+        if let rationale = thread.selectedMatchRationale?.nilIfBlank {
+            facts.append("Selection basis: \(rationale)")
+        }
+
+        let inboundStyleKinds: Set<ExchangeTurn.Kind> = [.replyReceived, .clarificationAnswered]
+        let allowedInboundDetailTurnIDs = allowedSecondHalfInboundDetailTurnIDs(
+            turns: turns,
+            kinds: inboundStyleKinds
+        )
+
+        for turn in turns {
+            switch turn.kind {
+            case .replyReceived, .clarificationAnswered:
+                appendSecondHalfKnownFactsForInboundStyleTurn(
+                    turn,
+                    allowedDetailTurnIDs: allowedInboundDetailTurnIDs,
+                    into: &facts
+                )
+            case .requestCaptured, .candidateSelected, .searchCompleted, .draftPrepared:
+                if let line = ExchangeSemanticEvidenceSanitizer.sanitize(turn.summary) {
+                    facts.append(line)
+                }
+            default:
+                break
+            }
+        }
+
+        if let offerID = thread.selectedOfferID?.nilIfBlank,
+           let offer = try? await store.fetchOffer(id: offerID) {
+            facts.append(contentsOf: ExchangeSellerSurfaceOperatingMemoryHydrator.offerFulfillmentFactLines(for: offer))
+        }
+
+        return dedupeSecondHalfLines(facts)
+    }
+
+    func makeSecondHalfUnresolvedIssues(
+        thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        knownFacts: [String],
+        matches: [ExchangeMatch],
+        requestCapturedSupplement: String? = nil
+    ) -> [String] {
+        var issues = makeSecondHalfBaseUnresolvedIssues(thread: thread, latestApproval: latestApproval)
+        issues.append(contentsOf: secondHalfOutboundMaterialFollowUpIssues(
+            thread: thread,
+            knownFacts: knownFacts,
+            matches: matches,
+            requestCapturedSupplement: requestCapturedSupplement
+        ))
+        return dedupeSecondHalfLines(issues)
+    }
+
+    private func makeSecondHalfBaseUnresolvedIssues(
+        thread: ExchangeThread,
+        latestApproval: ExchangeApproval?
+    ) -> [String] {
+        var issues: [String] = []
+
+        if latestApproval?.status == .pending {
+            issues.append("Human approval is required before external movement.")
+        }
+
+        if let question = currentClarificationQuestion(for: thread)?.nilIfBlank {
+            issues.append(question)
+        }
+
+        if let failure = thread.latestFailure {
+            issues.append(failure.recommendedNextStep.summaryLine)
+        }
+
+        switch thread.state {
+        case .matchCandidatesWeak:
+            issues.append("Current surfaced candidates are weak.")
+        case .noViableMatch:
+            issues.append("No viable match is anchored yet.")
+        case .stalled:
+            issues.append("Thread is stalled.")
+        case .blockedByDeliveryFailure:
+            issues.append("Delivery failed.")
+        case .blockedBySystemFailure:
+            issues.append("System failure blocked progress.")
+        default:
+            break
+        }
+
+        return issues
+    }
+
+    private func secondHalfUserOutboundRequestProbeBlob(
+        thread: ExchangeThread,
+        requestCapturedSupplement: String? = nil
+    ) -> String {
+        var parts: [String] = []
+        if let t = ExchangeSemanticEvidenceSanitizer.sanitize(thread.title) { parts.append(t) }
+        if let v = ExchangeSemanticEvidenceSanitizer.sanitize(thread.visibleSummary) { parts.append(v) }
+        if let captured = ExchangeSemanticEvidenceSanitizer.sanitize(requestCapturedSupplement) {
+            parts.append(captured)
+        }
+        if let i = thread.interpretation {
+            parts.append(contentsOf: i.semanticTags)
+            parts.append(contentsOf: i.discoveryKeywords)
+            parts.append(contentsOf: i.targetTags)
+            if let s = i.userSummary?.nilIfBlank { parts.append(s) }
+            if let q = i.userQuestion?.nilIfBlank { parts.append(q) }
+            if let n = i.userNextStep?.nilIfBlank { parts.append(n) }
+        }
+        return parts.joined(separator: " ").lowercased()
+    }
+
+    private func secondHalfOutboundProbeIntentDetected(probeBlob: String) -> Bool {
+        let phrases: [String] = [
+            "tell me about", "learn about", "see if", "find out", "ask about", "ask them about",
+            "and ask them", "check with", "confirm with", "message them about", "reach out",
+            "contact them", "inquire about", "ask the provider", "ask their", "email them",
+            "call them", "let them know", "verify with", "double-check", "double check",
+            "follow up with", "what's the", "what is the", "how much", "availability"
+        ]
+        if phrases.contains(where: { probeBlob.contains($0) }) {
+            return true
+        }
+        if probeBlob.contains(" confirm") || probeBlob.contains("confirm ") || probeBlob.contains("confirmation") {
+            return true
+        }
+        if probeBlob.contains(" check ") || probeBlob.hasPrefix("check ") || probeBlob.contains("check if")
+            || probeBlob.contains("check on") || probeBlob.contains("checking") {
+            return true
+        }
+        if probeBlob.contains(" available") || probeBlob.contains("available?") {
+            return true
+        }
+        return false
+    }
+
+    private func secondHalfSelectedOrLoneStrongCandidate(
+        thread: ExchangeThread,
+        matches: [ExchangeMatch]
+    ) -> Bool {
+        let hasAnchor =
+            thread.selectedCounterpartyID?.nilIfBlank != nil ||
+            thread.selectedOfferID?.nilIfBlank != nil ||
+            thread.selectedPublicProfileID?.nilIfBlank != nil
+        if hasAnchor { return true }
+        if matches.count == 1, let m = matches.first, m.strength != .weak {
+            return true
+        }
+        return secondHalfHasStrongTopRankedMatch(matches: matches)
+    }
+
+    private func secondHalfHasStrongTopRankedMatch(matches: [ExchangeMatch]) -> Bool {
+        let ranked = matches
+            .filter { $0.status != .rejected && $0.status != .archived }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+        guard let top = ranked.first else { return false }
+        return top.strength != .weak
+    }
+
+    func requesterTopRankedMatchSummaryLines(
+        matches: [ExchangeMatch],
+        limit: Int
+    ) -> [String] {
+        let ranked = matches
+            .filter { $0.status != .rejected && $0.status != .archived }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+
+        return ranked.prefix(limit).map { match in
+            let headline =
+                match.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                ?? match.reasons.first?.summary.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                ?? "Surfaced candidate"
+            let scoreLabel = String(format: "%.2f", match.score)
+            return "\(headline) — score \(scoreLabel), strength \(match.strength.rawValue)"
+        }
+    }
+
+    private func secondHalfAvailabilityThemeRequested(blob: String) -> Bool {
+        if blob.contains("availability") { return true }
+        if blob.contains("schedule") || blob.contains("scheduling") { return true }
+        if blob.contains(" time slot") || blob.contains(" slots") { return true }
+        if blob.contains(" open ") || blob.contains("openings") { return true }
+        if blob.contains(" available ") || blob.hasSuffix(" available") || blob.hasPrefix("available ") {
+            return true
+        }
+        if blob.contains("available?") || blob.contains("available,") || blob.contains("available.") {
+            return true
+        }
+        if blob.contains(" when ") && (blob.contains("lesson") || blob.contains("class") || blob.contains("teach")) {
+            return true
+        }
+        return false
+    }
+
+    /// **Named deterministic fallback only** (when Pass-2 LLM compare is unavailable or yields no
+    /// questions): second-person questions derived from the probe blob. Not used as the primary
+    /// missing-info source.
+    private func secondHalfRequesterProviderDirectedQuestionLinesFromProbeBlob(
+        blob: String,
+        thread: ExchangeThread
+    ) -> [String] {
+        let wantsPrice = ["price", "cost", "rate", "fee", "how much", "tuition", "pricing"].contains { blob.contains($0) }
+        let wantsSchedule = secondHalfAvailabilityThemeRequested(blob: blob)
+        let wantsPlace = ["location", "where", "address", "service area", "lesson location", "in-person", "in person", "remote"].contains { blob.contains($0) }
+
+        var lines: [String] = []
+        if wantsPrice {
+            lines.append("Could you confirm your lesson rate or pricing structure?")
+        }
+        if wantsSchedule {
+            lines.append(
+                "Could you confirm your current availability or schedule for new students?"
+            )
+        }
+        if wantsPlace {
+            lines.append(
+                "Could you confirm where lessons take place, and whether they are in-person, remote, or both?"
+            )
+        }
+        return lines
+    }
+
+    private func secondHalfOutboundMaterialFollowUpIssues(
+        thread: ExchangeThread,
+        knownFacts: [String],
+        matches: [ExchangeMatch],
+        requestCapturedSupplement: String? = nil
+    ) -> [String] {
+        let blob = secondHalfUserOutboundRequestProbeBlob(
+            thread: thread,
+            requestCapturedSupplement: requestCapturedSupplement
+        )
+        let probeDetected = secondHalfOutboundProbeIntentDetected(probeBlob: blob)
+        let anchorOk = secondHalfSelectedOrLoneStrongCandidate(thread: thread, matches: matches)
+
+        let wantsPrice = ["price", "cost", "rate", "fee", "how much", "tuition", "pricing"].contains { blob.contains($0) }
+        let wantsSchedule = secondHalfAvailabilityThemeRequested(blob: blob)
+        let wantsPlace = ["location", "where", "address", "service area", "lesson location", "in-person", "in person", "remote"].contains { blob.contains($0) }
+        let wantsLead = ["how soon", "lead time", "when can we", "when can you", "start date", "earliest", "timeline"].contains { blob.contains($0) }
+        let wantsPolicy = ["policy", "cancellation", "requirements", "rules", "contract terms"].contains { blob.contains($0) }
+
+        #if DEBUG
+        func emitProbeLog(emitted: [String]) {
+            secondHalfLogProbeLine(
+                threadID: thread.id,
+                probeDetected: probeDetected,
+                anchorOk: anchorOk,
+                blobPreview: blob,
+                wantsPrice: wantsPrice,
+                wantsSchedule: wantsSchedule,
+                wantsPlace: wantsPlace,
+                wantsLead: wantsLead,
+                wantsPolicy: wantsPolicy,
+                emittedFollowUps: emitted
+            )
+        }
+        #endif
+
+        guard probeDetected else {
+            #if DEBUG
+            emitProbeLog(emitted: [])
+            #endif
+            return []
+        }
+        guard anchorOk else {
+            #if DEBUG
+            emitProbeLog(emitted: [])
+            #endif
+            return []
+        }
+
+        let factsLower = knownFacts.joined(separator: " ").lowercased()
+
+        func factsCoverAny(_ terms: [String]) -> Bool {
+            terms.contains { factsLower.contains($0) }
+        }
+
+        var out: [String] = []
+
+        // Pricing/schedule/location probes are logged for Pass-2 diagnostics only. They must not inject
+        // internal scaffolding into unresolved issues (that text would leak into outbound drafts).
+
+        let leadTerms = ["lead time", "turnaround", "wait time", "how soon", "start date", "earliest", "timeline", "booking window"]
+        if wantsLead && !factsCoverAny(leadTerms) {
+            out.append("Please confirm timing or lead time with the provider before you finalize your decision.")
+        }
+
+        let policyTerms = ["policy", "cancellation", "requirements", "terms of service", "refund", "deposit policy"]
+        if wantsPolicy && !factsCoverAny(policyTerms) {
+            out.append("Please confirm policies or requirements with the provider before you finalize your decision.")
+        }
+
+        #if DEBUG
+        emitProbeLog(emitted: out)
+        #else
+        _ = wantsPrice
+        _ = wantsSchedule
+        _ = wantsPlace
+        #endif
+
+        return out
+    }
+
+    func makeSecondHalfPriorQuestions(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> [String] {
+        var questions: [String] = []
+
+        if let q = currentClarificationQuestion(for: thread)?.nilIfBlank {
+            questions.append(q)
+        }
+
+        questions.append(contentsOf: turns.compactMap { turn in
+            guard turn.kind == .clarificationAsked else { return nil }
+            return turn.summary.nilIfBlank
+        })
+
+        return dedupeSecondHalfLines(questions)
+    }
+
+    func makeSecondHalfPriorAnswers(
+        turns: [ExchangeTurn]
+    ) -> [String] {
+        let allowedDetailTurnIDs = allowedSecondHalfInboundDetailTurnIDs(
+            turns: turns,
+            kinds: [.clarificationAnswered]
+        )
+        var lines: [String] = []
+        for turn in turns where turn.kind == .clarificationAnswered {
+            appendSecondHalfKnownFactsForInboundStyleTurn(
+                turn,
+                allowedDetailTurnIDs: allowedDetailTurnIDs,
+                into: &lines
+            )
+        }
+        return dedupeSecondHalfLines(lines)
+    }
+
+    func latestCounterpartyReplyTextForSecondHalf(
+        from turns: [ExchangeTurn],
+        maxLen: Int = 2400
+    ) -> String? {
+        for turn in turns.reversed() {
+            guard turn.kind == .replyReceived, turn.actor == .counterparty else { continue }
+            if let detail = ExchangeSemanticEvidenceSanitizer.sanitize(turn.detail) {
+                return detail.count > maxLen ? String(detail.prefix(maxLen)) : detail
+            }
+            if let summary = ExchangeSemanticEvidenceSanitizer.sanitize(turn.summary) {
+                return summary.count > maxLen ? String(summary.prefix(maxLen)) : summary
+            }
+        }
+        return nil
+    }
+
+    func isExchangeThreadExplicitlyCompleted(thread: ExchangeThread) -> Bool {
+        if case .resolved = thread.state { return true }
+        return false
+    }
+
+    func makeSecondHalfConstraints(thread: ExchangeThread) -> [String] {
+        var constraints: [String] = []
+
+        constraints.append(contentsOf: thread.interpretation?.targetTags ?? [])
+        constraints.append(contentsOf: thread.interpretation?.semanticTags ?? [])
+        constraints.append(contentsOf: thread.interpretation?.discoveryKeywords ?? [])
+
+        return dedupeSecondHalfLines(constraints)
+    }
+
+    func requestedItems(thread: ExchangeThread) -> [String] {
+        var items: [String] = []
+
+        items.append(contentsOf: thread.interpretation?.targetTags ?? [])
+        items.append(contentsOf: thread.interpretation?.discoveryKeywords ?? [])
+
+        if items.isEmpty, let title = thread.title.nilIfBlank {
+            items.append(title)
+        }
+
+        return dedupeSecondHalfLines(items)
+    }
+
+    func makeInboundInquiryIfAvailable(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        selectedCounterparty: ExchangeCounterparty?,
+        knownFacts: [String],
+        unresolvedIssues: [String]
+    ) async -> ExchangeInboundInquiry? {
+        if thread.lastInboundEnvelopeID == nil {
+            #if DEBUG
+            let roleInference = inferSecondHalfRole(thread: thread)
+            let hasFedInbound = hasFederationReconciledInboundTurn(in: turns)
+            exchFacadeLog(
+                "makeInboundInquiryIfAvailable missing_lastInboundEnvelopeID | thread=\(thread.id.uuidString) | " +
+                    "inferSecondHalfRole=\(roleInference.rawValue) | metadata.inbound_thread=\(thread.metadata["inbound_thread"] ?? "nil") | " +
+                    "metadata.inbound_first_contact=\(thread.metadata["inbound_first_contact"] ?? "nil") | " +
+                    "hasFederationReconciledInboundTurn=\(hasFedInbound)"
+            )
+            #endif
+
+            let safety = fallbackInboundInquiry(
+                thread: thread,
+                turns: turns,
+                selectedCounterparty: selectedCounterparty
+            )
+
+            #if DEBUG
+            if safety == nil {
+                exchFacadeLog(
+                    "makeInboundInquiryIfAvailable nil_after_envelope_gate | thread=\(thread.id.uuidString) | " +
+                        "reason=no_fallback_path"
+                )
+            }
+            #endif
+
+            return safety
+        }
+
+        let ask = capturedRequestText(from: turns)
+            ?? turns.last(where: { $0.kind == .replyReceived })?.summary
+            ?? thread.visibleSummary
+            ?? thread.title
+
+        let request = ExchangeIntelligenceInboundInquiryRequest(
+            threadTitle: thread.title,
+            visibleSummary: thread.visibleSummary,
+            requesterAsk: ask,
+            matchedOfferOrProfileAnchor: thread.selectedOfferID ?? thread.selectedPublicProfileID,
+            selectedCounterpartyName: selectedCounterparty?.bestDisplayLine,
+            knownFacts: knownFacts,
+            unresolvedIssues: unresolvedIssues,
+            secretaryRepresentation: currentSecretaryConstitutionText()
+        )
+
+        do {
+            let response = try await intelligenceProvider.classifyInboundInquiry(request)
+
+            #if DEBUG
+            exchFacadeLog(
+                "makeInboundInquiryIfAvailable ai_ok | thread=\(thread.id.uuidString) | answerability=\(response.answerabilityStatus.rawValue) | classification=\(response.classification.rawValue) | confidence=\(response.confidence)"
+            )
+            #endif
+
+            return response.asInboundInquiry
+        } catch {
+            #if DEBUG
+            exchFacadeLog(
+                "makeInboundInquiryIfAvailable ai_failed | thread=\(thread.id.uuidString) | error=\(error)"
+            )
+            #endif
+
+            return fallbackInboundInquiry(
+                thread: thread,
+                turns: turns,
+                selectedCounterparty: selectedCounterparty
+            )
+        }
+    }
+    
+    func fallbackInboundInquiry(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> ExchangeInboundInquiry? {
+        guard thread.lastInboundEnvelopeID != nil
+            || hasFederationReconciledInboundTurn(in: turns)
+        else {
+            return nil
+        }
+
+        let ask = capturedRequestText(from: turns)
+            ?? turns.last(where: { $0.kind == .replyReceived })?.summary
+            ?? thread.visibleSummary
+            ?? thread.title
+
+        let combinedText = [
+            ask,
+            thread.visibleSummary,
+            thread.interpretation?.userSummary,
+            thread.selectedOfferID,
+            thread.selectedPublicProfileID,
+            selectedCounterparty?.bestDisplayLine
+        ]
+        .compactMap { $0 }
+        .joined(separator: " ")
+        .lowercased()
+
+        let answerability: ExchangeInboundInquiryAnswerability
+        if containsOutOfScopeSignal(combinedText) {
+            answerability = .outOfScope
+        } else if containsCustomOrCommitmentSignal(combinedText) {
+            answerability = .requiresUserInput
+        } else if hasProviderReceptionGrounding(thread: thread, selectedCounterparty: selectedCounterparty) {
+            answerability = .answerableFromKnownFacts
+        } else {
+            answerability = .insufficientContext
+        }
+
+        let classification: ExchangeInboundInquiryClassification =
+            containsCustomOrCommitmentSignal(combinedText) ? .exceptional : .routine
+
+        return ExchangeInboundInquiry(
+            inquirySummary: thread.visibleSummary ?? ask,
+            requesterAsk: ask,
+            matchedOfferOrProfileAnchor: thread.selectedOfferID ?? thread.selectedPublicProfileID,
+            answerabilityStatus: answerability,
+            classification: classification
+        )
+    }
+
+    private func hasFederationReconciledInboundTurn(in turns: [ExchangeTurn]) -> Bool {
+        turns.contains { turn in
+            turn.kind == .replyReceived &&
+                turn.actor == .counterparty &&
+                turn.metadata["source"] == "federation_reconcile_inbound"
+        }
+    }
+
+    func hasProviderReceptionGrounding(
+        thread: ExchangeThread,
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> Bool {
+        if thread.selectedOfferID?.nilIfBlank != nil {
+            return true
+        }
+
+        if thread.selectedPublicProfileID?.nilIfBlank != nil {
+            return true
+        }
+
+        if selectedCounterparty != nil {
+            return true
+        }
+
+        if thread.visibleSummary?.nilIfBlank != nil {
+            return true
+        }
+
+        if thread.interpretation?.userSummary?.nilIfBlank != nil {
+            return true
+        }
+
+        return false
+    }
+
+    func containsOutOfScopeSignal(
+        _ text: String
+    ) -> Bool {
+        let terms = [
+            "out of scope",
+            "not offered",
+            "not available",
+            "do not offer",
+            "unsupported",
+            "can't provide",
+            "cannot provide"
+        ]
+
+        return terms.contains { text.contains($0) }
+    }
+
+    func containsCustomOrCommitmentSignal(
+        _ text: String
+    ) -> Bool {
+        let terms = [
+            "custom price",
+            "custom pricing",
+            "special rate",
+            "discount",
+            "contract",
+            "agreement",
+            "sign",
+            "purchase order",
+            "invoice",
+            "book",
+            "reserve",
+            "confirm time",
+            "appointment",
+            "private",
+            "confidential",
+            "sensitive",
+            "exception",
+            "outside policy",
+            "special case"
+        ]
+
+        return terms.contains { text.contains($0) }
+    }
+
+    func makeStructuredQueryIfAvailable(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> ExchangeStructuredAnswerEngine.Query? {
+        let raw = capturedRequestText(from: turns) ?? thread.title
+        let lower = raw.lowercased()
+
+        let kind: ExchangeStructuredAnswerEngine.QueryKind
+        if lower.contains("price") || lower.contains("cost") || lower.contains("quote") {
+            kind = .pricing
+        } else if lower.contains("available") || lower.contains("availability") || lower.contains("time") {
+            kind = .availability
+        } else if lower.contains("area") || lower.contains("location") || lower.contains("where") {
+            kind = .serviceArea
+        } else if lower.contains("policy") || lower.contains("terms") {
+            kind = .standardPolicy
+        } else {
+            kind = .general
+        }
+
+        return ExchangeStructuredAnswerEngine.Query(rawText: raw, kind: kind)
+    }
+
+    func countClarificationRounds(turns: [ExchangeTurn]) -> Int {
+        turns.filter { $0.kind == .clarificationAsked }.count
+    }
+
+    func countFollowUpAttempts(turns: [ExchangeTurn]) -> Int {
+        turns.filter { turn in
+            let text = "\(turn.summary) \(turn.detail ?? "")".lowercased()
+            return text.contains("follow up") || text.contains("follow-up")
+        }.count
+    }
+
+    func countAutonomousRounds(turns: [ExchangeTurn]) -> Int {
+        turns.filter { turn in
+            switch turn.kind {
+            case .searchStarted,
+                 .searchCompleted,
+                 .candidateSelected,
+                 .draftPrepared,
+                 .approvalRequested,
+                 .sendAttempted,
+                 .followUpSuggested,
+                 .negotiationAdvanced,
+                 .systemNotice:
+                return true
+
+            default:
+                return false
+            }
+        }.count
+    }
+
+    func hasFreshProviderAnswer(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> Bool {
+        if thread.lastInboundEnvelopeID != nil {
+            return true
+        }
+
+        return turns.contains { turn in
+            switch turn.kind {
+            case .replyReceived,
+                 .clarificationAnswered:
+                return true
+
+            default:
+                return false
+            }
+        }
+    }
+
+    func isTimeSensitive(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> Bool {
+        containsAny(
+            thread: thread,
+            turns: turns,
+            terms: ["urgent", "asap", "today", "tomorrow", "deadline", "soon"]
+        )
+    }
+
+    func isPriceSensitive(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> Bool {
+        containsAny(
+            thread: thread,
+            turns: turns,
+            terms: ["cheap", "cheaper", "budget", "price", "cost", "quote", "discount"]
+        )
+    }
+
+    func hasLowTrustSignals(thread: ExchangeThread) -> Bool {
+        if let path = thread.selectedPath {
+            if path.introductionRequired { return true }
+            if path.accessMode == .introOnly { return true }
+            if path.trustSatisfied == false { return true }
+        }
+
+        return false
+    }
+
+    func containsAny(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        terms: [String]
+    ) -> Bool {
+        let blob = (
+            [thread.title, thread.visibleSummary, thread.interpretation?.userSummary, thread.interpretation?.userNextStep]
+                .compactMap { $0 }
+            +
+            turns.flatMap { [$0.summary, $0.detail ?? ""] }
+        )
+        .joined(separator: " ")
+        .lowercased()
+
+        return terms.contains { term in
+            containsTerm(blob: blob, term: term)
+        }
+    }
+
+    private func containsTerm(blob: String, term: String) -> Bool {
+        let needle = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return false }
+
+        // Keep phrase semantics for multi-token terms, but enforce whole-word matching
+        // for single tokens to avoid false positives like "sign" in "listing".
+        if needle.contains(where: { $0.isWhitespace }) {
+            return blob.contains(needle)
+        }
+
+        let escaped = NSRegularExpression.escapedPattern(for: needle)
+        let pattern = "(?<![a-z0-9])\(escaped)(?![a-z0-9])"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return blob.contains(needle)
+        }
+        let range = NSRange(blob.startIndex..., in: blob)
+        return regex.firstMatch(in: blob, options: [], range: range) != nil
+    }
+
+    func dedupeSecondHalfLines(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var output: [String] = []
+
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            if seen.insert(trimmed).inserted {
+                output.append(trimmed)
+            }
+        }
+
+        return output
+    }
+    
+    func loadApprovals(threadID: ExchangeThread.ID) async throws -> [ExchangeApproval] {
+        if let latest = try await store.fetchLatestApproval(threadID: threadID) {
+            return [latest]
+        }
+        return []
+    }
+
+    func currentRequestText(
+        for thread: ExchangeThread,
+        turns: [ExchangeTurn]
+    ) -> String? {
+        if let captured = capturedRequestText(from: turns) {
+            return captured
+        }
+
+        let title = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? nil : title
+    }
+
+    func currentClarificationQuestion(for thread: ExchangeThread) -> String? {
+        if case .needsClarification(let status) = thread.state {
+            let trimmed = status.question.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+
+        if let next = thread.latestFailure?.recommendedNextStep {
+            switch next {
+            case .clarify(let question):
+                let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            default:
+                break
+            }
+        }
+
+        return nil
+    }
+
+    func providerInboundNeedsFactsBeforeOutbound(
+        secondHalf: ExchangeSecondHalfUIAdapter.DisplayModel?,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> Bool {
+        guard let sh = secondHalf else { return false }
+        guard sh.status.role.caseInsensitiveCompare(ExchangeSecondHalfRole.provider.displayTitle) == .orderedSame else {
+            return false
+        }
+        if hasUserFacingRenderableOutboundDraft { return false }
+        if sh.placement == .needsInput { return true }
+        if sh.agencyPhase == .needsUserInput { return true }
+        if sh.nextMove?.needsUserInput == true { return true }
+        let raw = ExchangeSecondHalfUIAdapter.canonicalSecondHalfActionRaw(for: sh)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw == ExchangeSecondHalfAction.requestUserInput.rawValue
+    }
+
+    /// Hides “Prepared locally · waiting for approval” (and similar) when an inbound provider thread
+    /// has no outbound draft yet — including before second-half evaluation completes (`secondHalf == nil`).
+    func providerInboundShouldHideApprovalQueueDeliveryCopy(
+        thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        secondHalf: ExchangeSecondHalfUIAdapter.DisplayModel?,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> Bool {
+        guard thread.metadata["inbound_thread"] == "true" else { return false }
+        guard !hasUserFacingRenderableOutboundDraft else { return false }
+        guard latestApproval?.status == .pending else { return false }
+        if let sh = secondHalf {
+            return providerInboundNeedsFactsBeforeOutbound(
+                secondHalf: sh,
+                hasUserFacingRenderableOutboundDraft: false
+            )
+        }
+        return true
+    }
+
+    func inboxStateTitle(
+        for thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        hasUserFacingRenderableOutboundDraft: Bool,
+        inboundPreviewLine: String? = nil,
+        secondHalfDisplay: ExchangeSecondHalfUIAdapter.DisplayModel? = nil
+    ) -> String {
+        if thread.metadata["inbound_thread"] == "true",
+           secondHalfDisplay == nil,
+           let preview = inboundPreviewLine?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !preview.isEmpty {
+            return "New message"
+        }
+
+        if providerInboundNeedsFactsBeforeOutbound(
+            secondHalf: secondHalfDisplay,
+            hasUserFacingRenderableOutboundDraft: hasUserFacingRenderableOutboundDraft
+        ) {
+            return "Needs your input"
+        }
+
+        if latestApproval?.status == .pending {
+            if !hasUserFacingRenderableOutboundDraft,
+               let sh = secondHalfDisplay,
+               sh.status.role.caseInsensitiveCompare(ExchangeSecondHalfRole.provider.displayTitle) == .orderedSame {
+                return "Needs your input"
+            }
+            return "Needs approval"
+        }
+
+        switch thread.state {
+        case .drafting, .draftReady:
+            return hasUserFacingRenderableOutboundDraft ? "Draft ready" : "Drafting"
+
+        case .needsClarification:
+            return "Need detail"
+
+        case .searching:
+            return "Searching"
+
+        case .matchFound:
+            return "Ready to review"
+
+        case .matchCandidatesWeak:
+            let gradeResolution = ExchangeUmbrellaDiscoveryGradeProjection.resolve(thread: thread)
+            if let projectedTitle = ExchangeUmbrellaDiscoveryGradeProjection.inboxStateTitle(for: gradeResolution) {
+                return projectedTitle
+            }
+            return "No match yet"
+
+        case .noViableMatch:
+            return "No match yet"
+
+        case .awaitingApproval:
+            return "Needs approval"
+
+        case .sending:
+            return "Sending"
+
+        case .blockedByDeliveryFailure:
+            return "Delivery failed"
+
+        case .awaitingResponse:
+            return "Waiting for reply"
+
+        case .declined:
+            return "Declined"
+
+        case .stalled:
+            return "Stalled"
+
+        case .resolved:
+            return "Resolved"
+
+        case .blockedBySystemFailure:
+            return "System issue"
+        }
+    }
+
+    /// Short opportunity line for card subtitles — skipped when it duplicates the primary title.
+    func inboxOpportunityShortLine(
+        hydratedVisible: String?,
+        primaryCardTitle: String
+    ) -> String? {
+        guard let line = hydratedVisible?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+            return nil
+        }
+        let titleLower = primaryCardTitle.lowercased()
+        let lineLower = line.lowercased()
+        if titleLower.contains(lineLower) || lineLower.contains(titleLower) {
+            return nil
+        }
+        if line.count > 120 {
+            return String(line.prefix(117)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+        }
+        return line
+    }
+
+    func inboxSubtitle(
+        for thread: ExchangeThread,
+        latestTurn: ExchangeTurn?,
+        latestApproval: ExchangeApproval?,
+        selectedCounterparty: ExchangeCounterparty?,
+        hydratedSearchSurfaceLine: String? = nil,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> String {
+        if let summary = inboxVisibleSummary(
+            for: thread,
+            latestApproval: latestApproval,
+            selectedCounterparty: selectedCounterparty,
+            hydratedSearchSurfaceLine: hydratedSearchSurfaceLine,
+            hasUserFacingRenderableOutboundDraft: hasUserFacingRenderableOutboundDraft
+        ) {
+            return summary
+        }
+
+        return summaryEngine.inboxLine(
+            thread: thread,
+            latestTurn: latestTurn
+        )
+    }
+
+    func inboxVisibleSummary(
+        for thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        selectedCounterparty: ExchangeCounterparty?,
+        hydratedSearchSurfaceLine: String? = nil,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> String? {
+        if let hydrated = hydratedSearchSurfaceLine?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !hydrated.isEmpty {
+            switch thread.state {
+            case .searching, .matchFound:
+                return hydrated
+            default:
+                break
+            }
+        }
+
+        if let workTrace = makeWorkTraceCard(for: thread) {
+            switch workTrace.status {
+            case .running:
+                if let active = workTrace.activeStep {
+                    if let detail = active.detail, !detail.isEmpty {
+                        return "\(active.title) · \(detail)"
+                    }
+                    return active.title
+                }
+                if let headline = workTrace.headline, !headline.isEmpty {
+                    return headline
+                }
+
+            case .blocked, .completed, .idle:
+                break
+            }
+        }
+
+        if let basis = selectionBasisSummary(for: thread, selectedCounterparty: selectedCounterparty),
+           case .searching = thread.state {
+            return basis
+        }
+
+        if let basis = selectionBasisSummary(for: thread, selectedCounterparty: selectedCounterparty),
+           case .matchFound = thread.state {
+            return basis
+        }
+
+        if latestApproval?.status == .pending {
+            if let name = selectedCounterparty?.bestDisplayLine {
+                return "Draft ready for \(name)."
+            }
+            return "Draft ready."
+        }
+
+        switch thread.state {
+        case .drafting:
+            if hasUserFacingRenderableOutboundDraft {
+                if let name = selectedCounterparty?.bestDisplayLine {
+                    return "Draft for \(name) is ready locally."
+                }
+                return "Draft is ready locally."
+            }
+            return thread.visibleSummary ?? "Working on the next move."
+
+        case .draftReady:
+            if hasUserFacingRenderableOutboundDraft {
+                if let name = selectedCounterparty?.bestDisplayLine {
+                    return "Draft for \(name) is ready to review."
+                }
+                return "Draft is ready to review."
+            }
+            return thread.visibleSummary ?? "Working on the next move."
+
+        case .searching:
+            return thread.visibleSummary ?? "Looking for a good path."
+
+        case .matchFound(let status):
+            if let name = selectedCounterparty?.bestDisplayLine {
+                return "\(name) is currently the clearest path on this thread."
+            }
+            return thread.visibleSummary ?? status.summary
+
+        case .needsClarification:
+            return thread.visibleSummary ?? "Need one more detail."
+
+        case .matchCandidatesWeak:
+            return thread.visibleSummary ?? "Some candidates were found, but none look strong enough yet."
+
+        case .noViableMatch:
+            return thread.visibleSummary ?? "No viable match was found from the current search."
+
+        case .awaitingApproval:
+            return latestApproval?.summary ?? thread.visibleSummary ?? "Waiting for approval."
+
+        case .sending:
+            return thread.visibleSummary ?? "Sending now."
+
+        case .awaitingResponse:
+            return thread.visibleSummary ?? "Waiting for a reply."
+
+        case .blockedByDeliveryFailure:
+            return thread.latestFailure?.summary ?? thread.visibleSummary ?? "Delivery failed."
+
+        case .declined:
+            return thread.latestFailure?.summary ?? thread.visibleSummary ?? "This was declined."
+
+        case .stalled:
+            return thread.latestFailure?.summary ?? thread.visibleSummary ?? "This stalled."
+
+        case .resolved:
+            return thread.outcome?.summary ?? thread.visibleSummary ?? "This is done."
+
+        case .blockedBySystemFailure:
+            return thread.latestFailure?.summary ?? thread.visibleSummary ?? "A system issue blocked this."
+        }
+    }
+
+    func threadDetailSummary(
+        for thread: ExchangeThread,
+        latestTurn: ExchangeTurn?,
+        latestApproval: ExchangeApproval?,
+        selectedCounterparty: ExchangeCounterparty?,
+        hydratedSearchSurfaceLine: String? = nil,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> String {
+        if let summary = inboxVisibleSummary(
+            for: thread,
+            latestApproval: latestApproval,
+            selectedCounterparty: selectedCounterparty,
+            hydratedSearchSurfaceLine: hydratedSearchSurfaceLine,
+            hasUserFacingRenderableOutboundDraft: hasUserFacingRenderableOutboundDraft
+        ) {
+            return summary
+        }
+
+        return summaryEngine.threadSummary(
+            thread: thread,
+            latestTurn: latestTurn
+        )
+    }
+
+    func clarificationQuestionText(from turns: [ExchangeTurn]) -> String? {
+        guard let turn = turns.last(where: { $0.kind == .clarificationAsked }) else {
+            return nil
+        }
+
+        let summary = turn.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return summary.isEmpty ? nil : summary
+    }
+
+    func makeThreadTimelineItems(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        approvals: [ExchangeApproval],
+        drafts: [ExchangeMessageDraft],
+        inboxItems: [ExchangeInboxItem],
+        outboxItems: [ExchangeOutboxItem]
+    ) -> [ExchangeModels.ThreadTimelineItem] {
+        var items: [ExchangeModels.ThreadTimelineItem] = []
+        let sortedTurns = turns.sorted(by: { $0.createdAt > $1.createdAt })
+        var sourceInboxItemIDsFromTurns = Set<String>()
+        var sourceEnvelopeIDsFromTurns = Set<String>()
+
+        for turn in sortedTurns {
+            if let sourceInboxItemID = normalizedTimelineKey(turn.metadata["source_inbox_item_id"]) {
+                sourceInboxItemIDsFromTurns.insert(sourceInboxItemID)
+            }
+            if let sourceEnvelopeID = normalizedTimelineKey(turn.metadata["source_envelope_id"]) {
+                sourceEnvelopeIDsFromTurns.insert(sourceEnvelopeID)
+            }
+            if let externalReference = normalizedTimelineKey(turn.externalReference) {
+                sourceEnvelopeIDsFromTurns.insert(externalReference)
+            }
+        }
+
+        let openedSummary: String = {
+            if let captured = capturedRequestText(from: turns), !captured.isEmpty {
+                return captured
+            }
+
+            let trimmedTitle = thread.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedTitle.isEmpty {
+                return trimmedTitle
+            }
+
+            return "The secretary opened this coordination thread."
+        }()
+
+        items.append(
+            .init(
+                date: thread.createdAt,
+                title: "Thread opened",
+                summary: openedSummary,
+                tone: .active
+            )
+        )
+
+        if let rationale = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rationale.isEmpty {
+            items.append(
+                .init(
+                    date: thread.updatedAt,
+                    title: "Selection basis",
+                    summary: rationale,
+                    secondary: thread.selectedPath?.rationale,
+                    tone: .active
+                )
+            )
+        } else if let pathRationale = thread.selectedPath?.rationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !pathRationale.isEmpty {
+            items.append(
+                .init(
+                    date: thread.selectedPath?.recordedAt ?? thread.updatedAt,
+                    title: "Path basis",
+                    summary: pathRationale,
+                    secondary: thread.selectedPublicProfileID,
+                    tone: .active
+                )
+            )
+        }
+
+        if let workTrace = makeWorkTraceCard(for: thread) {
+            if let headline = workTrace.headline, !headline.isEmpty {
+                items.append(
+                    .init(
+                        date: workTrace.updatedAt,
+                        title: "Work update",
+                        summary: headline,
+                        tone: .active
+                    )
+                )
+            }
+
+            for step in workTrace.steps.sorted(by: { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.createdAt > rhs.createdAt
+            }) {
+                items.append(
+                    .init(
+                        date: step.updatedAt,
+                        title: step.title,
+                        summary: step.detail ?? step.title,
+                        tone: stepTone(for: step, traceStatus: workTrace.status)
+                    )
+                )
+            }
+        }
+
+        for approval in approvals.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            items.append(
+                .init(
+                    date: approval.updatedAt,
+                    title: "Approval \(approvalStatusTitle(approval.status))",
+                    summary: approvalTimelineSummary(approval),
+                    secondary: approval.rationale,
+                    tone: approvalTone(approval.status)
+                )
+            )
+        }
+
+        for draft in drafts.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+            items.append(
+                .init(
+                    date: draft.updatedAt,
+                    title: "Draft prepared",
+                    summary: draft.subject?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                        ? draft.subject!
+                        : "A draft was prepared on this thread.",
+                    secondary: trimmedTimelinePreview(draft.body),
+                    tone: .warning
+                )
+            )
+        }
+
+        if let failure = thread.latestFailure {
+            items.append(
+                .init(
+                    date: thread.updatedAt,
+                    title: "Failure surfaced",
+                    summary: failure.whatHappened,
+                    secondary: failure.recommendedNextStep.summaryLine,
+                    tone: .blocked
+                )
+            )
+        }
+
+        if let delivery = thread.delivery {
+            items.append(
+                .init(
+                    date: thread.updatedAt,
+                    title: "Delivery state: \(threadDeliveryStatusTitle(delivery.status))",
+                    summary: threadDeliverySummary(delivery.status),
+                    secondary: delivery.note,
+                    tone: threadDeliveryTone(delivery.status)
+                )
+            )
+        }
+
+        for turn in sortedTurns {
+            let summary = turn.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = turn.detail?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let primaryText = (detail?.isEmpty == false ? detail : summary).flatMap(\.nilIfBlank)
+
+            guard let primaryText else { continue }
+
+            let title: String
+            switch (turn.kind, turn.actor) {
+            case (.replyReceived, .counterparty):
+                title = "Inbound message"
+            case (.clarificationAnswered, .counterparty):
+                title = "Counterparty clarification"
+            default:
+                title = timelineTurnTitle(for: turn)
+            }
+
+            items.append(
+                .init(
+                    date: turn.createdAt,
+                    title: title,
+                    summary: primaryText,
+                    secondary: timelineTurnSecondary(for: turn),
+                    tone: timelineTurnTone(for: turn)
+                )
+            )
+        }
+
+        for inbox in inboxItems.sorted(by: { $0.receivedAt > $1.receivedAt }) {
+            let inboxID = normalizedTimelineKey(inbox.id.uuidString)
+            let inboxEnvelopeID = normalizedTimelineKey(inbox.envelopeID)
+            if let inboxID, sourceInboxItemIDsFromTurns.contains(inboxID) {
+                continue
+            }
+            if let inboxEnvelopeID, sourceEnvelopeIDsFromTurns.contains(inboxEnvelopeID) {
+                continue
+            }
+
+            let inboxBodyPreview = inbox.metadata["body_preview"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let inboxVisible = inbox.visibleSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+            let inboxSubject = inbox.metadata["subject_preview"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            items.append(
+                .init(
+                    date: inbox.receivedAt,
+                    title: "Inbound activity",
+                    summary: firstNonBlank(
+                        inboxBodyPreview,
+                        inboxVisible,
+                        inboxSubject
+                    ) ?? "A reply or inbound update was received on this thread.",
+                    secondary: firstNonBlank(
+                        inbox.senderDisplayName,
+                        inboxSubject
+                    ),
+                    tone: .success
+                )
+            )
+        }
+
+        for outbox in outboxItems.sorted(by: { $0.createdAt > $1.createdAt }) {
+            items.append(
+                .init(
+                    date: outbox.createdAt,
+                    title: "Outbound activity",
+                    summary: outbox.payloadSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "An outbound update was prepared or sent from this thread."
+                        : outbox.payloadSummary,
+                    secondary: outbox.deliveryState.note,
+                    tone: deliveryPhaseTone(outbox.deliveryState.phase)
+                )
+            )
+        }
+
+        return items.sorted(by: { $0.date > $1.date })
+    }
+
+    func normalizedTimelineKey(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func timelineTurnTitle(for turn: ExchangeTurn) -> String {
+        switch turn.kind {
+        case .requestCaptured:
+            return "Request captured"
+        case .clarificationAsked:
+            return "Clarification requested"
+        case .clarificationAnswered:
+            return "Clarification answered"
+        case .searchStarted:
+            return "Search started"
+        case .searchCompleted:
+            return "Search completed"
+        case .weakMatchesObserved:
+            return "Weak matches"
+        case .noViableMatchObserved:
+            return "No viable match"
+        case .candidateSelected:
+            return "Candidate selected"
+        case .draftPrepared:
+            return "Draft prepared"
+        case .approvalRequested:
+            return "Approval requested"
+        case .approvalGranted:
+            return "Approval granted"
+        case .approvalRejected:
+            return "Approval rejected"
+        case .approvalExpired:
+            return "Approval expired"
+        case .sendAttempted:
+            return "Send attempted"
+        case .sendConfirmed:
+            return "Send confirmed"
+        case .deliveryFailed:
+            return "Delivery failed"
+        case .replyReceived:
+            return "Reply received"
+        case .followUpSuggested:
+            return "Follow-up suggested"
+        case .threadStalled:
+            return "Thread stalled"
+        case .threadDeclined:
+            return "Thread declined"
+        case .threadResolved:
+            return "Thread resolved"
+        case .negotiationAdvanced:
+            return "Negotiation advanced"
+        case .negotiationFailed:
+            return "Negotiation failed"
+        case .systemNotice:
+            return "System notice"
+        case .systemError:
+            return "System error"
+        }
+    }
+
+    func timelineTurnSecondary(for turn: ExchangeTurn) -> String? {
+        if let reference = turn.externalReference?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !reference.isEmpty {
+            return "Envelope \(reference)"
+        }
+
+        if let sender = turn.metadata["source_sender_node_id"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sender.isEmpty {
+            return sender
+        }
+
+        return nil
+    }
+
+    func timelineTurnTone(for turn: ExchangeTurn) -> ExchangeModels.ThreadTimelineItem.Tone {
+        switch turn.kind {
+        case .deliveryFailed, .threadDeclined, .threadStalled, .negotiationFailed, .systemError:
+            return .blocked
+        case .approvalRequested, .draftPrepared, .sendAttempted:
+            return .warning
+        case .sendConfirmed, .replyReceived, .approvalGranted, .threadResolved:
+            return .success
+        default:
+            return .active
+        }
+    }
+
+    func approvalStatusTitle(_ status: ExchangeApproval.Status) -> String {
+        switch status {
+        case .pending: return "Pending"
+        case .approved: return "Approved"
+        case .rejected: return "Rejected"
+        case .expired: return "Expired"
+        case .cancelled: return "Cancelled"
+        @unknown default:
+            return String(describing: status).capitalized
+        }
+    }
+
+    func approvalTimelineSummary(_ approval: ExchangeApproval) -> String {
+        switch approval.status {
+        case .pending:
+            return "Waiting for your go-ahead."
+        case .approved:
+            return "You approved it and the thread could move forward."
+        case .rejected:
+            return "You stopped the outward move."
+        case .expired:
+            return "The review window expired."
+        case .cancelled:
+            return "The review was cancelled."
+        @unknown default:
+            return "The review state changed."
+        }
+    }
+
+    func approvalTone(_ status: ExchangeApproval.Status) -> ExchangeModels.ThreadTimelineItem.Tone {
+        switch status {
+        case .approved:
+            return .success
+        case .rejected, .expired, .cancelled:
+            return .blocked
+        case .pending:
+            return .warning
+        @unknown default:
+            return .neutral
+        }
+    }
+
+    func threadDeliveryStatusTitle(_ status: ExchangeThread.DeliverySnapshot.Status) -> String {
+        switch status {
+        case .notStarted: return "Not started"
+        case .pendingApproval: return "Pending approval"
+        case .readyToSend: return "Ready to send"
+        case .sending: return "Sending"
+        case .sent: return "Sent"
+        case .failed: return "Failed"
+        @unknown default:
+            return "Updated"
+        }
+    }
+
+    func threadDeliverySummary(_ status: ExchangeThread.DeliverySnapshot.Status) -> String {
+        switch status {
+        case .notStarted:
+            return "Nothing has gone out yet."
+        case .pendingApproval:
+            return "The move exists, but it is still waiting for approval."
+        case .readyToSend:
+            return "The move is prepared and ready."
+        case .sending:
+            return "The move is going out now."
+        case .sent:
+            return "The move went out successfully."
+        case .failed:
+            return "The move was attempted but failed."
+        @unknown default:
+            return "The delivery state changed."
+        }
+    }
+
+    func threadDeliveryTone(_ status: ExchangeThread.DeliverySnapshot.Status) -> ExchangeModels.ThreadTimelineItem.Tone {
+        switch status {
+        case .sent:
+            return .success
+        case .failed:
+            return .blocked
+        case .sending, .readyToSend, .pendingApproval:
+            return .warning
+        case .notStarted:
+            return .neutral
+        @unknown default:
+            return .neutral
+        }
+    }
+
+    func deliveryPhaseTone(_ phase: ExchangeDeliveryState.Phase) -> ExchangeModels.ThreadTimelineItem.Tone {
+        switch phase {
+        case .acknowledged, .sent:
+            return .success
+        case .failed, .tooLateToCancel, .incompatible:
+            return .blocked
+        case .sending, .queued, .blockedByPrerequisite, .deferred:
+            return .warning
+        case .cancelledBeforeSend:
+            return .neutral
+        @unknown default:
+            return .neutral
+        }
+    }
+
+    func stepTone(
+        for step: ExchangeModels.WorkTraceCard.Step,
+        traceStatus: ExchangeModels.WorkTraceCard.Status
+    ) -> ExchangeModels.ThreadTimelineItem.Tone {
+        if traceStatus == .blocked && step.isActive {
+            return .blocked
+        }
+
+        if step.isActive || step.isComplete {
+            return .active
+        }
+
+        return .neutral
+    }
+
+    func trimmedTimelinePreview(_ body: String) -> String? {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count > 120 ? String(trimmed.prefix(120)) + "…" : trimmed
+    }
+
+    func loadSelectedCounterparty(
+        for thread: ExchangeThread
+    ) async throws -> ExchangeCounterparty? {
+        guard let selectedID = thread.selectedCounterpartyID else { return nil }
+        return try await store.fetchCounterparty(id: selectedID)
+    }
+
+    /// Resolves Trust-tab / inbox linking id from the selected public profile only (no metadata heuristics).
+    private func trustLinkingCounterpartyIDFromPublicProfile(
+        profileID: ExchangePublicNodeProfile.ID
+    ) async throws -> String? {
+        guard let profile = try await store.fetchPublicProfile(id: profileID) else { return nil }
+        if let cp = profile.counterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return cp
+        }
+        return profile.nodeID.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+    }
+
+    /// Inbox projection: durable `thread.selectedCounterpartyID` if set; else profile `counterpartyID` or `nodeID` (cached per profile id).
+    private func projectedInboxTrustLinkingCounterpartyID(
+        thread: ExchangeThread,
+        profileLinkHits: inout [String: String],
+        profileLinkMissesNoResolution: inout Set<String>
+    ) async throws -> String? {
+        if let id = thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return id
+        }
+        guard let profileID = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+            return nil
+        }
+        if let cached = profileLinkHits[profileID] {
+            return cached
+        }
+        if profileLinkMissesNoResolution.contains(profileID) {
+            return nil
+        }
+        let resolved = try await trustLinkingCounterpartyIDFromPublicProfile(profileID: profileID)
+        if let resolved {
+            profileLinkHits[profileID] = resolved
+        } else {
+            profileLinkMissesNoResolution.insert(profileID)
+        }
+        return resolved
+    }
+
+    /// Same linking rule as inbox projection, without cross-thread caching (single-thread send guard).
+    private func resolveThreadTrustLinkingCounterpartyID(thread: ExchangeThread) async throws -> String? {
+        if let id = thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return id
+        }
+        guard let profileID = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank else {
+            return nil
+        }
+        return try await trustLinkingCounterpartyIDFromPublicProfile(profileID: profileID)
+    }
+
+    func matchContainsSelectedOfferID(_ match: ExchangeMatch, selectedOfferID: String) -> Bool {
+        let trimmed = selectedOfferID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if let oid = matchOfferID(match), oid == trimmed { return true }
+        return match.matchedOfferIDs.contains(trimmed)
+    }
+
+    /// When discovery produced **match candidates weak** but the coordination row has not yet
+    /// persisted routing IDs, copy the preferred match’s offer/profile/counterparty surfaces onto
+    /// the thread so second-half outbound drafting and ``ExchangeOutboundRecipientAnchor`` agree.
+    ///
+    /// - Does **not** run for ``ExchangeState/noViableMatch`` or when an anchor already exists.
+    /// - Does not override non-empty selected offer/profile/counterparty fields.
+    private func persistWeakMatchRecipientAnchorIfNeeded(
+        thread: ExchangeThread,
+        matches: [ExchangeMatch],
+        selectedCounterparty: ExchangeCounterparty?
+    ) async throws {
+        guard case .matchCandidatesWeak = thread.state else { return }
+        guard !matches.isEmpty else { return }
+        guard !ExchangeOutboundRecipientAnchor.hasRecipientSurface(for: thread) else { return }
+
+        guard let best = preferredMatch(
+            for: thread,
+            matches: matches,
+            selectedCounterparty: selectedCounterparty
+        ) else { return }
+
+        var updated = thread
+        var didChange = false
+
+        if updated.selectedOfferID == nil,
+           let oid = matchOfferID(best)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            updated.selectedOfferID = oid
+            didChange = true
+        }
+
+        if updated.selectedPublicProfileID == nil,
+           let pid = matchPublicProfileID(best)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            updated.selectedPublicProfileID = pid
+            didChange = true
+        }
+
+        if updated.selectedCounterpartyID == nil {
+            let trimmedCP = best.counterpartyID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedCP.isEmpty {
+                updated.selectedCounterpartyID = trimmedCP
+                didChange = true
+            }
+        }
+
+        guard didChange else { return }
+        try await store.updateThread(updated)
+    }
+
+    func preferredMatch(
+        for thread: ExchangeThread,
+        matches: [ExchangeMatch],
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> ExchangeMatch? {
+        if let anchorOfferID = ExchangeCanonicalSelectionResolution.resolveOfferID(
+            anchors: ExchangeCanonicalSelectionResolution.anchors(from: thread, allowChildCoordinationAnchor: false),
+            thread: thread,
+            matches: matches,
+            location: "ExchangeFacade.preferredMatch"
+        ),
+           let selected = matches.first(where: { matchContainsSelectedOfferID($0, selectedOfferID: anchorOfferID) }) {
+            return selected
+        }
+
+        if let selectedPublicProfileID = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !selectedPublicProfileID.isEmpty,
+           let selected = matches.first(where: { matchPublicProfileID($0) == selectedPublicProfileID }) {
+            return selected
+        }
+
+        if let selectedID = selectedCounterparty?.id,
+           let selected = matches.first(where: { $0.counterpartyID == selectedID }) {
+            return selected
+        }
+
+        if let selectedID = thread.selectedCounterpartyID,
+           let selected = matches.first(where: { $0.counterpartyID == selectedID }) {
+            return selected
+        }
+
+        return matches.first
+    }
+
+    /// Human-facing opportunity lines for inbox / thread summary when discovery selected an offer or profile.
+    private struct OpportunityHydrationLines: Sendable {
+        var hydratedVisibleLine: String?
+        var hydratedMatchSummary: String?
+        var anchor: ExchangeOpportunitySurfaceAnchor
+        var resolvedTitle: String?
+    }
+
+    private func hydrateOpportunitySurfaceLines(
+        thread: ExchangeThread,
+        bestMatch: ExchangeMatch?,
+        selectedCounterparty: ExchangeCounterparty?
+    ) async -> OpportunityHydrationLines {
+        let anchorOfferID = thread.canonicalCommercialOfferAnchor
+        let anchor = thread.intent.resolvedOpportunitySurfaceAnchor(
+            selectedOfferID: anchorOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID,
+            selectedCounterpartyID: thread.selectedCounterpartyID
+        )
+
+        func composeOfferLines(_ offer: ExchangeOffer) -> (String, String) {
+            let title = offer.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            var parts: [String] = []
+            if let s = offer.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                parts.append(s)
+            }
+            if let c = offer.category?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+                parts.append(c)
+            }
+            if !offer.regionTags.isEmpty {
+                parts.append(offer.regionTags.joined(separator: ", "))
+            }
+            var fulfill: [String] = []
+            if offer.fulfillment.remoteFriendly { fulfill.append("remote-friendly") }
+            let pm = offer.fulfillment.pricingMode.rawValue.replacingOccurrences(of: "_", with: " ")
+            fulfill.append(pm)
+            if let note = offer.fulfillment.leadTimeNote?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !note.isEmpty {
+                fulfill.append(note)
+            }
+            if !fulfill.isEmpty {
+                parts.append(fulfill.joined(separator: " · "))
+            }
+            let subtitle = parts.joined(separator: " · ")
+            let visible = subtitle.isEmpty ? title : "\(title) — \(subtitle)"
+            let summary = "Selected offer: \(title)\(subtitle.isEmpty ? "" : " — \(subtitle)")"
+            return (visible, summary)
+        }
+
+        func composeProfileLines(_ profile: ExchangePublicNodeProfile) -> (String, String) {
+            let title = profile.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                ?? profile.headline?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                ?? "Public profile"
+            var parts: [String] = []
+            if let s = profile.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                parts.append(s)
+            }
+            if !profile.regionTags.isEmpty {
+                parts.append(profile.regionTags.joined(separator: ", "))
+            }
+            if !profile.openTo.isEmpty {
+                parts.append("Open to: " + profile.openTo.prefix(4).joined(separator: ", "))
+            }
+            if !profile.interests.isEmpty {
+                parts.append("Interests: " + profile.interests.prefix(4).joined(separator: ", "))
+            }
+            let subtitle = parts.joined(separator: " · ")
+            let visible = subtitle.isEmpty ? title : "\(title) — \(subtitle)"
+            let summary = "Selected public surface: \(title)\(subtitle.isEmpty ? "" : " — \(subtitle)")"
+            return (visible, summary)
+        }
+
+        var visible: String?
+        var matchSummary: String?
+        var resolvedTitle: String?
+
+        let strictLead = ExchangePresentationSurfaceLead.resolve(
+            selectedOfferID: anchorOfferID,
+            selectedPublicProfileID: thread.selectedPublicProfileID
+        )
+
+        enum OpportunityHydrationBranch {
+            case offer
+            case profile
+            case anchored
+        }
+
+        let hydrationBranch: OpportunityHydrationBranch = {
+            switch strictLead {
+            case .offerLed:
+                return .offer
+            case .profileLed:
+                return .profile
+            case .ambiguous:
+                switch anchor {
+                case .offerSurface: return .offer
+                case .profileSurface: return .profile
+                case .counterpartyNode: return .anchored
+                }
+            }
+        }()
+
+        switch hydrationBranch {
+        case .offer:
+            if let oid = anchorOfferID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !oid.isEmpty,
+               let offer = try? await store.fetchOffer(id: oid) {
+                let pair = composeOfferLines(offer)
+                visible = pair.0
+                matchSummary = pair.1
+                resolvedTitle = offer.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let m = bestMatch, let t = matchOfferTitle(m), !t.isEmpty {
+                let sub = [
+                    matchOfferSummary(m),
+                    matchOfferCategory(m),
+                    matchOfferTags(m),
+                    matchOfferRegions(m)
+                ].compactMap { $0 }.joined(separator: " · ")
+                resolvedTitle = t
+                visible = sub.isEmpty ? t : "\(t) — \(sub)"
+                matchSummary = "Selected offer: \(t)\(sub.isEmpty ? "" : " — \(sub)")"
+            }
+
+        case .profile:
+            if let pid = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !pid.isEmpty,
+               let profile = try? await store.fetchPublicProfile(id: pid) {
+                let pair = composeProfileLines(profile)
+                visible = pair.0
+                matchSummary = pair.1
+                resolvedTitle = profile.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                    ?? profile.headline?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            } else if let cp = selectedCounterparty,
+                      let p = cp.publicProfile,
+                      let tid = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !tid.isEmpty,
+                      p.id == tid {
+                let pair = composeProfileLines(p)
+                visible = pair.0
+                matchSummary = pair.1
+                resolvedTitle = p.displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                    ?? p.headline?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+            } else if let m = bestMatch,
+                      let t = matchPublicProfileName(m) ?? matchPublicProfileHeadline(m),
+                      !t.isEmpty {
+                let sub = [
+                    matchPublicProfileSummary(m),
+                    m.metadata["public_profile_regions"],
+                    m.metadata["public_profile_open_to"]
+                ].compactMap { $0 }.joined(separator: " · ")
+                resolvedTitle = t
+                visible = sub.isEmpty ? t : "\(t) — \(sub)"
+                matchSummary = "Selected public surface: \(t)\(sub.isEmpty ? "" : " — \(sub)")"
+            }
+
+        case .anchored:
+            break
+        }
+
+        #if DEBUG
+        let surfaceLabel: String = {
+            switch anchor {
+            case .offerSurface: return "offer"
+            case .profileSurface: return "profile"
+            case .counterpartyNode: return "fallback"
+            }
+        }()
+        if ExchangeDebugProjectionLogDedupe.shouldLogOpportunityDisplay(
+            threadID: thread.id.uuidString,
+            selectedOfferID: anchorOfferID,
+            resolvedSurface: surfaceLabel,
+            title: resolvedTitle
+        ) {
+            exchFacadeLog(
+                "[OpportunityDisplay] thread=\(thread.id.uuidString) " +
+                    "queryClass=\(thread.intent.queryIntentClass.rawValue) " +
+                    "surfacePref=\(thread.intent.surfacePreference.rawValue) " +
+                    "selectedCounterpartyID=\(thread.selectedCounterpartyID ?? "nil") " +
+                    "selectedProfileID=\(thread.selectedPublicProfileID ?? "nil") " +
+                    "selectedOfferID=\(anchorOfferID ?? "nil") " +
+                    "resolvedSurface=\(surfaceLabel) " +
+                    "title=\(resolvedTitle ?? "nil")"
+            )
+        }
+        #endif
+
+        return OpportunityHydrationLines(
+            hydratedVisibleLine: visible,
+            hydratedMatchSummary: matchSummary,
+            anchor: anchor,
+            resolvedTitle: resolvedTitle
+        )
+    }
+
+    func isAwaitingReply(_ state: ExchangeState) -> Bool {
+        if case .awaitingResponse = state {
+            return true
+        }
+        return false
+    }
+
+    func capturedRequestText(from turns: [ExchangeTurn]) -> String? {
+        ExchangeThreadCardTitleProjection.requestCapturedText(from: turns)
+    }
+
+    /// Latest counterparty reply text for inbound card subtitles (turn-backed).
+    func latestInboundRequesterPreview(from turns: [ExchangeTurn]) -> String? {
+        let replies = turns.filter { $0.kind == .replyReceived }
+        guard let last = replies.max(by: { $0.createdAt < $1.createdAt }) else { return nil }
+        if let detail = last.detail?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            return String(detail.prefix(220))
+        }
+        let summary = last.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else { return nil }
+        return String(summary.prefix(220))
+    }
+
+    /// Display-safe sender label for “New message from …” (avoid raw node identifiers).
+    func inboundSenderDisplayLabel(counterparty: ExchangeCounterparty?) -> String? {
+        guard let cp = counterparty else { return nil }
+        let raw = counterpartyPublicSurfaceHeadline(cp) ?? cp.bestDisplayLine
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        if ExchangeThreadCardTitleProjection.shouldRejectTitleCandidate(t) { return nil }
+        let lower = t.lowercased()
+        if lower.hasPrefix("node-") { return nil }
+        return t
+    }
+
+    func deliveryStatusText(
+        for thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        hasUserFacingRenderableOutboundDraft: Bool,
+        secondHalfDisplay: ExchangeSecondHalfUIAdapter.DisplayModel? = nil
+    ) -> String? {
+        if providerInboundShouldHideApprovalQueueDeliveryCopy(
+            thread: thread,
+            latestApproval: latestApproval,
+            secondHalf: secondHalfDisplay,
+            hasUserFacingRenderableOutboundDraft: hasUserFacingRenderableOutboundDraft
+        ) {
+            return nil
+        }
+
+        guard let delivery = thread.delivery else {
+            if latestApproval?.status == .pending {
+                return "Prepared locally · waiting for approval"
+            }
+            if hasUserFacingRenderableOutboundDraft, case .drafting = thread.state {
+                return "Prepared locally · nothing sent"
+            }
+            return nil
+        }
+
+        switch delivery.status {
+        case .notStarted:
+            if hasUserFacingRenderableOutboundDraft, case .drafting = thread.state {
+                return "Prepared locally · nothing sent"
+            }
+            return "No external action yet"
+        case .pendingApproval:
+            return "Waiting for approval before send"
+        case .readyToSend:
+            if latestApproval?.status == .pending {
+                return "Prepared locally · waiting for approval"
+            }
+            return "Ready to send"
+        case .sending:
+            return "Sending now"
+        case .sent:
+            if let date = delivery.lastConfirmedSendAt {
+                return "Sent \(relativeTimestamp(from: date))"
+            }
+            return "Sent"
+        case .failed:
+            return "Delivery failed"
+        @unknown default:
+            return "Delivery updated"
+        }
+    }
+
+    func outcomeStatusText(for thread: ExchangeThread) -> String? {
+        if case .matchFound = thread.state {
+            return "Found path"
+        }
+
+        guard let outcome = thread.outcome else { return nil }
+
+        switch outcome.status {
+        case .noViableMatch:
+            switch thread.state {
+            case .matchCandidatesWeak:
+                return "Weak search results"
+
+            case .noViableMatch:
+                return "No match found"
+
+            case .matchFound:
+                return "Found path"
+
+            default:
+                return "Search result updated"
+            }
+
+        case .declined:
+            return "Declined"
+
+        case .stalled:
+            return "Stalled"
+
+        case .resolved:
+            return "Resolved"
+
+        case .failedLegibly:
+            return "Failed clearly"
+
+        @unknown default:
+            return "Outcome updated"
+        }
+    }
+
+    func trustPathSummary(
+        for thread: ExchangeThread,
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> String? {
+        if let rationale = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rationale.isEmpty {
+            return rationale
+        }
+
+        if let path = thread.selectedPath {
+            if let rationale = path.rationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rationale.isEmpty {
+                return rationale
+            }
+
+            switch path.status {
+            case .selected:
+                switch path.accessMode {
+                case .introOnly:
+                    return "Selected through an introduction-qualified path."
+                case .direct, .open:
+                    return "Selected through a direct path."
+                case .closed:
+                    return "Selected path later became closed."
+                case .unknown:
+                    return "A path was selected."
+                }
+            case .candidate:
+                return "A candidate path is being evaluated."
+            case .blocked:
+                return "The selected path is blocked."
+            case .unavailable:
+                return "The selected path is unavailable."
+            }
+        }
+
+        guard let selectedCounterparty else { return nil }
+
+        let headline = counterpartyPublicSurfaceHeadline(selectedCounterparty)
+            ?? selectedCounterparty.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if thread.candidateCounterpartyIDs.count > 1 {
+            return "\(thread.candidateCounterpartyIDs.count) options considered · chose \(headline)"
+        }
+
+        return "Chosen path: \(headline)"
+    }
+
+    func matchOfferTitle(_ match: ExchangeMatch) -> String? {
+        match.metadata["selected_offer_title"]?.nilIfBlank
+    }
+
+    /// User-facing headline for a persisted discovery match (offer, profile, or counterparty).
+    func matchDisplayHeadline(_ match: ExchangeMatch) -> String? {
+        matchOfferTitle(match)
+            ?? matchPublicProfileName(match)
+            ?? matchPublicProfileHeadline(match)
+            ?? match.metadata["counterparty_name"]?.nilIfBlank
+    }
+
+    /// Alternate ranked headlines for list/dashboard discovery review copy (excludes selected anchor).
+    func alternateCandidateHeadlinesForListProjection(
+        matches: [ExchangeMatch],
+        thread: ExchangeThread,
+        limit: Int = 3
+    ) -> [String] {
+        guard thread.candidateCounterpartyIDs.count > 1 else { return [] }
+
+        let ranked = matches
+            .filter { $0.status != .rejected && $0.status != .archived }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                if lhs.strength != rhs.strength {
+                    return strengthRank(lhs.strength) > strengthRank(rhs.strength)
+                }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+
+        var headlines: [String] = []
+        var seen = Set<String>()
+
+        for match in ranked {
+            guard let raw = matchDisplayHeadline(match)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { continue }
+
+            let lower = raw.lowercased()
+            if seen.contains(lower) { continue }
+            if isSelectedDiscoveryMatch(match, thread: thread) { continue }
+
+            seen.insert(lower)
+            headlines.append(raw)
+            if headlines.count >= max(1, limit) { break }
+        }
+
+        return headlines
+    }
+
+    private func strengthRank(_ strength: ExchangeMatch.Strength) -> Int {
+        switch strength {
+        case .strong: return 3
+        case .moderate: return 2
+        case .weak: return 1
+        }
+    }
+
+    private func isSelectedDiscoveryMatch(_ match: ExchangeMatch, thread: ExchangeThread) -> Bool {
+        if let selectedOfferID = thread.selectedOfferID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            if matchContainsSelectedOfferID(match, selectedOfferID: selectedOfferID) { return true }
+        }
+        if let selectedProfileID = thread.selectedPublicProfileID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            if matchPublicProfileID(match) == selectedProfileID { return true }
+        }
+        if let selectedCounterpartyID = thread.selectedCounterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank {
+            if match.counterpartyID == selectedCounterpartyID { return true }
+        }
+        return false
+    }
+
+    func matchOfferSummary(_ match: ExchangeMatch) -> String? {
+        match.metadata["selected_offer_summary"]?.nilIfBlank
+    }
+
+    func matchOfferCategory(_ match: ExchangeMatch) -> String? {
+        match.metadata["selected_offer_category"]?.nilIfBlank
+    }
+
+    /// Comma-joined tags from `ExchangeFitEngine.makeMatchMetadata` (`putList("selected_offer_tags", …)`).
+    func matchOfferTags(_ match: ExchangeMatch) -> String? {
+        match.metadata["selected_offer_tags"]?.nilIfBlank
+    }
+
+    /// Comma-joined region tags from `ExchangeFitEngine.makeMatchMetadata` (`putList("selected_offer_regions", …)`).
+    func matchOfferRegions(_ match: ExchangeMatch) -> String? {
+        match.metadata["selected_offer_regions"]?.nilIfBlank
+    }
+
+    func matchPublicProfileName(_ match: ExchangeMatch) -> String? {
+        match.metadata["public_profile_display_name"]?.nilIfBlank
+    }
+
+    func matchPublicProfileHeadline(_ match: ExchangeMatch) -> String? {
+        match.metadata["public_profile_headline"]?.nilIfBlank
+    }
+
+    func matchPublicProfileSummary(_ match: ExchangeMatch) -> String? {
+        match.metadata["public_profile_summary"]?.nilIfBlank
+    }
+
+    func matchOfferID(_ match: ExchangeMatch) -> String? {
+        match.offerID?.nilIfBlank ?? match.metadata["selected_offer_id"]?.nilIfBlank
+    }
+
+    func matchPublicProfileID(_ match: ExchangeMatch) -> String? {
+        match.publicProfileID?.nilIfBlank ?? match.metadata["public_profile_id"]?.nilIfBlank
+    }
+
+    func selectedMatchSummary(
+        for thread: ExchangeThread,
+        bestMatch: ExchangeMatch?,
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> String? {
+        guard selectedCounterparty != nil || bestMatch != nil || thread.selectedPath != nil else { return nil }
+
+        if case .noViableMatch = thread.state { return nil }
+        if case .matchCandidatesWeak = thread.state { return nil }
+        if case .needsClarification = thread.state { return nil }
+        if case .blockedByDeliveryFailure = thread.state { return nil }
+        if case .declined = thread.state { return nil }
+        if case .stalled = thread.state { return nil }
+        if case .blockedBySystemFailure = thread.state { return nil }
+
+        if let bestMatch {
+            if let offerTitle = matchOfferTitle(bestMatch) {
+                if let offerSummary = matchOfferSummary(bestMatch) {
+                    return "Selected offer: \(offerTitle) — \(offerSummary)"
+                }
+                return "Selected offer: \(offerTitle)"
+            }
+
+            if let profileName = matchPublicProfileName(bestMatch) {
+                if let headline = matchPublicProfileHeadline(bestMatch) {
+                    return "Selected public surface: \(profileName) — \(headline)"
+                }
+                if let profileSummary = matchPublicProfileSummary(bestMatch) {
+                    return "Selected public surface: \(profileName) — \(profileSummary)"
+                }
+                return "Selected public surface: \(profileName)"
+            }
+        }
+
+        if let summary = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            return summary
+        }
+
+        if case .matchFound(let status) = thread.state {
+            return status.summary
+        }
+
+        if let pathSummary = thread.selectedPath?.rationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !pathSummary.isEmpty {
+            return pathSummary
+        }
+
+        if let summary = thread.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            return summary
+        }
+
+        if let summary = thread.visibleSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            return summary
+        }
+
+        if let selectedCounterparty {
+            let headline = counterpartyPublicSurfaceHeadline(selectedCounterparty)
+                ?? selectedCounterparty.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !headline.isEmpty else {
+                return "A likely match was found."
+            }
+            return "Selected path through \(headline)."
+        }
+
+        return "A likely match was found."
+    }
+
+    func selectedMatchWhy(
+        for thread: ExchangeThread,
+        bestMatch: ExchangeMatch?,
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> String? {
+        guard selectedCounterparty != nil || bestMatch != nil || thread.selectedPath != nil else { return nil }
+
+        if case .noViableMatch = thread.state { return nil }
+        if case .matchCandidatesWeak = thread.state { return nil }
+        if case .needsClarification = thread.state { return nil }
+        if case .blockedByDeliveryFailure = thread.state { return nil }
+        if case .declined = thread.state { return nil }
+        if case .stalled = thread.state { return nil }
+        if case .blockedBySystemFailure = thread.state { return nil }
+
+        var parts: [String] = []
+
+        if let bestMatch {
+            if let offerTitle = matchOfferTitle(bestMatch) {
+                parts.append("offer: \(offerTitle)")
+            }
+
+            if let offerSummary = matchOfferSummary(bestMatch) {
+                parts.append(offerSummary)
+            }
+
+            if let offerCategory = matchOfferCategory(bestMatch) {
+                parts.append("category: \(offerCategory)")
+            }
+
+            if let profileName = matchPublicProfileName(bestMatch) {
+                parts.append("surface: \(profileName)")
+            }
+
+            if let headline = matchPublicProfileHeadline(bestMatch) {
+                parts.append(headline)
+            }
+
+            if let firstReason = bestMatch.reasons.first?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !firstReason.isEmpty {
+                parts.append(firstReason)
+            }
+
+            if bestMatch.hasMeaningfulCautions,
+               let firstCaution = bestMatch.cautions.first?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !firstCaution.isEmpty {
+                parts.append("caution: \(firstCaution)")
+            }
+        }
+
+        if case .matchFound(let status) = thread.state {
+            if let nextStep = status.nextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !nextStep.isEmpty {
+                parts.append(nextStep)
+            }
+        }
+
+        if let path = thread.selectedPath {
+            switch path.accessMode {
+            case .introOnly:
+                parts.append("introduction-qualified path")
+            case .direct:
+                parts.append("direct contact allowed")
+            case .open:
+                parts.append("open route")
+            case .closed:
+                parts.append("path closed")
+            case .unknown:
+                break
+            }
+
+            if path.introductionRequired {
+                parts.append("introduction required")
+            }
+
+            if let minimumTrustLabel = path.minimumTrustLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !minimumTrustLabel.isEmpty {
+                parts.append("minimum trust: \(minimumTrustLabel)")
+            }
+
+            if let trustSatisfied = path.trustSatisfied {
+                parts.append(trustSatisfied ? "trust satisfied" : "trust not yet satisfied")
+            }
+
+            if let matchedRouteKind = path.matchedRouteKind?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !matchedRouteKind.isEmpty {
+                parts.append("route: \(matchedRouteKind)")
+            }
+        }
+
+        if let rationale = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rationale.isEmpty,
+           !parts.contains(rationale) {
+            parts.append(rationale)
+        }
+
+        if parts.isEmpty,
+           let trust = trustPathSummary(for: thread, selectedCounterparty: selectedCounterparty),
+           !trust.isEmpty {
+            parts.append(trust)
+        }
+
+        if parts.isEmpty,
+           let selectedCounterparty {
+            parts.append("chosen path: \(selectedCounterparty.bestDisplayLine)")
+        }
+
+        let cleaned = dedupeSecondHalfLines(parts)
+        guard !cleaned.isEmpty else { return nil }
+        return cleaned.joined(separator: " · ")
+    }
+    
+    func draftedSubject(from draft: ExchangeMessageDraft?) -> String? {
+        guard let draft else { return nil }
+        let trimmed = draft.subject?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func draftedBodyPreview(from draft: ExchangeMessageDraft?) -> String? {
+        guard let draft else { return nil }
+        let trimmed = draft.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count > 240 ? String(trimmed.prefix(240)) + "…" : trimmed
+    }
+
+    func clarificationPrompt(
+        for thread: ExchangeThread,
+        clarificationQuestion: String?
+    ) -> String? {
+        if let clarificationQuestion,
+           !clarificationQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return clarificationQuestion
+        }
+
+        if let question = thread.interpretation?.userQuestion?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !question.isEmpty {
+            return question
+        }
+
+        return nil
+    }
+
+    func failureWhatHappened(for thread: ExchangeThread) -> String? {
+        switch thread.state {
+        case .matchFound,
+             .matchCandidatesWeak,
+             .noViableMatch:
+            return nil
+
+        case .blockedByDeliveryFailure:
+            if let failure = thread.latestFailure?.whatHappened.trimmingCharacters(in: .whitespacesAndNewlines),
+               !failure.isEmpty {
+                return failure
+            }
+            if let summary = thread.latestFailure?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                return summary
+            }
+            return "The send did not complete."
+
+        case .declined:
+            if let failure = thread.latestFailure?.whatHappened.trimmingCharacters(in: .whitespacesAndNewlines),
+               !failure.isEmpty {
+                return failure
+            }
+            if let summary = thread.latestFailure?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                return summary
+            }
+            return "The other side declined."
+
+        case .stalled:
+            if let failure = thread.latestFailure?.whatHappened.trimmingCharacters(in: .whitespacesAndNewlines),
+               !failure.isEmpty {
+                return failure
+            }
+            if let summary = thread.latestFailure?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                return summary
+            }
+            return "The thread stopped moving."
+
+        case .blockedBySystemFailure:
+            if let failure = thread.latestFailure?.whatHappened.trimmingCharacters(in: .whitespacesAndNewlines),
+               !failure.isEmpty {
+                return failure
+            }
+            if let summary = thread.latestFailure?.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                return summary
+            }
+            return "A system issue interrupted the thread."
+
+        case .drafting,
+             .draftReady,
+             .needsClarification,
+             .searching,
+             .awaitingApproval,
+             .sending,
+             .awaitingResponse,
+             .resolved:
+            return nil
+        }
+    }
+    
+    func failureWhatDidNotHappen(for thread: ExchangeThread) -> String? {
+        switch thread.state {
+        case .matchFound,
+             .matchCandidatesWeak,
+             .noViableMatch:
+            return nil
+
+        case .blockedByDeliveryFailure, .blockedBySystemFailure, .declined, .stalled:
+            if let delivery = thread.delivery {
+                switch delivery.status {
+                case .failed:
+                    return "The intended action did not go through."
+                case .notStarted, .pendingApproval, .readyToSend:
+                    return "Nothing went out."
+                case .sending:
+                    return "The send did not finish cleanly."
+                case .sent:
+                    return nil
+                @unknown default:
+                    return nil
+                }
+            }
+            return "The thread did not reach the intended outcome."
+
+        case .drafting,
+             .draftReady,
+             .needsClarification,
+             .searching,
+             .awaitingApproval,
+             .sending,
+             .awaitingResponse,
+             .resolved:
+            return nil
+        }
+    }
+
+    func failureNextMove(for thread: ExchangeThread) -> String? {
+        switch thread.state {
+        case .matchFound,
+             .matchCandidatesWeak,
+             .noViableMatch:
+            return nil
+
+        case .blockedByDeliveryFailure:
+            if let next = thread.latestFailure?.recommendedNextStep.summaryLine.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return "Check the delivery issue and try again."
+
+        case .declined:
+            if let next = thread.latestFailure?.recommendedNextStep.summaryLine.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return "Review the decline and decide what to do next."
+
+        case .stalled:
+            if let next = thread.latestFailure?.recommendedNextStep.summaryLine.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return "Choose whether to restart, wait, or close it."
+
+        case .blockedBySystemFailure:
+            if let next = thread.latestFailure?.recommendedNextStep.summaryLine.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return "Review the issue and retry."
+
+        case .drafting,
+             .draftReady,
+             .needsClarification,
+             .searching,
+             .awaitingApproval,
+             .sending,
+             .awaitingResponse,
+             .resolved:
+            return nil
+        }
+    }
+
+    func relativeTimestamp(from date: Date, now: Date = Date()) -> String {
+        let interval = max(0, now.timeIntervalSince(date))
+
+        if interval < 60 {
+            return "just now"
+        } else if interval < 3600 {
+            let minutes = Int(interval / 60)
+            return "\(minutes)m ago"
+        } else if interval < 86_400 {
+            let hours = Int(interval / 3600)
+            return "\(hours)h ago"
+        } else {
+            let days = Int(interval / 86_400)
+            return "\(days)d ago"
+        }
+    }
+}
+
+extension ExchangeFacade {
+    /// - Parameter hasUserFacingRenderableOutboundDraft: Canonical user-facing draft signal
+    ///   (`ExchangeMessageDraft.hasUserFacingRenderableExternalOutboundDraft` / inbox `hasActionableExternalOutboundDraft`).
+    ///   Do not substitute `latestDraft != nil` (any persisted row).
+    func requiresAttentionReason(
+        for thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        clarificationQuestion: String?,
+        hasUserFacingRenderableOutboundDraft: Bool
+    ) -> String? {
+        if latestApproval?.status == .pending {
+            return "Approval needed before anything goes out"
+        }
+
+        switch thread.state {
+        case .needsClarification:
+            if let clarificationQuestion,
+               !clarificationQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return clarificationQuestion
+            }
+            return "Need one more detail"
+
+        case .matchFound:
+            return nil
+
+        case .matchCandidatesWeak:
+            return thread.visibleSummary ?? "Some candidates were found, but none are strong enough yet."
+
+        case .noViableMatch:
+            return thread.visibleSummary ?? "No viable match was found from the current search."
+
+        case .awaitingApproval:
+            return latestApproval?.summary ?? "Waiting for approval"
+
+        case .blockedByDeliveryFailure:
+            return thread.latestFailure?.summary ?? "Delivery failed"
+
+        case .declined:
+            return thread.latestFailure?.summary ?? "This was declined"
+
+        case .stalled:
+            return thread.latestFailure?.summary ?? "This stalled"
+
+        case .blockedBySystemFailure:
+            return thread.latestFailure?.summary ?? "A system issue needs review"
+
+        case .drafting:
+            return hasUserFacingRenderableOutboundDraft ? "Draft is being shaped locally." : nil
+
+        case .draftReady:
+            return hasUserFacingRenderableOutboundDraft ? "Draft is ready to review." : nil
+
+        case .searching, .sending, .awaitingResponse, .resolved:
+            if let workTrace = makeWorkTraceCard(for: thread),
+               workTrace.status == .blocked,
+               let headline = workTrace.headline,
+               !headline.isEmpty {
+                return headline
+            }
+            return nil
+        }
+    }
+
+    /// - Parameter hasUserFacingRenderableOutboundDraft: See ``requiresAttentionReason(for:latestApproval:clarificationQuestion:hasUserFacingRenderableOutboundDraft:)``.
+    func nextStepText(
+        for thread: ExchangeThread,
+        latestApproval: ExchangeApproval?,
+        hasUserFacingRenderableOutboundDraft: Bool,
+        clarificationQuestion: String?
+    ) -> String? {
+        if latestApproval?.status == .pending {
+            return "Review the draft"
+        }
+
+        if let workTrace = makeWorkTraceCard(for: thread),
+           workTrace.status == .running,
+           let active = workTrace.activeStep {
+            return active.title
+        }
+
+        switch thread.state {
+        case .needsClarification:
+            if let clarificationQuestion,
+               !clarificationQuestion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return clarificationQuestion
+            }
+            return "Clarify the request"
+
+        case .matchFound(let status):
+            if let next = status.nextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+
+            if let next = thread.interpretation?.userNextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+
+            return hasUserFacingRenderableOutboundDraft
+                ? "Review the draft"
+                : "Continue on this found path"
+
+        case .matchCandidatesWeak:
+            if let next = thread.interpretation?.userNextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return thread.visibleSummary ?? "Review the search results or refresh the search"
+
+        case .noViableMatch:
+            if let next = thread.interpretation?.userNextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            return thread.visibleSummary ?? "Refresh the search or refine the request"
+
+        case .awaitingApproval:
+            let summary = latestApproval?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return summary.isEmpty ? "Review the draft" : summary
+
+        case .blockedByDeliveryFailure:
+            return thread.latestFailure?.recommendedNextStep.summaryLine ?? "Review the delivery issue"
+
+        case .awaitingResponse:
+            return "Wait for a reply or follow up later"
+
+        case .declined:
+            return thread.latestFailure?.recommendedNextStep.summaryLine ?? "Review the decline"
+
+        case .stalled:
+            return thread.latestFailure?.recommendedNextStep.summaryLine ?? "Choose the next move"
+
+        case .resolved:
+            return "Review the outcome"
+
+        case .blockedBySystemFailure:
+            return thread.latestFailure?.recommendedNextStep.summaryLine ?? "Review the issue"
+
+        case .drafting:
+            return hasUserFacingRenderableOutboundDraft ? "Review the draft" : "Keep drafting"
+
+        case .draftReady:
+            if hasUserFacingRenderableOutboundDraft {
+                return "Review the draft"
+            }
+            if let next = thread.interpretation?.userNextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !next.isEmpty {
+                return next
+            }
+            if let summary = thread.visibleSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty {
+                return summary
+            }
+            return "Check progress"
+
+        case .searching:
+            if let rationale = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rationale.isEmpty {
+                return rationale
+            }
+            return thread.selectedCounterpartyID != nil
+                ? "Review the found path"
+                : "Check search progress"
+
+        case .sending:
+            return "Monitor the send"
+        }
+    }
+}
+
+extension ExchangeFacade {
+    public static func secondHalfOutboundQueueSignature(
+        threadID: ExchangeThread.ID,
+        draftID: ExchangeMessageDraft.ID,
+        counterpartyID: String
+    ) -> String {
+        "\(threadID.uuidString)|\(draftID.uuidString)|\(counterpartyID)"
+    }
+
+    static func pickLatestSendableSecondHalfGeneratedDraft(
+        drafts: [ExchangeMessageDraft],
+        matchingActionRaw: String
+    ) -> ExchangeMessageDraft? {
+        drafts
+            .filter { $0.metadata["second_half_generated"] == "true" }
+            .filter { $0.isActionable }
+            .filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .filter { draft in
+                let metaAction = draft.metadata["second_half_action"]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if metaAction == nil || metaAction?.isEmpty == true || metaAction == "none" {
+                    return true
+                }
+                return metaAction == matchingActionRaw
+            }
+            .sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            .first
+    }
+
+    public static func pickSendableSecondHalfDraftForUserDirectedSend(
+        drafts: [ExchangeMessageDraft],
+        preferredDraftID: ExchangeMessageDraft.ID?
+    ) -> ExchangeMessageDraft? {
+        let filtered = drafts
+            .filter { $0.metadata["second_half_generated"] == "true" }
+            .filter {
+                switch $0.status {
+                case .draft, .awaitingApproval:
+                    return true
+                case .approved, .rejected, .sent, .superseded, .abandoned:
+                    return false
+                }
+            }
+            .filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+
+        if let preferredDraftID,
+           let exact = filtered.first(where: { $0.id == preferredDraftID }) {
+            return exact
+        }
+
+        return filtered.first
+    }
+
+    /// Picks a user-directed outbound draft for the prepared-send bridge: prefers second-half generated drafts,
+    /// then falls back to any actionable external counterparty draft when recipient routing is present.
+    public static func pickUserDirectedOutboundDraftForPreparedSend(
+        drafts: [ExchangeMessageDraft],
+        preferredDraftID: ExchangeMessageDraft.ID?,
+        thread: ExchangeThread
+    ) -> ExchangeMessageDraft? {
+        guard ExchangeOutboundRecipientAnchor.hasRecipientSurface(for: thread) else {
+            return nil
+        }
+        if let preferred = pickSendableSecondHalfDraftForUserDirectedSend(
+            drafts: drafts,
+            preferredDraftID: preferredDraftID
+        ) {
+            return preferred
+        }
+
+        let filtered = drafts
+            .filter { $0.audience == .externalCounterparty }
+            .filter {
+                switch $0.status {
+                case .draft, .awaitingApproval:
+                    return true
+                case .approved, .rejected, .sent, .superseded, .abandoned:
+                    return false
+                }
+            }
+            .filter { !$0.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+
+        if let preferredDraftID,
+           let exact = filtered.first(where: { $0.id == preferredDraftID }) {
+            return exact
+        }
+
+        return filtered.first
+    }
+
+    /// Provider auto-response duplicate detection: anchored to **live outbox** and latest inbound parent when available.
+    struct ProviderAutoResponseDuplicateEval: Sendable {
+        var isDuplicate: Bool
+        var reason: String
+        var matchedLiveOutboxIDs: [ExchangeOutboxItem.ID]
+        var matchedPendingOutboxIDs: [ExchangeOutboxItem.ID]
+        var matchedSentOutboxIDs: [ExchangeOutboxItem.ID]
+        var matchedPendingCounterpartyWide: Bool
+        var matchedLiveForSignature: Bool
+    }
+
+    static func evaluateProviderAutoResponseDuplicateOutboxAnchored(
+        draft: ExchangeMessageDraft?,
+        thread: ExchangeThread,
+        counterpartyID: String?,
+        outboxItems: [ExchangeOutboxItem]
+    ) -> ProviderAutoResponseDuplicateEval {
+        guard let draft,
+              let cp = counterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        else {
+            return ProviderAutoResponseDuplicateEval(
+                isDuplicate: false,
+                reason: "clear_no_draft_or_counterparty",
+                matchedLiveOutboxIDs: [],
+                matchedPendingOutboxIDs: [],
+                matchedSentOutboxIDs: [],
+                matchedPendingCounterpartyWide: false,
+                matchedLiveForSignature: false
+            )
+        }
+
+        let live = Self.hasLiveOutboxForSecondHalfSignature(
+            outboxItems: outboxItems,
+            draftID: draft.id,
+            counterpartyID: cp
+        )
+        if live {
+            let liveIDs = outboxItems.compactMap { item -> ExchangeOutboxItem.ID? in
+                guard item.draftID == draft.id else { return nil }
+                guard item.isActive else { return nil }
+                guard Self.liveSecondHalfOutboxPhases.contains(item.deliveryState.phase) else { return nil }
+                guard Self.providerAutoOutboxCounterpartyMatches(item: item, counterpartyID: cp) else { return nil }
+                return item.id
+            }
+            return ProviderAutoResponseDuplicateEval(
+                isDuplicate: true,
+                reason: "live_active_outbox_same_draft_counterparty",
+                matchedLiveOutboxIDs: liveIDs,
+                matchedPendingOutboxIDs: [],
+                matchedSentOutboxIDs: [],
+                matchedPendingCounterpartyWide: false,
+                matchedLiveForSignature: true
+            )
+        }
+
+        let inbound = thread.lastInboundEnvelopeID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+        let pendingPhases: Set<ExchangeDeliveryState.Phase> = [
+            .queued, .blockedByPrerequisite, .deferred, .sending
+        ]
+        let terminalPhases: Set<ExchangeDeliveryState.Phase> = [.sent, .acknowledged]
+
+        if let inbound, !inbound.isEmpty {
+            let pendingIDs = outboxItems.compactMap { item -> ExchangeOutboxItem.ID? in
+                guard item.isActive, pendingPhases.contains(item.deliveryState.phase) else { return nil }
+                guard Self.providerAutoOutboxCounterpartyMatches(item: item, counterpartyID: cp) else { return nil }
+                let parent = item.metadata["parent_envelope_id"]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                guard parent == inbound else { return nil }
+                return item.id
+            }
+            if !pendingIDs.isEmpty {
+                return ProviderAutoResponseDuplicateEval(
+                    isDuplicate: true,
+                    reason: "pending_outbox_parent_matches_latest_inbound",
+                    matchedLiveOutboxIDs: [],
+                    matchedPendingOutboxIDs: pendingIDs,
+                    matchedSentOutboxIDs: [],
+                    matchedPendingCounterpartyWide: false,
+                    matchedLiveForSignature: false
+                )
+            }
+
+            let sentIDs = outboxItems.compactMap { item -> ExchangeOutboxItem.ID? in
+                guard terminalPhases.contains(item.deliveryState.phase) else { return nil }
+                guard Self.providerAutoOutboxCounterpartyMatches(item: item, counterpartyID: cp) else { return nil }
+                let parent = item.metadata["parent_envelope_id"]?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank
+                guard parent == inbound else { return nil }
+                return item.id
+            }
+            if !sentIDs.isEmpty {
+                return ProviderAutoResponseDuplicateEval(
+                    isDuplicate: true,
+                    reason: "sent_or_ack_outbox_parent_matches_latest_inbound",
+                    matchedLiveOutboxIDs: [],
+                    matchedPendingOutboxIDs: [],
+                    matchedSentOutboxIDs: sentIDs,
+                    matchedPendingCounterpartyWide: false,
+                    matchedLiveForSignature: false
+                )
+            }
+
+            return ProviderAutoResponseDuplicateEval(
+                isDuplicate: false,
+                reason: "clear_no_conflicting_outbox_for_inbound_anchor",
+                matchedLiveOutboxIDs: [],
+                matchedPendingOutboxIDs: [],
+                matchedSentOutboxIDs: [],
+                matchedPendingCounterpartyWide: false,
+                matchedLiveForSignature: false
+            )
+        }
+
+        let pendingWide = Self.hasPendingOutboundToCounterpartyForDuplicateDetection(
+            outboxItems: outboxItems,
+            counterpartyID: cp
+        )
+        if pendingWide {
+            return ProviderAutoResponseDuplicateEval(
+                isDuplicate: true,
+                reason: "pending_outbox_to_counterparty_no_inbound_anchor",
+                matchedLiveOutboxIDs: [],
+                matchedPendingOutboxIDs: [],
+                matchedSentOutboxIDs: [],
+                matchedPendingCounterpartyWide: true,
+                matchedLiveForSignature: false
+            )
+        }
+
+        let sentSameDraftIDs = outboxItems.compactMap { item -> ExchangeOutboxItem.ID? in
+            guard item.draftID == draft.id else { return nil }
+            guard terminalPhases.contains(item.deliveryState.phase) else { return nil }
+            guard Self.providerAutoOutboxCounterpartyMatches(item: item, counterpartyID: cp) else { return nil }
+            return item.id
+        }
+        if !sentSameDraftIDs.isEmpty {
+            return ProviderAutoResponseDuplicateEval(
+                isDuplicate: true,
+                reason: "sent_or_ack_outbox_same_draft_no_inbound_anchor",
+                matchedLiveOutboxIDs: [],
+                matchedPendingOutboxIDs: [],
+                matchedSentOutboxIDs: sentSameDraftIDs,
+                matchedPendingCounterpartyWide: false,
+                matchedLiveForSignature: false
+            )
+        }
+
+        return ProviderAutoResponseDuplicateEval(
+            isDuplicate: false,
+            reason: "clear_no_conflicting_outbox",
+            matchedLiveOutboxIDs: [],
+            matchedPendingOutboxIDs: [],
+            matchedSentOutboxIDs: [],
+            matchedPendingCounterpartyWide: false,
+            matchedLiveForSignature: false
+        )
+    }
+
+    private static func providerAutoOutboxCounterpartyMatches(
+        item: ExchangeOutboxItem,
+        counterpartyID: String
+    ) -> Bool {
+        let trimmedCounterpartyID = counterpartyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetNodeID = item.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedCounterpartyID.isEmpty, targetNodeID == trimmedCounterpartyID {
+            return true
+        }
+        let metadataMatches =
+            item.metadata["counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedCounterpartyID
+            || item.metadata["selected_counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                == trimmedCounterpartyID
+        return metadataMatches
+    }
+
+    static func hasLiveOutboxForSecondHalfSignature(
+        outboxItems: [ExchangeOutboxItem],
+        draftID: ExchangeMessageDraft.ID,
+        counterpartyID: String
+    ) -> Bool {
+        let trimmedCounterpartyID = counterpartyID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return outboxItems.contains { item in
+            guard item.draftID == draftID else { return false }
+            guard item.isActive else { return false }
+            guard Self.liveSecondHalfOutboxPhases.contains(item.deliveryState.phase) else { return false }
+
+            let targetNodeID = item.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedCounterpartyID.isEmpty, targetNodeID == trimmedCounterpartyID {
+                return true
+            }
+
+            let metadataMatches =
+                item.metadata["counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedCounterpartyID
+                || item.metadata["selected_counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedCounterpartyID
+            return metadataMatches
+        }
+    }
+
+    /// True when an active, still-pending outbound leg already exists for the selected counterparty.
+    /// Excludes `.sent` so a later user-initiated follow-up is not blocked forever before relay acknowledgement.
+    static func hasPendingOutboundToCounterpartyForDuplicateDetection(
+        outboxItems: [ExchangeOutboxItem],
+        counterpartyID: String?
+    ) -> Bool {
+        guard let trimmedCounterpartyID = counterpartyID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmedCounterpartyID.isEmpty
+        else {
+            return false
+        }
+
+        let pendingPhases: Set<ExchangeDeliveryState.Phase> = [
+            .queued,
+            .blockedByPrerequisite,
+            .deferred,
+            .sending
+        ]
+
+        return outboxItems.contains { item in
+            guard item.isActive else { return false }
+            guard pendingPhases.contains(item.deliveryState.phase) else { return false }
+
+            let targetNodeID = item.targetNodeID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if targetNodeID == trimmedCounterpartyID {
+                return true
+            }
+
+            let metadataMatches =
+                item.metadata["counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedCounterpartyID
+                || item.metadata["selected_counterparty_id"]?.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedCounterpartyID
+            return metadataMatches
+        }
+    }
+
+    static var liveSecondHalfOutboxPhases: Set<ExchangeDeliveryState.Phase> {
+        [.queued, .blockedByPrerequisite, .deferred, .sending, .sent]
+    }
+}
+
+extension ExchangeFacade {
+
+    // MARK: - Autonomous For You discovery
+
+    struct ForYouStandingIntentSignals: Sendable {
+        var queryText: String
+        var tags: [String]
+        var openToTags: [String]
+        /// Always empty for the profile-interest For You rail (directory `offerTags` are not used for local-offer steering).
+        var offerTags: [String]
+        var regionTags: [String]
+    }
+
+    /// Loads For You rail candidates from locally cached directory counterparties (`cacheSource=forYou`).
+    /// Does not call the directory client, standing-interest LLM, or `runAutonomousForYouPass`.
+    public func loadCachedForYouItems(
+        dismissedNodeIDs: Set<String> = [],
+        localNodeID: String?,
+        limit: Int = 12,
+        now: Date = Date()
+    ) async throws -> [ExchangeModels.ForYouItem] {
+        let cappedLimit = max(1, min(limit, 24))
+        let policy = ExchangeLocalMaintenancePolicy(localNodeID: localNodeID)
+        let staleCutoff = policy.staleForYouCacheCutoffDate(now: now)
+
+        let trimmedLocal = localNodeID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let dismissed = Set(
+            dismissedNodeIDs
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+
+        let activeThreads = (try? await store.listThreads(filter: .init())) ?? []
+        let activeCounterpartyIDs: Set<String> = Set(
+            activeThreads
+                .filter { thread in
+                    if case .declined = thread.state { return false }
+                    if case .resolved = thread.state { return false }
+                    return true
+                }
+                .compactMap { $0.selectedCounterpartyID }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+
+        var threadIDByCounterparty: [String: ExchangeThread.ID] = [:]
+        for thread in activeThreads {
+            guard let cid = thread.selectedCounterpartyID?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !cid.isEmpty
+            else { continue }
+            if case .declined = thread.state { continue }
+            if case .resolved = thread.state { continue }
+            threadIDByCounterparty[cid] = thread.id
+        }
+
+        let candidates = try await store.listCounterparties(filter: .init(limit: 500))
+        struct CachedRow {
+            var counterparty: ExchangeCounterparty
+            var lastSeenAt: Date
+        }
+
+        var rows: [CachedRow] = []
+        rows.reserveCapacity(min(candidates.count, 64))
+
+        for counterparty in candidates {
+            let nid = counterparty.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nid.isEmpty, nid.hasPrefix("node-") else { continue }
+            guard counterparty.publicProfile != nil else { continue }
+            guard ExchangeRemoteDiscoveryCacheMetadata.cacheSource(from: counterparty.metadata) == .forYou else {
+                continue
+            }
+            if !trimmedLocal.isEmpty, nid == trimmedLocal { continue }
+            if dismissed.contains(nid) { continue }
+            #if DEBUG
+            let includeActiveThreadDebug = ForYouActiveThreadDiscoveryDebug.includeActiveThreadCounterpartiesInForYouDebug
+            #else
+            let includeActiveThreadDebug = false
+            #endif
+            if !includeActiveThreadDebug, activeCounterpartyIDs.contains(nid) { continue }
+
+            let lastSeen = ExchangeRemoteDiscoveryCacheMetadata.parseLastSeenAt(from: counterparty.metadata) ?? counterparty.updatedAt
+            guard lastSeen >= staleCutoff else { continue }
+
+            rows.append(CachedRow(counterparty: counterparty, lastSeenAt: lastSeen))
+        }
+
+        rows.sort { $0.lastSeenAt > $1.lastSeenAt }
+
+        var items: [ExchangeModels.ForYouItem] = []
+        items.reserveCapacity(cappedLimit)
+
+        for row in rows.prefix(cappedLimit) {
+            let linked = threadIDByCounterparty[row.counterparty.id]
+            guard let item = Self.forYouItemFromCachedCounterparty(
+                row.counterparty,
+                lastSeenAt: row.lastSeenAt,
+                linkedThreadID: linked,
+                now: now
+            ) else { continue }
+            items.append(item)
+        }
+
+        #if DEBUG
+        if !items.isEmpty {
+            exchFacadeLog(
+                "loadCachedForYouItems done | count=\(items.count) newest=\(rows.first?.lastSeenAt ?? now)"
+            )
+        }
+        #endif
+        Swift.print("[ForYouCache] count=\(items.count)")
+
+        return items
+    }
+
+    private static func forYouItemFromCachedCounterparty(
+        _ counterparty: ExchangeCounterparty,
+        lastSeenAt: Date,
+        linkedThreadID: ExchangeThread.ID?,
+        now: Date
+    ) -> ExchangeModels.ForYouItem? {
+        guard let profile = counterparty.publicProfile else { return nil }
+
+        let reachability = profile.reachability
+        let canContact = counterparty.allowsDirectContactInPrinciple
+            && !counterparty.requiresIntroductionInPrinciple
+            && counterparty.isRoutableInPrinciple
+
+        let blockedReason: String?
+        if !counterparty.isRoutableInPrinciple {
+            blockedReason = "Not routeable"
+        } else if counterparty.requiresIntroductionInPrinciple {
+            blockedReason = "Requires introduction"
+        } else if !counterparty.allowsDirectContactInPrinciple {
+            blockedReason = "Direct contact not permitted by recipient posture"
+        } else {
+            blockedReason = nil
+        }
+
+        let activityTagsArr = profile.activityTags
+        var tagsSeen: Set<String> = []
+        let tags: [String] = activityTagsArr
+            .filter { tagsSeen.insert($0).inserted }
+            .prefix(3)
+            .map { $0 }
+
+        let discoveryLines = discoverForYouDiscoveryFactLines(
+            profile: profile,
+            offers: [],
+            matchedTerms: []
+        )
+
+        let forYouImageURL = discoverForYouPrimaryImageURL(
+            profile: profile,
+            surfacedOffer: nil,
+            queryClassText: nil,
+            surfacePreferenceText: nil,
+            discoveryFactLines: discoveryLines
+        )
+
+        let displayCard = ExchangeProviderDisplayBuilder.build(
+            ExchangeProviderDisplayBuildInput(
+                sourceSurface: .forYouCachedHydration,
+                publicProfile: profile,
+                surfacedOffer: nil,
+                counterparty: counterparty,
+                matchInference: nil,
+                surfaceLead: .profileLed,
+                policy: .forYouCachedDefault,
+                contactPosture: ExchangeProviderDisplayContactPosture(
+                    acceptingInbound: reachability.acceptingInbound,
+                    requiresIntroduction: counterparty.requiresIntroductionInPrinciple,
+                    allowsDirectContact: counterparty.allowsDirectContactInPrinciple,
+                    isRoutable: counterparty.isRoutableInPrinciple
+                )
+            )
+        )
+
+        return ExchangeModels.ForYouItem(
+            id: counterparty.id,
+            displayName: counterparty.displayName,
+            headline: discoverForYouCardHeadline(profile: profile),
+            matchReasonSummary: "Cached suggestion",
+            accessMode: reachability.accessMode.rawValue,
+            dominantTags: tags,
+            topOfferTitle: nil,
+            nodeID: counterparty.id,
+            publicProfileID: profile.id,
+            acceptingInbound: reachability.acceptingInbound,
+            discoveredAt: lastSeenAt,
+            canAutonomouslyContact: canContact,
+            blockedReason: blockedReason,
+            linkedThreadID: linkedThreadID,
+            primaryImageURL: forYouImageURL,
+            surfacedOfferImageURLs: [],
+            publicOfferContactInfo: nil,
+            discoveryMatchedTerms: [],
+            discoveryFactLines: discoveryLines,
+            publicFactLines: [],
+            suggestedBuyerInputHints: [],
+            retrievalFitScore: nil,
+            discoverySourceLabel: "Cached",
+            displayCard: displayCard,
+            publicSupporterPresentation: profile.publicSupporterPresentation
+        )
+    }
+
+    /// Discovers public profiles/offers relevant to the local node using the directory client.
+    ///
+    /// Safety:
+    /// - Deduplicates the local node.
+    /// - Deduplicates active, non-declined threads so we never surface a counterparty that
+    ///   already has an open thread (DEBUG builds: file-private `ForYouActiveThreadDiscoveryDebug` can opt into retaining those hits for retrieval diagnostics).
+    /// - Does NOT create threads, drafts, or approvals.
+    /// - Returns an empty item array with a ``ExchangeModels/ForYouDiscoveryQuality`` snapshot when `directoryClient` is nil.
+    /// - Returns mixed items plus a ``ExchangeModels/ForYouDiscoveryQuality`` snapshot for UI legibility.
+    public func discoverForYou(
+        localNodeID: String?,
+        limit: Int = 12,
+        now: Date = Date(),
+        useStandingIntentAdapter: Bool = false,
+        forceStandingInterestRefresh: Bool = false,
+        forYouMixContext: ForYouResultMixContext = .default
+    ) async throws -> ExchangeModels.DiscoverForYouOutcome {
+        guard let directoryClient else {
+            exchFacadeLog("discoverForYou skipped | reason=noDirectoryClient")
+            let quality = ForYouDiscoveryQualityClassifier.classify(
+                ForYouDiscoveryQualityInputs(
+                    rawDirectoryMatchCount: 0,
+                    afterLocalFilterCount: 0,
+                    mixedItemCount: 0,
+                    mixedItems: [],
+                    mixQualitySummary: nil,
+                    directoryClientUnavailable: true
+                )
+            )
+            return ExchangeModels.DiscoverForYouOutcome(items: [], discoveryQuality: quality)
+        }
+
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("discoverForYou start | localNodeID=\(localNodeID ?? "nil") | limit=\(limit)")
+
+        // --- Build search context from the local node's own public profile ---
+        let localProfiles: [ExchangePublicNodeProfile]
+        if let nodeID = localNodeID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !nodeID.isEmpty {
+            localProfiles = (try? await store.listPublicProfiles(
+                filter: .init(nodeID: nodeID, limit: 1)
+            )) ?? []
+        } else {
+            localProfiles = []
+        }
+
+        let localProfile = localProfiles.first
+
+        let trimmedNodeID = localNodeID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        let queryText: String
+        let allTags: [String]
+        let openToTags: [String]
+        let regionTags: [String]
+        let excludedTags: [String]
+        var cachedStanding: ForYouStandingInterest?
+
+        if !trimmedNodeID.isEmpty, let profile = localProfile {
+            let resolved = await forYouStandingInterestService.resolveForDirectoryQuery(
+                nodeID: trimmedNodeID,
+                profile: profile,
+                forceRefresh: forceStandingInterestRefresh
+            )
+            let interest = resolved.interest
+            cachedStanding = interest
+            queryText = ForYouStandingInterestSanitizer.directorySearchQueryText(from: interest, profile: profile)
+            allTags = interest.directoryTags
+            openToTags = ForYouStandingInterestNormalizer.normalizeTagBucket(interest.lookingForTags)
+            regionTags = ForYouStandingInterestNormalizer.normalizeTagBucket(interest.regionTags)
+            excludedTags = ForYouStandingInterestNormalizer.normalizeTagBucket(interest.excludedTags)
+            await forYouStandingInterestService.ensureGeneratedInBackground(
+                nodeID: trimmedNodeID,
+                profile: profile,
+                force: false
+            )
+        } else {
+            cachedStanding = nil
+            let standingIntent = makeForYouStandingIntentSignals(
+                localProfile: localProfile,
+                useStandingIntentAdapter: useStandingIntentAdapter
+            )
+            queryText = standingIntent.queryText
+            allTags = standingIntent.tags
+            openToTags = standingIntent.openToTags
+            regionTags = standingIntent.regionTags
+            excludedTags = ForYouStandingInterestNormalizer.normalizeTagBucket(
+                localProfile?.excludedTopics ?? []
+            )
+        }
+
+        let interestForEmbed: [String]
+        let roleForEmbed: [String]
+        if let cached = cachedStanding {
+            interestForEmbed = ForYouStandingInterestNormalizer.normalizeTagBucket(cached.interestTags)
+            roleForEmbed = ForYouStandingInterestNormalizer.normalizeTagBucket(cached.roleTags)
+        } else if let profile = localProfile {
+            interestForEmbed = ForYouStandingInterestNormalizer.normalizeTagBucket(profile.interests)
+            roleForEmbed = ForYouStandingInterestNormalizer.normalizeTagBucket(
+                profile.activityTags + profile.semantic.domains + profile.semantic.intentKinds
+            )
+        } else {
+            interestForEmbed = []
+            roleForEmbed = []
+        }
+
+        let forYouEmbedText = Self.buildForYouDirectoryEmbeddingText(
+            queryText: queryText,
+            directoryTags: allTags,
+            openToTags: openToTags,
+            regionTags: regionTags,
+            interestTags: interestForEmbed,
+            roleTags: roleForEmbed
+        )
+
+        let forYouQueryEmbedding: [Float]? = {
+            guard let provider = forYouDirectoryEmbeddingProvider else {
+                #if DEBUG
+                exchFacadeLog("discoverForYou embedding_skipped reason=noProvider")
+                #endif
+                return nil
+            }
+            guard !forYouEmbedText.isEmpty else {
+                #if DEBUG
+                exchFacadeLog("discoverForYou embedding_skipped reason=noText")
+                #endif
+                return nil
+            }
+            guard let vec = ExchangeDirectoryQueryEmbedding.embedQueryText(forYouEmbedText, provider: provider),
+                  !vec.isEmpty else {
+                #if DEBUG
+                exchFacadeLog("discoverForYou embedding_skipped reason=embedFailed")
+                #endif
+                return nil
+            }
+            #if DEBUG
+            exchFacadeLog("discoverForYou embedding_built dims=\(vec.count)")
+            #endif
+            return vec
+        }()
+
+        // All active unresolved threads — used to deduplicate counterparties.
+        let activeThreads = (try? await store.listThreads(filter: .init())) ?? []
+        let activeCounterpartyIDs: Set<String> = Set(
+            activeThreads
+                .filter { thread in
+                    if case .declined = thread.state { return false }
+                    if case .resolved = thread.state { return false }
+                    return true
+                }
+                .compactMap { $0.selectedCounterpartyID }
+        )
+
+        // For You profile rail is profile-interest-led. Local commercial offers are display/context only
+        // on returned cards (remote match offers) and must not steer this directory query.
+        // Do not include secretary constitution / private coordination instructions in remote directory queries.
+        let request = ExchangeDirectorySearchRequest(
+            localNodeID: localNodeID,
+            mode: .transactional,
+            intentKind: .message,
+            targetDescription: queryText.nilIfBlank,
+            queryText: queryText.nilIfBlank,
+            queryEmbedding: forYouQueryEmbedding,
+            tags: allTags,
+            openToTags: openToTags,
+            offerTags: [],
+            excludedTags: excludedTags,
+            regionTags: regionTags,
+            limit: limit,
+            routeRequirement: .federationCapableOnly,
+            accessRequirement: .directContactAllowedOnly
+        )
+
+        let recallSignal = Self.forYouDirectoryHasRecallSignal(
+            queryText: queryText,
+            queryEmbedding: forYouQueryEmbedding,
+            tags: allTags,
+            openToTags: openToTags,
+            offerTags: [],
+            regionTags: regionTags
+        )
+        if !recallSignal {
+            #if DEBUG
+            let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let nonEmptyTagCount = (allTags + openToTags + regionTags)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .count
+            Swift.print(
+                "[ForYouColdStartGuard] willSearch=false reason=insufficientRecallSignal " +
+                "queryEmpty=\(trimmedQuery.isEmpty) tags=\(nonEmptyTagCount) " +
+                "embedding=\(forYouQueryEmbedding != nil)"
+            )
+            #endif
+            throw ExchangeDirectoryClientError.invalidRequest(
+                reason: "For You needs a more specific focus before searching."
+            )
+        }
+
+        let response = try await directoryClient.search(request)
+        let rawDirectoryMatchCount = response.matches.count
+
+        let filteredForYouMatches: [ExchangeDirectoryMatch] = {
+            var out: [ExchangeDirectoryMatch] = []
+            out.reserveCapacity(response.matches.count)
+            #if DEBUG
+            var selfDrops = 0
+            var activeThreadDrops = 0
+            let includeActiveThreadDebug = ForYouActiveThreadDiscoveryDebug.includeActiveThreadCounterpartiesInForYouDebug
+            #endif
+            for match in response.matches {
+                let nid = match.counterparty.id
+                let title = match.counterparty.displayName
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\r", with: " ")
+                let scoreStr = match.score.map { String(format: "%.2f", $0) } ?? "nil"
+
+                if let nodeID = localNodeID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !nodeID.isEmpty,
+                   nid == nodeID {
+                    #if DEBUG
+                    selfDrops += 1
+                    Swift.print(
+                        "[ForYouFilter][drop] nodeID=\(nid) reason=self title=\(title) score=\(scoreStr)"
+                    )
+                    #endif
+                    continue
+                }
+
+                if activeCounterpartyIDs.contains(nid) {
+                    #if DEBUG
+                    if includeActiveThreadDebug {
+                        Swift.print(
+                            "[ForYouFilter][debugInclude] nodeID=\(nid) reason=activeThread title=\(title) score=\(scoreStr)"
+                        )
+                        Swift.print(
+                            "[ForYouFilter][debugIncludeForRerankOnly] nodeID=\(nid) activeThread match retained for ForYouClientRetrievalRanker; DEBUG mixer active exclusion cleared when include flag is on."
+                        )
+                        out.append(match)
+                    } else {
+                        activeThreadDrops += 1
+                        Swift.print(
+                            "[ForYouFilter][drop] nodeID=\(nid) reason=activeThread title=\(title) score=\(scoreStr)"
+                        )
+                    }
+                    #endif
+                    continue
+                }
+
+                #if DEBUG
+                Swift.print(
+                    "[ForYouFilter][keep] nodeID=\(nid) title=\(title) score=\(scoreStr)"
+                )
+                #endif
+                out.append(match)
+            }
+            #if DEBUG
+            Swift.print(
+                "[ForYouFilter][summary] raw=\(rawDirectoryMatchCount) kept=\(out.count) selfDrops=\(selfDrops) activeThreadDrops=\(activeThreadDrops) includeActiveThreadDebug=\(includeActiveThreadDebug)"
+            )
+            #endif
+            return out
+        }()
+
+        #if DEBUG
+        let mixerActiveUnresolvedCounterpartyIDs: Set<String> = {
+            if ForYouActiveThreadDiscoveryDebug.includeActiveThreadCounterpartiesInForYouDebug {
+                Swift.print(
+                    "[ForYouFilter][debugMixer] activeUnresolvedCounterpartyIDs cleared for DEBUG For You retrieval test"
+                )
+                return []
+            }
+            return activeCounterpartyIDs
+        }()
+        #else
+        let mixerActiveUnresolvedCounterpartyIDs = activeCounterpartyIDs
+        #endif
+
+        #if DEBUG
+        Swift.print(
+            "[ForYouClientRetrieval][preMixInput] order=\(filteredForYouMatches.map(\.counterparty.id).joined(separator: ","))"
+        )
+        #endif
+        let matchesForForYouMapping = await ForYouClientRetrievalRanker.rerankMatchesIfEnabled(
+            matches: filteredForYouMatches,
+            queryText: queryText,
+            directoryTags: allTags,
+            openToTags: openToTags,
+            regionTags: regionTags,
+            interestTags: interestForEmbed,
+            roleTags: roleForEmbed
+        )
+        #if DEBUG
+        Swift.print(
+            "[ForYouClientRetrieval][postBM25] order=\(matchesForForYouMapping.map(\.counterparty.id).joined(separator: ","))"
+        )
+        #endif
+        
+        let freshDirectoryCounterpartiesForCache = matchesForForYouMapping
+            .map(\.counterparty)
+            .filter { counterparty in
+                let id = counterparty.id.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !id.isEmpty else { return false }
+                guard id.hasPrefix("node-") else { return false }
+                guard counterparty.publicProfile != nil else { return false }
+                return true
+            }
+
+        if !freshDirectoryCounterpartiesForCache.isEmpty {
+            do {
+                let taggedForYouCounterparties = freshDirectoryCounterpartiesForCache.map {
+                    ExchangeRemoteDiscoveryCacheMetadata.tagForYouCounterparty($0, now: Date())
+                }
+                try await store.upsertCounterparties(taggedForYouCounterparties)
+                #if DEBUG
+                Swift.print(
+                    "[ForYouCounterpartyCache] upserted=\(freshDirectoryCounterpartiesForCache.count) nodeIDs=\(freshDirectoryCounterpartiesForCache.map(\.id).joined(separator: ","))"
+                )
+                #endif
+            } catch {
+                #if DEBUG
+                Swift.print(
+                    "[ForYouCounterpartyCache] upsertFailed count=\(freshDirectoryCounterpartiesForCache.count) error=\(error)"
+                )
+                #endif
+            }
+        }
+
+        let mappedForYouItems: [ExchangeModels.ForYouItem] = matchesForForYouMapping
+            .map { match -> ExchangeModels.ForYouItem in
+                let r = match.reachability
+                let canContact = r.allowsDirectContactInPrinciple
+                    && !r.requiresIntroductionInPrinciple
+                    && r.isRouteableInPrinciple
+
+                let blockedReason: String?
+                if !r.isRouteableInPrinciple {
+                    blockedReason = "Not routeable"
+                } else if r.requiresIntroductionInPrinciple {
+                    blockedReason = "Requires introduction"
+                } else if !r.allowsDirectContactInPrinciple {
+                    blockedReason = "Direct contact not permitted by recipient posture"
+                } else {
+                    blockedReason = nil
+                }
+
+                let matchedTermsArr: [String] = Array(match.matchedTerms.prefix(3))
+                let activityTagsArr: [String] = match.publicProfile?.activityTags ?? []
+                var tagsSeen: Set<String> = []
+                let tags: [String] = (matchedTermsArr + activityTagsArr)
+                    .filter { tagsSeen.insert($0).inserted }
+                    .prefix(3)
+                    .map { $0 }
+
+                // One surfaced offer drives title, commercial metadata, contact, and image.
+                // Prefer outward-visible listings (active + not hidden) when the match carries multiple offers.
+                let surfacedOffer =
+                    match.offers.first(where: { offer in
+                        offer.status == .active && offer.visibility != .hidden
+                    })
+                    ?? match.offers.first
+
+                let discoveryLines = Self.discoverForYouDiscoveryFactLines(
+                    profile: match.publicProfile,
+                    offers: match.offers,
+                    matchedTerms: match.matchedTerms
+                )
+                let queryClassText =
+                    [
+                        request.queryText,
+                        request.targetDescription,
+                        request.tags.joined(separator: " "),
+                        request.offerTags.joined(separator: " "),
+                        match.matchedTerms.joined(separator: " "),
+                        match.matchReason,
+                        String(describing: request.mode),
+                        String(describing: request.intentKind)
+                    ]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank }
+                    .joined(separator: " ")
+                let surfacePreferenceText = [
+                    request.openToTags.joined(separator: " "),
+                    request.regionTags.joined(separator: " ")
+                ]
+                .joined(separator: " ")
+
+                let forYouImageURL = Self.discoverForYouPrimaryImageURL(
+                    profile: match.publicProfile,
+                    surfacedOffer: surfacedOffer,
+                    queryClassText: queryClassText.nilIfBlank,
+                    surfacePreferenceText: surfacePreferenceText.nilIfBlank,
+                    discoveryFactLines: discoveryLines
+                )
+
+                let publicLines = Self.discoverForYouPublicFactLines(offer: surfacedOffer)
+                let buyerHints = Array(
+                    surfacedOffer?.commercialFacts.requiredBuyerInputs.prefix(4) ?? []
+                )
+
+                let displayCard = ExchangeProviderDisplayBuilder.build(
+                    ExchangeProviderDisplayBuildInput(
+                        sourceSurface: .forYouFreshDiscovery,
+                        publicProfile: match.publicProfile,
+                        surfacedOffer: surfacedOffer,
+                        counterparty: match.counterparty,
+                        matchInference: nil,
+                        surfaceLead: ExchangePresentationSurfaceLead.resolve(
+                            selectedOfferID: surfacedOffer?.id,
+                            selectedPublicProfileID: match.publicProfile?.id
+                        ),
+                        policy: .forYouFreshDefault,
+                        contactPosture: ExchangeProviderDisplayContactPosture(
+                            acceptingInbound: r.allowsDirectContactInPrinciple,
+                            requiresIntroduction: r.requiresIntroductionInPrinciple,
+                            allowsDirectContact: r.allowsDirectContactInPrinciple,
+                            isRoutable: r.isRouteableInPrinciple
+                        )
+                    )
+                )
+
+                return ExchangeModels.ForYouItem(
+                    id: match.counterparty.id,
+                    displayName: match.counterparty.displayName,
+                    headline: Self.discoverForYouCardHeadline(profile: match.publicProfile),
+                    matchReasonSummary: match.matchReason,
+                    accessMode: r.accessMode.rawValue,
+                    dominantTags: tags,
+                    topOfferTitle: surfacedOffer?.title,
+                    nodeID: match.counterparty.id,
+                    publicProfileID: match.publicProfile?.id,
+                    acceptingInbound: r.allowsDirectContactInPrinciple,
+                    discoveredAt: now,
+                    canAutonomouslyContact: canContact,
+                    blockedReason: blockedReason,
+                    linkedThreadID: nil,
+                    primaryImageURL: forYouImageURL,
+                    surfacedOfferImageURLs: surfacedOffer?.normalizedPublicOfferImageURLs() ?? [],
+                    publicOfferContactInfo: surfacedOffer?.contactInfo,
+                    discoveryMatchedTerms: Array(match.matchedTerms.prefix(12)),
+                    discoveryFactLines: discoveryLines,
+                    publicFactLines: publicLines,
+                    suggestedBuyerInputHints: buyerHints,
+                    retrievalFitScore: match.score,
+                    discoverySourceLabel: "Directory",
+                    displayCard: displayCard,
+                    publicSupporterPresentation: match.publicProfile?.publicSupporterPresentation
+                )
+            }
+
+        #if DEBUG
+        for (idx, item) in mappedForYouItems.enumerated() {
+            let scoreStr = item.retrievalFitScore.map { String(format: "%.2f", $0) } ?? "nil"
+            let terms = item.discoveryMatchedTerms.joined(separator: ",")
+            let dom = item.dominantTags.joined(separator: ",")
+            Swift.print(
+                "[ForYouRanking][mapped] index=\(idx) title=\(item.displayName) nodeID=\(item.nodeID) retrievalFitScore=\(scoreStr) matchedTerms=\(terms) dominantTags=\(dom)"
+            )
+        }
+
+        let rerankDiag = ForYouClientRetrievalDebugSnapshotCoordinator.shared.take()
+        var facadeMixerInParts: [String] = []
+        facadeMixerInParts.reserveCapacity(mappedForYouItems.count)
+        for (item, match) in zip(mappedForYouItems, matchesForForYouMapping) {
+            let nid = item.nodeID
+            let srv = item.retrievalFitScore.map { String(format: "%.2f", $0) } ?? "nil"
+            let vSurf = match.vectorSignals?.bestVectorSurfaceType ?? "nil"
+            let vDoc = match.vectorSignals?.bestVectorRetrievalDocID ?? "nil"
+            let bmStr: String
+            let bmHit: String
+            if let d = rerankDiag {
+                bmStr = String(format: "%.4f", d.bm25ScoreByNodeID[nid] ?? 0)
+                bmHit = String(d.bm25HitPresentByNodeID[nid] ?? false)
+            } else {
+                bmStr = "nil"
+                bmHit = "nil"
+            }
+            facadeMixerInParts.append(
+                "\(nid)(serverScore=\(srv),vectorSurface=\(vSurf),vectorDoc=\(vDoc),bm25Score=\(bmStr),bm25Hit=\(bmHit))"
+            )
+        }
+        Swift.print(
+            "[ForYouMixerDiag][facadePreMix] thinPool=notUsedInMixer mode=\(forYouMixContext.mode.rawValue) order=\(facadeMixerInParts.joined(separator: "|"))"
+        )
+        #endif
+
+        let viewerSignals = ForYouViewerMixSignals(
+            interestTags: interestForEmbed,
+            openToTags: openToTags,
+            regionTags: regionTags,
+            directoryTags: allTags
+        )
+        let mixed = ForYouResultMixer.mix(
+            items: mappedForYouItems,
+            viewer: viewerSignals,
+            localNodeID: localNodeID,
+            activeUnresolvedCounterpartyIDs: mixerActiveUnresolvedCounterpartyIDs,
+            context: forYouMixContext
+        )
+        let mixedItems = mixed.items
+
+        #if DEBUG
+        Swift.print(
+            "[ForYouMixerDiag][facadePostMix] order=\(mixedItems.map(\.nodeID).joined(separator: ","))"
+        )
+        #endif
+
+        #if DEBUG
+        for (rank, item) in mixedItems.enumerated() {
+            let scoreStr = item.retrievalFitScore.map { String(format: "%.2f", $0) } ?? "nil"
+            let dom = item.dominantTags.joined(separator: ",")
+            Swift.print(
+                "[ForYouRanking][final] rank=\(rank) title=\(item.displayName) nodeID=\(item.nodeID) retrievalFitScore=\(scoreStr) dominantTags=\(dom)"
+            )
+        }
+        #endif
+
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+        exchFacadeLog(
+            "discoverForYou done | elapsed=\(elapsedMs)ms | matches=\(rawDirectoryMatchCount) | afterFilter=\(mappedForYouItems.count) | afterMix=\(mixedItems.count)"
+        )
+
+        #if DEBUG
+        if let summary = mixed.qualitySummary {
+            exchFacadeLog("discoverForYou \(summary)")
+        }
+        let topScoreLog = mixedItems.compactMap(\.retrievalFitScore).max().map { String(format: "%.1f", $0) } ?? "nil"
+        exchFacadeLog(
+            "[ForYouQuality] discoverForYou summary raw=\(rawDirectoryMatchCount) mapped=\(mappedForYouItems.count) mixed=\(mixedItems.count) topScore=\(topScoreLog)"
+        )
+        #endif
+
+        let discoveryQuality = ForYouDiscoveryQualityClassifier.classify(
+            ForYouDiscoveryQualityInputs(
+                rawDirectoryMatchCount: rawDirectoryMatchCount,
+                afterLocalFilterCount: mappedForYouItems.count,
+                mixedItemCount: mixedItems.count,
+                mixedItems: mixedItems,
+                mixQualitySummary: mixed.qualitySummary,
+                directoryClientUnavailable: false
+            )
+        )
+
+        return ExchangeModels.DiscoverForYouOutcome(items: mixedItems, discoveryQuality: discoveryQuality)
+    }
+
+    /// Public-safe compact text for directory query embedding (For You rail only).
+    private static func buildForYouDirectoryEmbeddingText(
+        queryText: String,
+        directoryTags: [String],
+        openToTags: [String],
+        regionTags: [String],
+        interestTags: [String],
+        roleTags: [String]
+    ) -> String {
+        let parts = compactForYouEmbeddingParts([
+            queryText,
+            directoryTags.joined(separator: " "),
+            openToTags.joined(separator: ", "),
+            interestTags.joined(separator: ", "),
+            roleTags.joined(separator: ", "),
+            regionTags.joined(separator: ", ")
+        ])
+        var joined = parts
+            .joined(separator: ". ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
+        if joined.count > 1200 {
+            joined = String(joined.prefix(1200)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return joined
+    }
+
+    private static func compactForYouEmbeddingParts(_ values: [String]) -> [String] {
+        values.compactMap {
+            let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    /// Picks a For You card image in a surface-aware way: offer/commercial-led matches prefer the surfaced offer;
+    /// profile/social-led and unknown/mixed matches prefer the public profile; each side falls back to the other.
+    private static func discoverForYouPrimaryImageURL(
+        profile: ExchangePublicNodeProfile?,
+        surfacedOffer: ExchangeOffer?,
+        queryClassText: String?,
+        surfacePreferenceText: String?,
+        discoveryFactLines: [String]
+    ) -> String? {
+        let profileImage = profile?.primaryImageURL?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+        let offerImage = surfacedOffer?.displayHeroImageURL?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+
+        let queryPart = queryClassText?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank ?? ""
+        let surfacePart = surfacePreferenceText?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank ?? ""
+        let linesJoined = discoveryFactLines.joined(separator: "\n")
+        let corpus = [queryPart, surfacePart, linesJoined]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+            .lowercased()
+
+        let tokenCorpus = discoverForYouLowercaseTokens(corpus)
+
+        let industriesLine = discoverForYouDiscoveryHasIndustriesOrCategoriesLineWithBody(discoveryFactLines)
+        let offersListingLine = discoverForYouDiscoveryHasOffersLineWithBody(discoveryFactLines)
+        let commercialListing = discoverForYouSurfacedOfferSuggestsCommercialListing(surfacedOffer)
+
+        let corpusOfferCue = !tokenCorpus.isDisjoint(with: discoverForYouOfferImageCueTokens)
+        let corpusProfileCue = !tokenCorpus.isDisjoint(with: discoverForYouProfileImageCueTokens)
+
+        let offerDiscoveryCue = industriesLine || (offersListingLine && commercialListing) || corpusOfferCue
+        let profileDiscoveryCue =
+            discoverForYouDiscoveryHasProfileLineWithBody(discoveryFactLines) || corpusProfileCue
+
+        let offerLed = offerDiscoveryCue && !profileDiscoveryCue
+        if offerLed {
+            return offerImage ?? profileImage
+        }
+        return profileImage ?? offerImage
+    }
+
+    private static func discoverForYouSurfacedOfferSuggestsCommercialListing(_ offer: ExchangeOffer?) -> Bool {
+        guard let offer else { return false }
+        if offer.commercialFacts != .empty {
+            return true
+        }
+        if offer.category?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil {
+            return true
+        }
+        if !offer.tags.isEmpty {
+            return true
+        }
+        return false
+    }
+
+    private static func discoverForYouLowercaseTokens(_ text: String) -> Set<String> {
+        text
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .reduce(into: Set<String>()) { $0.insert($1) }
+    }
+
+    private static let discoverForYouOfferImageCueTokens: Set<String> = [
+        "commercial", "fulfillment", "pricing", "b2b", "saas", "vendor", "suppliers",
+        "supplier", "procurement", "wholesale", "marketplace", "inventory", "sku",
+        "quotation", "reseller", "invoicing"
+    ]
+
+    private static let discoverForYouProfileImageCueTokens: Set<String> = [
+        "social", "hobbies", "hobby", "networking", "mentorship", "friendship",
+        "community", "volunteer", "clubs", "enthusiasts", "enthusiast"
+    ]
+
+    private static func discoverForYouDiscoveryHasOffersLineWithBody(_ lines: [String]) -> Bool {
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            guard lower.hasPrefix("offers:") else { continue }
+            guard let colon = trimmed.firstIndex(of: ":") else { continue }
+            let rest = trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rest.isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func discoverForYouDiscoveryHasIndustriesOrCategoriesLineWithBody(_ lines: [String]) -> Bool {
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            guard lower.hasPrefix("industries/categories:") else { continue }
+            guard let colon = trimmed.firstIndex(of: ":") else { continue }
+            let rest = trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rest.isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static let discoverForYouProfileDiscoveryPrefixes: [String] = [
+        "about:", "interests:", "open to:", "roles:", "looking for:", "region:", "shared themes:"
+    ]
+
+    private static func discoverForYouDiscoveryHasProfileLineWithBody(_ lines: [String]) -> Bool {
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            guard discoverForYouProfileDiscoveryPrefixes.contains(where: { lower.hasPrefix($0) }) else { continue }
+            guard let colon = trimmed.firstIndex(of: ":") else { continue }
+            let rest = trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rest.isEmpty {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Card-facing profile line: headline when set, otherwise public ``summary`` (About You).
+    private static func discoverForYouCardHeadline(profile: ExchangePublicNodeProfile?) -> String? {
+        if let headline = profile?.headline?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            return headline
+        }
+        return profile?.summary?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank
+    }
+
+    private static func discoverForYouPublicFactLines(offer: ExchangeOffer?) -> [String] {
+        guard let offer else {
+            return []
+        }
+
+        let f = offer.fulfillment
+        let posture = "Fulfillment: \(f.pricingMode.rawValue) · \(f.commitmentMode.rawValue) · \(f.remoteFriendly ? "remote-friendly" : "onsite-leaning")"
+
+        let commercial = Array(offer.commercialSurfaceSkimLines.prefix(7))
+        let merged = ([posture] + commercial).prefix(10)
+        return Array(merged)
+    }
+
+    private static func discoverForYouDiscoveryFactLines(
+        profile: ExchangePublicNodeProfile?,
+        offers: [ExchangeOffer],
+        matchedTerms: [String]
+    ) -> [String] {
+        let offerTitles = offers.map(\.title)
+        let offerCategories = offers.compactMap(\.category)
+        let offerTags = offers.flatMap(\.tags)
+
+        let sharedThemes = matchedTerms
+            + (profile?.semantic.domains ?? [])
+            + (profile?.semantic.intentKinds ?? [])
+
+        let lines: [String?] = [
+            makeDiscoveryLine(label: "About", values: profile.map { [$0.summary ?? ""] } ?? []),
+            makeDiscoveryLine(label: "Open to", values: profile?.openTo ?? []),
+            makeDiscoveryLine(label: "Interests", values: profile?.interests ?? []),
+            makeDiscoveryLine(label: "Roles", values: profile?.activityTags ?? []),
+            makeDiscoveryLine(
+                label: "Looking for",
+                values: (profile?.openTo ?? []) + (profile?.semantic.intentKinds ?? [])
+            ),
+            makeDiscoveryLine(label: "Offers", values: offerTitles),
+            makeDiscoveryLine(label: "Industries/categories", values: offerCategories + offerTags),
+            makeDiscoveryLine(label: "Region", values: profile?.regionTags ?? []),
+            makeDiscoveryLine(label: "Shared themes", values: sharedThemes)
+        ]
+
+        var seen: Set<String> = []
+        return lines
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { line in
+                let normalized = line.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                return seen.insert(normalized).inserted
+            }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    private static func makeDiscoveryLine(label: String, values: [String]) -> String? {
+        let cleaned = cleanedDiscoveryValues(values).prefix(3)
+        guard !cleaned.isEmpty else { return nil }
+
+        let joined = cleaned.joined(separator: ", ")
+        let line = "\(label): \(joined)"
+        guard !isForbiddenForYouDiscoveryText(line) else { return nil }
+        return line
+    }
+
+    private static func cleanedDiscoveryValues(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { !isForbiddenForYouDiscoveryText($0) }
+            .filter { value in
+                let normalized = value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                return seen.insert(normalized).inserted
+            }
+    }
+
+    private static func isForbiddenForYouDiscoveryText(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let forbiddenTerms = [
+            "price",
+            "pricing",
+            "commercial facts",
+            "fulfillment",
+            "required buyer inputs",
+            "retrieval score",
+            "fit score",
+            "route requirement",
+            "access requirement",
+            "directcontactallowedonly",
+            "federationcapable",
+            "federation capable",
+            "query class",
+            "standing intent",
+            "schema",
+            "state logs",
+            "delivery",
+            "approval",
+            "autonomy"
+        ]
+        return forbiddenTerms.contains { lower.contains($0) }
+    }
+
+    /// Mirrors federation `hasDirectorySearchRecallSignal` (min query chars, embedding, or tags).
+    private static func forYouDirectoryHasRecallSignal(
+        queryText: String,
+        queryEmbedding: [Float]?,
+        tags: [String],
+        openToTags: [String],
+        offerTags: [String],
+        regionTags: [String],
+        minQueryChars: Int = 2
+    ) -> Bool {
+        let trimmedQuery = queryText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedQuery.count >= minQueryChars {
+            return true
+        }
+        if let queryEmbedding, !queryEmbedding.isEmpty {
+            return true
+        }
+        let tagCount = (tags + openToTags + offerTags + regionTags)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .count
+        return tagCount > 0
+    }
+
+    func makeForYouStandingIntentSignals(
+        localProfile: ExchangePublicNodeProfile?,
+        useStandingIntentAdapter: Bool
+    ) -> ForYouStandingIntentSignals {
+        if useStandingIntentAdapter {
+            return ForYouStandingIntentAdapter.adapt(localProfile: localProfile)
+        }
+
+        // Legacy path: public profile fields only (profile-interest For You rail).
+        let profileInterests = localProfile?.interests ?? []
+        let profileOpenTo = localProfile?.openTo ?? []
+        let profileActivityTags = localProfile?.activityTags ?? []
+        let profileRegionTags = localProfile?.regionTags ?? []
+        let profileSemanticDomains = localProfile?.semantic.domains ?? []
+        let profileSemanticIntents = localProfile?.semantic.intentKinds ?? []
+        let profileHeadline = localProfile?.headline
+        let profileSummary = localProfile?.summary
+
+        var queryParts: [String] = []
+        if let profileHeadline { queryParts.append(profileHeadline) }
+        if let profileSummary { queryParts.append(profileSummary) }
+        if !profileInterests.isEmpty { queryParts.append(profileInterests.joined(separator: ", ")) }
+        if !profileOpenTo.isEmpty { queryParts.append(profileOpenTo.joined(separator: ", ")) }
+        let queryText = queryParts.joined(separator: ". ").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let tags = Array(Set(profileActivityTags + profileSemanticDomains + profileSemanticIntents))
+
+        return ForYouStandingIntentSignals(
+            queryText: queryText,
+            tags: tags,
+            openToTags: profileOpenTo,
+            offerTags: [],
+            regionTags: profileRegionTags
+        )
+    }
+
+    // MARK: - Autonomous auto-approve helper (first-contact variant)
+
+    /// Result type for `autoApproveFirstContactIfSafe`.
+    enum AutoApproveFirstContactResult: String {
+        case queued
+        case missingDraft
+        case missingCounterparty
+        case notEligible
+        case alreadyQueued
+    }
+
+    /// Auto-approves and queues a first-contact outbound message when the existing
+    /// second-half display confirms the action is safe to take autonomously.
+    ///
+    /// This is modelled closely on `queueSecondHalfAutoResponseIfEligible` —
+    /// same approval construction, same eligibility check, same queue path —
+    /// without the `.autoRespond` action requirement, since a first-contact
+    /// draft may not yet have a second-half action assigned.
+    ///
+    /// Safety guards (all must pass):
+    /// - `display.canRunAutonomously == true`
+    /// - `display.needsHumanAttention == false`
+    /// - `display.boundary.allowsAutonomousSending == true`
+    /// - `display.boundary.requiresHumanApproval == false`
+    /// - `evaluateSendEligibility` returns eligible
+    func autoApproveFirstContactIfSafe(
+        threadID: ExchangeThread.ID,
+        display: ExchangeSecondHalfUIAdapter.DisplayModel,
+        counterparty: ExchangeCounterparty,
+        permit: OutboundQueuePermit,
+        autonomyNote: String,
+        now: Date
+    ) async throws -> AutoApproveFirstContactResult {
+        guard display.canRunAutonomously && !display.needsHumanAttention else {
+            return .notEligible
+        }
+
+        guard display.boundary.allowsAutonomousSending && !display.boundary.requiresHumanApproval else {
+            return .notEligible
+        }
+
+        // Find the most-recent actionable draft for this thread.
+        let allDrafts = try await store.listDrafts(threadID: threadID)
+        guard var draft = allDrafts
+            .filter({ $0.isActionable })
+            .sorted(by: { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            })
+            .first
+        else {
+            exchFacadeLog("autoApproveFirstContactIfSafe | reason=missingDraft | thread=\(threadID.uuidString)")
+            return .missingDraft
+        }
+
+        if draft.metadata["autonomous_first_contact_queued"] == "true" {
+            return .alreadyQueued
+        }
+
+        if draft.status != .approved {
+            draft = draft.approving(at: now)
+            draft.metadata["autonomous_first_contact_approved"] = "true"
+            draft.metadata["autonomous_first_contact_approved_at"] = ISO8601DateFormatter().string(from: now)
+            try await store.saveDraft(draft)
+        }
+
+        let thread = try await store.requireThread(id: threadID)
+
+        let eligibility = try await federationService.evaluateSendEligibility(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft
+        )
+
+        guard eligibility.isEligible else {
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: display.status.role,
+                        threadID: threadID,
+                        draftID: draft.id,
+                        selectedOfferID: thread.selectedOfferID,
+                        selectedPublicProfileID: thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: false,
+                        eligibilityReason: eligibility.reason,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "send_eligibility_denied",
+                        errorSummary: nil
+                    )
+                )
+            }
+            exchFacadeLog(
+                "autoApproveFirstContactIfSafe notEligible | thread=\(threadID.uuidString) | reason=\(eligibility.reason)"
+            )
+            return .notEligible
+        }
+
+        let approval = ExchangeApproval(
+            threadID: thread.id,
+            createdAt: now,
+            updatedAt: now,
+            status: .approved,
+            kind: .outboundSend,
+            requestedAction: .sendMessage,
+            draftID: draft.id,
+            summary: "Auto-approved autonomous first-contact message.",
+            rationale: firstNonBlank(
+                display.nextMove?.rationale,
+                display.recommendation,
+                "Autonomous policy allowed this low-commitment first-contact message to be sent automatically."
+            ) ?? "Autonomous policy allowed this low-commitment first-contact message to be sent automatically.",
+            decidedAt: now,
+            decisionNote: "Auto-approved by autonomous For You policy (\(display.boundary.kind)). No human approval boundary was triggered.",
+            metadata: [
+                "autonomous_first_contact": "true",
+                "autonomy_source": "for_you",
+                "autonomy_note": autonomyNote,
+                "second_half_boundary_kind": display.boundary.kind,
+                "second_half_boundary_requires_approval": "false",
+                "second_half_allows_autonomous_sending": "true"
+            ]
+        )
+
+        try await store.saveApproval(approval)
+
+        _ = try await queueApprovedOutboundWithPermit(
+            thread: thread,
+            counterparty: counterparty,
+            draft: draft,
+            approval: approval,
+            permit: permit,
+            disclosureLevel: .balanced,
+            priority: .userInitiated,
+            now: now
+        )
+
+        draft.metadata["autonomous_first_contact_queued"] = "true"
+        draft.metadata["autonomous_first_contact_queued_at"] = ISO8601DateFormatter().string(from: now)
+        try await store.saveDraft(draft)
+
+        exchFacadeLog(
+            "autoApproveFirstContactIfSafe queued | thread=\(threadID.uuidString) | draft=\(draft.id.uuidString) | counterparty=\(counterparty.id)"
+        )
+
+        return .queued
+    }
+
+    // MARK: - Autonomous For You pass
+
+    /// Runs the autonomous For You discovery-and-optionally-send pass.
+    ///
+    /// - Parameters:
+    ///   - localNodeID: The local node's ID (used for dedup and directory query context).
+    ///   - mode: Controls how far the pass proceeds.  Only `.safeAutoSend` may queue outbound.
+    ///   - recentContacts: A caller-owned cooldown dict `[counterpartyNodeID: lastContactDate]`.
+    ///     Callers (e.g. `AppServices`) are responsible for persisting updates to this dict.
+    ///   - limit: Max number of discovery results to fetch.
+    ///   - now: Injected clock for testability.
+    ///
+    /// Hard safety constraints enforced here:
+    /// - `discoverOnly` and `draftOnly` never queue outbound.
+    /// - Max 1 autonomous contact per pass.
+    /// - 24-hour cooldown per candidate node/counterparty ID.
+    /// - No duplicate active unresolved thread for the same counterparty (enforced in `discoverForYou`).
+    /// - Sending requires `secondHalfDisplay != nil`.
+    /// - Sending requires all four boundary/autonomy guards to pass.
+    /// - Thread must be verifiably linked to the chosen candidate before sending.
+    /// - `safeAutoSend` still requires thread autonomy (`secretary.threadAutonomy.mode` via
+    ///   `ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority`) to allow autonomous outbound.
+    /// - No raw relay send — all sends go through `federationService.queueApprovedOutbound` + `flushOutbox`.
+    public func runAutonomousForYouPass(
+        localNodeID: String?,
+        mode: ExchangeModels.SecretaryDiscoveryMode,
+        recentContacts: [String: Date],
+        limit: Int = 10,
+        now: Date = Date(),
+        useStandingIntentAdapter: Bool = false,
+        forceStandingInterestRefresh: Bool = false,
+        forYouMixContext: ForYouResultMixContext = .default
+    ) async throws -> ExchangeModels.AutonomousPassResult {
+        guard mode != .off else {
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: [],
+                sendOutcome: .noAction,
+                forYouDiscoveryQuality: nil
+            )
+        }
+
+        let start = CFAbsoluteTimeGetCurrent()
+        exchFacadeLog("runAutonomousForYouPass start | mode=\(mode.rawValue) | localNodeID=\(localNodeID ?? "nil")")
+
+        let discoverPack = try await discoverForYou(
+            localNodeID: localNodeID,
+            limit: limit,
+            now: now,
+            useStandingIntentAdapter: useStandingIntentAdapter,
+            forceStandingInterestRefresh: forceStandingInterestRefresh,
+            forYouMixContext: forYouMixContext
+        )
+        let items = discoverPack.items
+        let forYouDiscoveryQuality = discoverPack.discoveryQuality
+
+        guard mode != .discoverOnly else {
+            exchFacadeLog("runAutonomousForYouPass discoverOnly done | items=\(items.count)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                sendOutcome: .noAction,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // --- draftOnly or safeAutoSend path ---
+
+        let twentyFourHoursAgo = now.addingTimeInterval(-86_400)
+
+        // Max-1 enforcement: pick only the first candidate that passes ALL pre-conditions.
+        guard let candidate = items.first(where: { item in
+            guard item.canAutonomouslyContact, item.blockedReason == nil else { return false }
+            // 24h cooldown: key is nodeID (non-nil for every ForYouItem) falling back to id.
+            let cooldownKey = item.nodeID.isEmpty ? item.id : item.nodeID
+            if let last = recentContacts[cooldownKey], last > twentyFourHoursAgo {
+                exchFacadeLog(
+                    "runAutonomousForYouPass cooldown active | key=\(cooldownKey) | lastContact=\(last)"
+                )
+                return false
+            }
+            return true
+        }) else {
+            exchFacadeLog("runAutonomousForYouPass | reason=noCandidates | items=\(items.count)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                sendOutcome: items.contains(where: { $0.canAutonomouslyContact })
+                    ? .cooldownActive
+                    : .noCandidates,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        exchFacadeLog("runAutonomousForYouPass selected candidate | nodeID=\(candidate.nodeID) | displayName=\(candidate.displayName)")
+
+        // --- Build autonomous prompt ---
+        var promptParts: [String] = [
+            "Autonomous private-network first contact.",
+            "Based on my profile and this public offer/profile, prepare a short, low-commitment introduction.",
+            "Do not promise price, schedule, availability, legal terms, or sensitive information.",
+            "Ask one lightweight question or express interest."
+        ]
+        promptParts.append("Candidate: \(candidate.displayName)")
+        if let headline = candidate.headline { promptParts.append("Headline: \(headline)") }
+        if let offer = candidate.topOfferTitle { promptParts.append("Offer: \(offer)") }
+        if let reason = candidate.matchReasonSummary { promptParts.append("Match reason: \(reason)") }
+        if !candidate.dominantTags.isEmpty {
+            promptParts.append("Matched terms: \(candidate.dominantTags.joined(separator: ", "))")
+        }
+        let prompt = promptParts.joined(separator: "\n")
+
+        // --- Create thread + draft via existing orchestrator / LLM path ---
+        let response: ExchangeOrchestrator.Response
+        do {
+            response = try await submit(prompt, threadID: nil, now: now)
+        } catch {
+            exchFacadeLog("runAutonomousForYouPass submit failed | error=\(error)")
+            throw error
+        }
+        let threadID = response.thread.id
+
+        // --- Tag thread with autonomous metadata ---
+        do {
+            var thread = try await store.requireThread(id: threadID)
+            thread.metadata["autonomous_first_contact"] = "true"
+            thread.metadata["autonomy_source"] = "for_you"
+            thread.metadata["autonomy_mode"] = mode.rawValue
+            thread.metadata["autonomous_counterparty_id"] = candidate.nodeID
+            thread.updatedAt = now
+            try await store.updateThread(thread)
+        } catch {
+            exchFacadeLog("runAutonomousForYouPass metadata tag failed (non-fatal) | error=\(error)")
+        }
+
+        let contactedAt = now
+
+        // draftOnly: stop here, do not queue outbound.
+        if mode == .draftOnly {
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog("runAutonomousForYouPass draftOnly done | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .draftOnly,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // --- safeAutoSend only from here ---
+
+        // Discovery mode controls whether opportunities are found; thread autonomy controls whether
+        // anything may be sent autonomously. Do not let safeAutoSend bypass draft/manual autonomy.
+        let threadAutonomyAuthority = ExchangeAutonomousSendPolicy.currentThreadAutonomyAuthority()
+        guard threadAutonomyAuthority.allowsAutonomousSend else {
+            exchFacadeLog(
+                "runAutonomousForYouPass blocked | reason=threadAutonomy | authority=\(threadAutonomyAuthority.rawValue) | threadID=\(threadID.uuidString)"
+            )
+            do {
+                var thread = try await store.requireThread(id: threadID)
+                thread.metadata["for_you_send_blocked_reason"] = "thread_autonomy"
+                thread.metadata["for_you_thread_autonomy_authority"] = threadAutonomyAuthority.rawValue
+                thread.updatedAt = now
+                try await store.updateThread(thread)
+            } catch {
+                exchFacadeLog(
+                    "runAutonomousForYouPass threadAutonomy metadata update failed (non-fatal) | error=\(error)"
+                )
+            }
+            let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            exchFacadeLog(
+                "runAutonomousForYouPass threadAutonomy blocked | elapsed=\(elapsedMs)ms | threadID=\(threadID.uuidString)"
+            )
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .disabledByThreadAutonomy,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // Fetch full thread detail (includes second-half display computed by submit's
+        // runSecondHalfAfterThreadMutation call).
+        let detail: ExchangeModels.ThreadDetail
+        do {
+            detail = try await getThread(threadID: threadID)
+        } catch {
+            exchFacadeLog("runAutonomousForYouPass getThread failed | error=\(error)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .unsafeBoundary,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // Guard 1: secondHalfDisplay must be present.
+        guard let display = detail.secondHalfDisplay else {
+            exchFacadeLog("runAutonomousForYouPass blocked | reason=secondHalfDisplayNil | threadID=\(threadID.uuidString)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .unsafeBoundary,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // Guard 2: All four boundary/autonomy flags must pass.
+        guard display.canRunAutonomously,
+              !display.needsHumanAttention,
+              display.boundary.allowsAutonomousSending,
+              !display.boundary.requiresHumanApproval
+        else {
+            exchFacadeLog(
+                "runAutonomousForYouPass blocked | reason=boundaryOrAutonomy | threadID=\(threadID.uuidString) | " +
+                "canRunAutonomously=\(display.canRunAutonomously) | needsHumanAttention=\(display.needsHumanAttention) | " +
+                "allowsAutonomousSending=\(display.boundary.allowsAutonomousSending) | " +
+                "requiresHumanApproval=\(display.boundary.requiresHumanApproval)"
+            )
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .unsafeBoundary,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        let pass3OutboundGate = ExchangeAgencyPlanner.evaluateAutonomousOutboundGate(display: display)
+        if !pass3OutboundGate.allowed {
+            #if DEBUG
+            exchFacadeLog(
+                "runAutonomousForYouPass blocked | reason=pass3AgencyGate | threadID=\(threadID.uuidString) | " +
+                "agency_suggestion_kind=\(pass3OutboundGate.agencySuggestionKind ?? "nil") | " +
+                "agency_block_reason=\(pass3OutboundGate.agencyBlockReason ?? pass3OutboundGate.vetoReason ?? "nil") | " +
+                "used_public_facts_count=\(pass3OutboundGate.usedPublicFactsCount)"
+            )
+            #endif
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .notEligible,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        if detail.thread.metadata["inbound_requires_verified_context_hold"] == "true" {
+            exchFacadeLog(
+                "runAutonomousForYouPass blocked | reason=missingVerifiedContext | threadID=\(threadID.uuidString)"
+            )
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .notEligible,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // Guard 3: Verify the created thread is tied to the chosen candidate.
+        // The orchestrator sets selectedCounterpartyID during discovery; if it chose a different
+        // counterparty (e.g. because the directory match didn't produce a local record) the thread
+        // cannot safely be sent on behalf of the candidate we committed to.
+        let currentThread = detail.thread
+        let threadCounterpartyID = currentThread.selectedCounterpartyID
+            ?? currentThread.metadata["autonomous_counterparty_id"]
+        let candidateID = candidate.nodeID.isEmpty ? candidate.id : candidate.nodeID
+
+        let isBound: Bool
+        if let bound = threadCounterpartyID {
+            isBound = bound == candidateID
+        } else {
+            // No counterparty assigned yet; try to patch it now.
+            do {
+                var patched = try await store.requireThread(id: threadID)
+                patched.selectedCounterpartyID = candidateID
+                patched.metadata["autonomous_counterparty_id"] = candidateID
+                patched.updatedAt = now
+                try await store.updateThread(patched)
+                isBound = true
+                exchFacadeLog("runAutonomousForYouPass bound candidate to thread | candidateID=\(candidateID) | threadID=\(threadID.uuidString)")
+            } catch {
+                exchFacadeLog("runAutonomousForYouPass candidate binding failed | error=\(error)")
+                isBound = false
+            }
+        }
+
+        guard isBound else {
+            exchFacadeLog("runAutonomousForYouPass blocked | reason=candidateBindingFailed | threadID=\(threadID.uuidString)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .candidateBindingFailed,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // Resolve the counterparty for the federation send path.
+        let selectedCounterparty: ExchangeCounterparty?
+        if let cp = detail.selectedCounterparty {
+            selectedCounterparty = cp
+        } else {
+            selectedCounterparty = try? await store.fetchCounterparty(id: candidateID)
+        }
+
+        guard let counterparty = selectedCounterparty else {
+            exchFacadeLog("runAutonomousForYouPass blocked | reason=missingCounterparty | candidateID=\(candidateID)")
+            return ExchangeModels.AutonomousPassResult(
+                forYouItems: items,
+                contactedCounterpartyID: candidate.nodeID,
+                contactedAt: contactedAt,
+                contactedThreadID: threadID,
+                sendOutcome: .notEligible,
+                forYouDiscoveryQuality: forYouDiscoveryQuality
+            )
+        }
+
+        // --- Send path ---
+
+        // Prefer the pending approval created by the orchestrator (thread in .awaitingApproval).
+        let pendingApproval = detail.approvals.first { $0.status == .pending }
+
+        if let pending = pendingApproval {
+            // Orchestrator already created an approval; use the existing approveAndQueue path
+            // which handles the state machine transition (.awaitingApproval → .sending).
+            do {
+                _ = try await approveAndQueue(
+                    threadID: threadID,
+                    approvalID: pending.id,
+                    permit: .agencyAutonomy(
+                        source: "runAutonomousForYouPass.pendingApproval",
+                        gate: pass3OutboundGate
+                    ),
+                    now: now
+                )
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                exchFacadeLog(
+                    "runAutonomousForYouPass queued via approveAndQueue | elapsed=\(elapsedMs)ms | " +
+                    "threadID=\(threadID.uuidString) | approvalID=\(pending.id.uuidString)"
+                )
+                return ExchangeModels.AutonomousPassResult(
+                    forYouItems: items,
+                    contactedCounterpartyID: candidate.nodeID,
+                    contactedAt: contactedAt,
+                    contactedThreadID: threadID,
+                    sendOutcome: .queued,
+                    forYouDiscoveryQuality: forYouDiscoveryQuality
+                )
+            } catch {
+                exchFacadeLog("runAutonomousForYouPass approveAndQueue failed | error=\(error) | threadID=\(threadID.uuidString)")
+                return ExchangeModels.AutonomousPassResult(
+                    forYouItems: items,
+                    contactedCounterpartyID: candidate.nodeID,
+                    contactedAt: contactedAt,
+                    contactedThreadID: threadID,
+                    sendOutcome: .notEligible,
+                    forYouDiscoveryQuality: forYouDiscoveryQuality
+                )
+            }
+        } else {
+            // No pending approval (thread may be in .draftReady).
+            // Use the internal first-contact auto-approve helper — same approval + eligibility
+            // + queueApprovedOutbound pattern as queueSecondHalfAutoResponseIfEligible.
+            do {
+                let outcome = try await autoApproveFirstContactIfSafe(
+                    threadID: threadID,
+                    display: display,
+                    counterparty: counterparty,
+                    permit: .agencyAutonomy(
+                        source: "runAutonomousForYouPass.firstContactAutoApprove",
+                        gate: pass3OutboundGate
+                    ),
+                    autonomyNote: "autonomous_for_you_pass",
+                    now: now
+                )
+                let sendOutcome: ExchangeModels.AutonomousPassResult.SendOutcome
+                switch outcome {
+                case .queued: sendOutcome = .queued
+                case .missingDraft, .missingCounterparty: sendOutcome = .unsafeBoundary
+                case .notEligible: sendOutcome = .notEligible
+                case .alreadyQueued: sendOutcome = .queued
+                }
+                let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+                exchFacadeLog(
+                    "runAutonomousForYouPass autoApprove | elapsed=\(elapsedMs)ms | outcome=\(outcome.rawValue) | threadID=\(threadID.uuidString)"
+                )
+                return ExchangeModels.AutonomousPassResult(
+                    forYouItems: items,
+                    contactedCounterpartyID: candidate.nodeID,
+                    contactedAt: contactedAt,
+                    contactedThreadID: threadID,
+                    sendOutcome: sendOutcome,
+                    forYouDiscoveryQuality: forYouDiscoveryQuality
+                )
+            } catch {
+                exchFacadeLog("runAutonomousForYouPass autoApprove threw | error=\(error) | threadID=\(threadID.uuidString)")
+                return ExchangeModels.AutonomousPassResult(
+                    forYouItems: items,
+                    contactedCounterpartyID: candidate.nodeID,
+                    contactedAt: contactedAt,
+                    contactedThreadID: threadID,
+                    sendOutcome: .notEligible,
+                    forYouDiscoveryQuality: forYouDiscoveryQuality
+                )
+            }
+        }
+    }
+}
+
+private extension ExchangeFacade {
+    func recordAutonomousSendAttempt(_ attempt: AutonomousSendAttempt) async {
+        do {
+            try await store.appendAuditRecord(ExchangeAuditRecord.autonomousSendAttemptTrace(attempt: attempt))
+        } catch {
+            #if DEBUG
+            exchFacadeLog("recordAutonomousSendAttempt appendAuditRecord failed | error=\(error)")
+            #endif
+        }
+    }
+
+    func queueApprovedOutboundWithPermit(
+        thread: ExchangeThread,
+        counterparty: ExchangeCounterparty,
+        draft: ExchangeMessageDraft,
+        approval: ExchangeApproval,
+        permit: OutboundQueuePermit,
+        disclosureLevel: ExchangeRelayEnvelope.Payload.DisclosureLevel,
+        priority: ExchangeDeliveryState.Priority,
+        now: Date
+    ) async throws -> ExchangeFederationQueueResult {
+        switch permit {
+        case let .userApproved(source):
+            secSendBridgeLog(
+                "queue permit accepted | kind=userApproved | source=\(source) | thread=\(thread.id.uuidString)"
+            )
+
+        case let .agencyAutonomy(source, gate):
+            guard gate.allowed else {
+                secSendBridgeLog(
+                    "queue permit denied | kind=agencyAutonomy | source=\(source) | thread=\(thread.id.uuidString) | agency_block_reason=\(gate.agencyBlockReason ?? gate.vetoReason ?? "nil")"
+                )
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: thread.id,
+                        draftID: draft.id,
+                        selectedOfferID: thread.selectedOfferID,
+                        selectedPublicProfileID: thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: nil,
+                        eligibilityReason: nil,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "agency_autonomy_permit_denied",
+                        errorSummary: nil
+                    )
+                )
+                throw ExchangeStoreError.storageFailure(
+                    reason: "Agency autonomy permit denied at outbound queue boundary."
+                )
+            }
+            secSendBridgeLog(
+                "queue permit accepted | kind=agencyAutonomy | source=\(source) | thread=\(thread.id.uuidString) | agency_suggestion_kind=\(gate.agencySuggestionKind ?? "nil")"
+            )
+        }
+
+        do {
+            let result = try await federationService.queueApprovedOutbound(
+                thread: thread,
+                counterparty: counterparty,
+                draft: draft,
+                approval: approval,
+                disclosureLevel: disclosureLevel,
+                priority: priority,
+                now: now
+            )
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: thread.id,
+                        draftID: draft.id,
+                        selectedOfferID: thread.selectedOfferID,
+                        selectedPublicProfileID: thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: nil,
+                        eligibilityReason: nil,
+                        permitKind: "agencyAutonomy",
+                        queued: true,
+                        skipReason: nil,
+                        errorSummary: nil
+                    )
+                )
+            }
+            #if DEBUG
+            exchFacadeLog(
+                "[RefreshTrace][SendQueued] thread=\(thread.id.uuidString) draft=\(draft.id.uuidString) outboxItem=\(result.outboxItem.id.uuidString) envelopeID=\(result.outboxItem.envelopeID) trigger=postQueueImmediate time=\(now)"
+            )
+            #endif
+            Task {
+                do {
+                    let flushResult = try await flushOutbox(now: Date())
+                    #if DEBUG
+                    exchFacadeLog(
+                        "[RefreshTrace][FlushResult] runID=facade-postQueue attempted=\(flushResult.attempted) acknowledged=\(flushResult.acknowledged) failed=\(flushResult.failed) deferred=\(flushResult.deferred) envelopeIDs=see-relay-send-logs time=\(Date())"
+                    )
+                    #endif
+                } catch {
+                    #if DEBUG
+                    exchFacadeLog(
+                        "[RefreshTrace][FlushResult] runID=facade-postQueue attempted=0 acknowledged=0 failed=1 deferred=0 envelopeIDs=none time=\(Date()) error=\(error)"
+                    )
+                    #endif
+                }
+            }
+            return result
+        } catch {
+            if case let .agencyAutonomy(source, gate) = permit {
+                await recordAutonomousSendAttempt(
+                    AutonomousSendAttempt(
+                        lane: source,
+                        role: nil,
+                        threadID: thread.id,
+                        draftID: draft.id,
+                        selectedOfferID: thread.selectedOfferID,
+                        selectedPublicProfileID: thread.selectedPublicProfileID,
+                        lastInboundEnvelopeID: thread.lastInboundEnvelopeID,
+                        pass3Allowed: gate.allowed,
+                        pass3BlockReason: gate.agencyBlockReason,
+                        pass3Veto: gate.vetoReason,
+                        policyAllowed: nil,
+                        policyOutcome: nil,
+                        eligibilityAllowed: nil,
+                        eligibilityReason: nil,
+                        permitKind: "agencyAutonomy",
+                        queued: false,
+                        skipReason: "queue_approved_outbound_failed",
+                        errorSummary: String(describing: error)
+                    )
+                )
+            }
+            throw error
+        }
+    }
+
+
+    func makeWorkTraceCard(for thread: ExchangeThread) -> ExchangeModels.WorkTraceCard? {
+        ExchangeModels.WorkTraceCard(thread.workTrace)
+    }
+
+    func selectionBasisSummary(
+        for thread: ExchangeThread,
+        selectedCounterparty: ExchangeCounterparty?
+    ) -> String? {
+        if let rationale = thread.selectedMatchRationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rationale.isEmpty {
+            return rationale
+        }
+
+        if let rationale = thread.selectedPath?.rationale?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rationale.isEmpty {
+            return rationale
+        }
+
+        if let selectedCounterparty {
+            let headline = counterpartyPublicSurfaceHeadline(selectedCounterparty)
+                ?? selectedCounterparty.bestDisplayLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !headline.isEmpty else { return nil }
+            return "Found a likely path through \(headline)."
+        }
+
+        return nil
+    }
+
+    /// Prefer embedded public profile display over raw node id for selection-basis copy.
+    private func counterpartyPublicSurfaceHeadline(_ counterparty: ExchangeCounterparty) -> String? {
+        counterparty.publicCoordinationHeadline
+    }
+
+    func loadCounterparties(ids: [ExchangeCounterparty.ID]) async throws -> [ExchangeCounterparty] {
+        var result: [ExchangeCounterparty] = []
+        result.reserveCapacity(ids.count)
+
+        var seen = Set<String>()
+        for rawID in ids {
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            guard !seen.contains(id) else { continue }
+            seen.insert(id)
+
+            if let counterparty = try await store.fetchCounterparty(id: id) {
+                result.append(counterparty)
+            }
+        }
+
+        return result
+    }
+
+    static func directoryMatchForManualTrustedContact(
+        _ match: ExchangeDirectoryMatch,
+        canonicalNodeID: String
+    ) -> Bool {
+        let c = canonicalNodeID
+        if match.counterparty.id == c { return true }
+        if match.counterparty.identity?.nodeID == c { return true }
+        guard let profile = match.publicProfile else { return false }
+        if profile.nodeID == c { return true }
+        if profile.id == c { return true }
+        if profile.counterpartyID == c { return true }
+        return false
+    }
+
+    static func alignedPublicProfileForManualTrustedContact(
+        _ profile: ExchangePublicNodeProfile?,
+        canonicalCounterpartyID: String
+    ) -> ExchangePublicNodeProfile? {
+        guard var profile else { return nil }
+        profile.nodeID = canonicalCounterpartyID
+        profile.counterpartyID = canonicalCounterpartyID
+        return profile
+    }
+
+    /// Display name for a persisted trusted-contact execution profile (omit raw node id placeholders).
+    static func knownTrustedContactProfileDisplayName(
+        displayNameOverride: String?,
+        existingCounterparty: ExchangeCounterparty?,
+        canonicalTarget: String
+    ) -> String? {
+        if let overrideDisplay = displayNameOverride?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank {
+            return overrideDisplay
+        }
+        let existingName = existingCounterparty?
+            .displayName
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !existingName.isEmpty, existingName != canonicalTarget {
+            return existingName
+        }
+        return nil
+    }
+
+    /// Minimal federation execution surface for trusted manual DM when no directory/public profile exists.
+    static func syntheticTrustedContactExecutionProfile(
+        canonicalCounterpartyID: String,
+        displayName: String?,
+        now: Date
+    ) -> ExchangePublicNodeProfile {
+        ExchangePublicNodeProfile(
+            id: "trusted-contact-basis-\(canonicalCounterpartyID)",
+            nodeID: canonicalCounterpartyID,
+            counterpartyID: canonicalCounterpartyID,
+            displayName: displayName,
+            headline: nil,
+            summary: nil,
+            visibility: .discoverable,
+            interests: [],
+            offers: [],
+            openTo: [],
+            excludedTopics: [],
+            activityTags: [],
+            regionTags: [],
+            semantic: .init(),
+            reachability: ExchangePublicNodeProfile.ReachabilityPolicy(
+                accessMode: .direct,
+                acceptingInbound: true,
+                intentCategoryPolicy: .permissive,
+                disclosureCeiling: .balanced
+            ),
+            approach: .init(),
+            availability: .open,
+            createdAt: now,
+            updatedAt: now,
+            primaryImageURL: nil,
+            metadata: ["synthetic_trusted_contact_execution_basis": "true"]
+        )
+    }
+}
+
+private extension ExchangeFacade {
+    func resolveExecutionProfileForTrustedManualSend(
+        counterparty: ExchangeCounterparty,
+        trustedNodeID: String,
+        now: Date
+    ) async throws -> ExchangePublicNodeProfile {
+        if let profile = counterparty.publicProfile {
+            return profile
+        }
+
+        let activeEdges = try await store.listTrustEdges(
+            filter: ExchangeTrustEdgeFilter(
+                targetNodeID: trustedNodeID,
+                activeOnly: true,
+                limit: 8
+            )
+        )
+        guard !activeEdges.isEmpty else {
+            throw ExchangeStoreError.storageFailure(
+                reason: "This trusted contact has no public execution surface for federation send."
+            )
+        }
+
+        let synthetic = Self.syntheticTrustedContactExecutionProfile(
+            canonicalCounterpartyID: trustedNodeID,
+            displayName: Self.knownTrustedContactProfileDisplayName(
+                displayNameOverride: nil,
+                existingCounterparty: counterparty,
+                canonicalTarget: trustedNodeID
+            ),
+            now: now
+        )
+        let persisted = try await persistTrustedContactExecutionProfile(
+            profile: synthetic,
+            counterparty: counterparty,
+            now: now
+        )
+        #if DEBUG
+        Swift.print(
+            "[TrustedContactSend] nodeID=\(trustedNodeID) syntheticExecutionBasis=true persisted=true"
+        )
+        #endif
+        return persisted
+    }
+
+    func persistTrustedContactExecutionProfile(
+        profile: ExchangePublicNodeProfile,
+        counterparty: ExchangeCounterparty,
+        now: Date
+    ) async throws -> ExchangePublicNodeProfile {
+        var taggedProfile = profile
+        ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationProfile(&taggedProfile, now: now)
+        var updatedCounterparty = counterparty
+        updatedCounterparty.publicProfile = taggedProfile
+        updatedCounterparty.updatedAt = now
+        let taggedCounterparty = ExchangeRemoteDiscoveryCacheMetadata.tagContactHydrationCounterparty(
+            updatedCounterparty,
+            now: now
+        )
+        try await store.upsertCounterparties([taggedCounterparty])
+        try await store.savePublicProfile(taggedProfile)
+        if let fetched = try await store.fetchPublicProfile(id: taggedProfile.id) {
+            return fetched
+        }
+        return taggedProfile
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// Profile-interest standing intent for For You (`ExchangePublicNodeProfile` only).
+/// Local commercial offers must not steer the directory query; remote match offers remain card context in `discoverForYou`.
+private enum ForYouStandingIntentAdapter {
+    static func adapt(
+        localProfile: ExchangePublicNodeProfile?
+    ) -> ExchangeFacade.ForYouStandingIntentSignals {
+        let profileInterests = localProfile?.interests ?? []
+        let profileOpenTo = localProfile?.openTo ?? []
+        let profileActivityTags = localProfile?.activityTags ?? []
+        let profileRegionTags = localProfile?.regionTags ?? []
+        let profileSemanticDomains = localProfile?.semantic.domains ?? []
+        let profileSemanticIntents = localProfile?.semantic.intentKinds ?? []
+
+        var queryParts: [String] = []
+        if let headline = localProfile?.headline { queryParts.append(headline) }
+        if let summary = localProfile?.summary { queryParts.append(summary) }
+        if !profileInterests.isEmpty { queryParts.append(profileInterests.joined(separator: ", ")) }
+        if !profileOpenTo.isEmpty { queryParts.append(profileOpenTo.joined(separator: ", ")) }
+
+        let queryText = queryParts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let tags = Array(
+            Set(
+                profileActivityTags
+                    + profileSemanticDomains
+                    + profileSemanticIntents
+            )
+        )
+
+        return ExchangeFacade.ForYouStandingIntentSignals(
+            queryText: queryText,
+            tags: tags,
+            openToTags: profileOpenTo,
+            offerTags: [],
+            regionTags: profileRegionTags
+        )
+    }
+}
+
+private extension ExchangeTrustEdge.TrustLevel {
+    var sortRank: Int {
+        switch self {
+        case .high:
+            return 3
+        case .standard:
+            return 2
+        case .low:
+            return 1
+        }
+    }
+}
+
+extension ExchangeFacade {
+    /// For `AnumAPPTests` validation (`@testable import AnumCore`); forwards to inbound inquiry shaping.
+    func test_support_makeInboundInquiryIfAvailable(
+        thread: ExchangeThread,
+        turns: [ExchangeTurn],
+        selectedCounterparty: ExchangeCounterparty?,
+        knownFacts: [String],
+        unresolvedIssues: [String]
+    ) async -> ExchangeInboundInquiry? {
+        await makeInboundInquiryIfAvailable(
+            thread: thread,
+            turns: turns,
+            selectedCounterparty: selectedCounterparty,
+            knownFacts: knownFacts,
+            unresolvedIssues: unresolvedIssues
+        )
+    }
+
+    /// For `AnumAPPTests`; forwards to the file-private second-half mutation runner.
+    func test_support_runSecondHalfAfterThreadMutation(
+        threadID: ExchangeThread.ID,
+        source: String,
+        now: Date = Date()
+    ) async {
+        await runSecondHalfAfterThreadMutation(threadID: threadID, source: source, now: now)
+    }
+}

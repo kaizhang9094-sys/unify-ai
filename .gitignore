@@ -1,0 +1,11 @@
+
+# Swift/Xcode build output
+.build/
+DerivedData/
+xcuserdata/
+*.gguf
+*.onnx
+*.mlmodel
+*.mlmodelc/
+*.dSYM/
+*.dylib

@@ -1,0 +1,885 @@
+import Foundation
+
+/// Bounded JSON output from the optional Pass 3 rewrite helper.
+public struct ExchangeAgencyDraftRewrite: Codable, Sendable, Hashable {
+    public var body: String
+    public var usedFacts: [String]
+    public var requiresApproval: Bool
+    public var missingFacts: [String]
+
+    public init(
+        body: String,
+        usedFacts: [String] = [],
+        requiresApproval: Bool,
+        missingFacts: [String] = []
+    ) {
+        self.body = body
+        self.usedFacts = usedFacts
+        self.requiresApproval = requiresApproval
+        self.missingFacts = missingFacts
+    }
+}
+
+public struct ExchangeAgencyDraftRewriteResult: Sendable, Hashable {
+    public var body: String
+    public var accepted: Bool
+    public var rejectionReasons: [String]
+
+    public init(
+        body: String,
+        accepted: Bool,
+        rejectionReasons: [String] = []
+    ) {
+        self.body = body
+        self.accepted = accepted
+        self.rejectionReasons = rejectionReasons
+    }
+}
+
+/// Optional LLM polish for **wording only** — deterministic draft remains the safe fallback.
+///
+/// - Important: Callers must **not** treat this as autonomy to send; approvals and eligibility stay upstream.
+public enum ExchangeAgencyDraftRewriteEngine {
+    public static func rewriteRequesterClarification(
+        packet: RequesterClarificationDraftPacket,
+        deterministicBaseDraft: String
+    ) async -> ExchangeAgencyDraftRewriteResult {
+        ExchangeAgencyDraftRewriteResult(
+            body: deterministicBaseDraft,
+            accepted: false,
+            rejectionReasons: ["no_runner_available"]
+        )
+    }
+
+    public static func rewriteRequesterClarification(
+        packet: RequesterClarificationDraftPacket,
+        deterministicBaseDraft: String,
+        runner: any ExchangeIntelligenceModelRunner
+    ) async -> ExchangeAgencyDraftRewriteResult {
+        let base = deterministicBaseDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else {
+            return ExchangeAgencyDraftRewriteResult(
+                body: deterministicBaseDraft,
+                accepted: false,
+                rejectionReasons: ["empty_deterministic_base"]
+            )
+        }
+
+        let prompt = requesterClarificationPrompt(
+            packet: packet,
+            deterministicBaseDraft: base
+        )
+
+        let styleSupplement = Self.secretaryStyleSupplement(from: packet.styleProfile)
+        do {
+            let raw = try await runner.run(
+                ExchangeIntelligenceModelRunRequest(
+                    task: .requesterDraft,
+                    prompt: prompt,
+                    maxTokens: 420,
+                    representationSupplement: styleSupplement
+                )
+            )
+
+            let body = decodeBodyOnly(raw: raw) ?? base
+            let candidate = clipped(body, maxLength: packet.maxLength)
+            let reasons = ExchangeAgencyDraftValidator.validateRequesterClarification(
+                body: candidate,
+                packet: packet
+            )
+            if reasons.isEmpty {
+                return ExchangeAgencyDraftRewriteResult(
+                    body: candidate,
+                    accepted: true,
+                    rejectionReasons: []
+                )
+            }
+
+            return ExchangeAgencyDraftRewriteResult(
+                body: base,
+                accepted: false,
+                rejectionReasons: reasons
+            )
+        } catch {
+            return ExchangeAgencyDraftRewriteResult(
+                body: base,
+                accepted: false,
+                rejectionReasons: ["rewrite_error"]
+            )
+        }
+    }
+
+    public static func rewriteProviderResponse(
+        packet: ProviderResponseDraftPacket,
+        deterministicBaseDraft: String
+    ) async -> ExchangeAgencyDraftRewriteResult {
+        ExchangeAgencyDraftRewriteResult(
+            body: deterministicBaseDraft,
+            accepted: false,
+            rejectionReasons: ["no_runner_available"]
+        )
+    }
+
+    public static func rewriteProviderResponse(
+        packet: ProviderResponseDraftPacket,
+        deterministicBaseDraft: String,
+        runner: any ExchangeIntelligenceModelRunner
+    ) async -> ExchangeAgencyDraftRewriteResult {
+        let base = deterministicBaseDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else {
+            return ExchangeAgencyDraftRewriteResult(
+                body: deterministicBaseDraft,
+                accepted: false,
+                rejectionReasons: ["empty_deterministic_base"]
+            )
+        }
+
+        let prompt = providerResponsePrompt(
+            packet: packet,
+            deterministicBaseDraft: base
+        )
+
+        let styleSupplement = Self.secretaryStyleSupplement(from: packet.styleProfile)
+        do {
+            let raw = try await runner.run(
+                ExchangeIntelligenceModelRunRequest(
+                    task: .providerDraft,
+                    prompt: prompt,
+                    maxTokens: 520,
+                    representationSupplement: styleSupplement
+                )
+            )
+            let body = decodeBodyOnly(raw: raw) ?? base
+            let candidate = clipped(body, maxLength: packet.maxLength)
+            let validation = ExchangeAgencyDraftValidator.validateProviderResponse(
+                body: candidate,
+                packet: packet
+            )
+            if validation.accepted {
+                return ExchangeAgencyDraftRewriteResult(
+                    body: candidate,
+                    accepted: true,
+                    rejectionReasons: []
+                )
+            }
+
+            return ExchangeAgencyDraftRewriteResult(
+                body: base,
+                accepted: false,
+                rejectionReasons: validation.rejectionReasons
+            )
+        } catch {
+            return ExchangeAgencyDraftRewriteResult(
+                body: base,
+                accepted: false,
+                rejectionReasons: ["rewrite_error"]
+            )
+        }
+    }
+
+    /// LLM-authored autonomous outbound (requester). Marker: `AGENCY_AUTONOMOUS_OUTBOUND_JSON_V1`.
+    public struct ExchangeAgencyAutonomousComposeResult: Sendable, Hashable {
+        public var subject: String?
+        public var body: String
+        public var accepted: Bool
+        public var rejectionReasons: [String]
+
+        public init(
+            subject: String?,
+            body: String,
+            accepted: Bool,
+            rejectionReasons: [String] = []
+        ) {
+            self.subject = subject
+            self.body = body
+            self.accepted = accepted
+            self.rejectionReasons = rejectionReasons
+        }
+    }
+
+    public static func composeRequesterAutonomousOutbound(
+        packet: RequesterClarificationDraftPacket,
+        runner: any ExchangeIntelligenceModelRunner
+    ) async -> ExchangeAgencyAutonomousComposeResult {
+        let prompt = requesterAutonomousComposePrompt(packet: packet)
+        let styleSupplement = Self.secretaryStyleSupplement(from: packet.styleProfile)
+        #if DEBUG
+        print(
+            "[RequesterDraft] styleApplied=true styleChars=\(styleSupplement?.count ?? 0) path=llm_compose"
+        )
+        #endif
+        do {
+            let raw = try await runner.run(
+                ExchangeIntelligenceModelRunRequest(
+                    task: .requesterDraft,
+                    prompt: prompt,
+                    maxTokens: 520,
+                    representationSupplement: styleSupplement
+                )
+            )
+            return parseAutonomousCompose(raw: raw, packet: packet)
+        } catch {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["compose_error"]
+            )
+        }
+    }
+
+    public static func composeProviderAutonomousOutbound(
+        packet: ProviderResponseDraftPacket,
+        runner: any ExchangeIntelligenceModelRunner
+    ) async -> ExchangeAgencyAutonomousComposeResult {
+        let prompt = providerAutonomousComposePrompt(packet: packet)
+        let styleSupplement = Self.secretaryStyleSupplement(from: packet.styleProfile)
+        #if DEBUG
+        print(
+            "[ProviderDraft] styleApplied=true styleChars=\(styleSupplement?.count ?? 0) source=autonomous_compose"
+        )
+        #endif
+        do {
+            let raw = try await runner.run(
+                ExchangeIntelligenceModelRunRequest(
+                    task: .providerDraft,
+                    prompt: prompt,
+                    maxTokens: 640,
+                    representationSupplement: styleSupplement
+                )
+            )
+            return parseAutonomousComposeProvider(raw: raw, packet: packet)
+        } catch {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["compose_error"]
+            )
+        }
+    }
+
+    private static func parseAutonomousCompose(
+        raw: String,
+        packet: RequesterClarificationDraftPacket
+    ) -> ExchangeAgencyAutonomousComposeResult {
+        let jsonSlice = extractFirstJSONObject(from: raw) ?? raw
+        guard let data = jsonSlice.data(using: .utf8) else {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["json_decode_skipped"]
+            )
+        }
+        do {
+            let decoded = try JSONDecoder().decode(AutonomousComposePayload.self, from: data)
+            let body = decoded.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let subjectRaw = decoded.subject?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let subjectOpt: String? = subjectRaw.isEmpty ? nil : subjectRaw
+            guard !body.isEmpty else {
+                return ExchangeAgencyAutonomousComposeResult(
+                    subject: subjectOpt,
+                    body: "",
+                    accepted: false,
+                    rejectionReasons: ["empty_body"]
+                )
+            }
+            let clippedBody = clipped(body, maxLength: packet.maxLength)
+            let clippedSubject = subjectOpt.map { clipped($0, maxLength: 140) }
+            let reasons = ExchangeAgencyDraftValidator.validateRequesterAutonomousOutbound(
+                body: clippedBody,
+                packet: packet
+            )
+            if reasons.isEmpty {
+                return ExchangeAgencyAutonomousComposeResult(
+                    subject: clippedSubject,
+                    body: clippedBody,
+                    accepted: true,
+                    rejectionReasons: []
+                )
+            }
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: clippedSubject,
+                body: clippedBody,
+                accepted: false,
+                rejectionReasons: reasons
+            )
+        } catch {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["json_decode_failed"]
+            )
+        }
+    }
+
+    private static func parseAutonomousComposeProvider(
+        raw: String,
+        packet: ProviderResponseDraftPacket
+    ) -> ExchangeAgencyAutonomousComposeResult {
+        let jsonSlice = extractFirstJSONObject(from: raw) ?? raw
+        guard let data = jsonSlice.data(using: .utf8) else {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["json_decode_skipped"]
+            )
+        }
+        do {
+            let decoded = try JSONDecoder().decode(AutonomousComposePayload.self, from: data)
+            let body = decoded.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let subjectRaw = decoded.subject?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let subjectOpt: String? = subjectRaw.isEmpty ? nil : subjectRaw
+            guard !body.isEmpty else {
+                return ExchangeAgencyAutonomousComposeResult(
+                    subject: subjectOpt,
+                    body: "",
+                    accepted: false,
+                    rejectionReasons: ["empty_body"]
+                )
+            }
+            let clippedBody = clipped(body, maxLength: packet.maxLength)
+            let clippedSubject = subjectOpt.map { clipped($0, maxLength: 140) }
+            var reasons = ExchangeAgencyDraftValidator.validateHumanFacingAutonomousBody(
+                body: clippedBody,
+                maxLength: packet.maxLength
+            )
+            if reasons.isEmpty {
+                let providerVal = ExchangeAgencyDraftValidator.validateProviderResponse(
+                    body: clippedBody,
+                    packet: packet
+                )
+                if !providerVal.accepted {
+                    reasons.append(contentsOf: providerVal.rejectionReasons)
+                }
+            }
+            if reasons.isEmpty {
+                return ExchangeAgencyAutonomousComposeResult(
+                    subject: clippedSubject,
+                    body: clippedBody,
+                    accepted: true,
+                    rejectionReasons: []
+                )
+            }
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: clippedSubject,
+                body: clippedBody,
+                accepted: false,
+                rejectionReasons: reasons
+            )
+        } catch {
+            return ExchangeAgencyAutonomousComposeResult(
+                subject: nil,
+                body: "",
+                accepted: false,
+                rejectionReasons: ["json_decode_failed"]
+            )
+        }
+    }
+
+    #if DEBUG
+    /// Test seam for deterministic prompt inspection (no on-device LLM).
+    internal static func debugRequesterAutonomousComposePrompt(
+        packet: RequesterClarificationDraftPacket
+    ) -> String {
+        requesterAutonomousComposePrompt(packet: packet)
+    }
+    #endif
+
+    private struct AutonomousComposePayload: Decodable {
+        var subject: String?
+        var body: String
+    }
+
+    private static func requesterAutonomousComposePrompt(packet: RequesterClarificationDraftPacket) -> String {
+        let mode = packet.autonomousComposeMode?.rawValue ?? "askClarification"
+        let topLines = packet.topRankedCandidateSummaries ?? []
+        let topBlock = topLines.isEmpty ? "(none)" : topLines.joined(separator: "\n")
+        let directed = packet.providerDirectedQuestionLines ?? []
+        let compareSucceeded = packet.pass2LLMCompareSucceeded
+        let directedBlock: String
+        if directed.isEmpty {
+            if compareSucceeded {
+                directedBlock =
+                    "(none — grounded compare found no provider clarification needed; do not invent new provider questions.)"
+            } else {
+                directedBlock = "(none — derive only from user request + missing facts.)"
+            }
+        } else {
+            directedBlock = directed.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+        }
+        let contract = packet.outboundComposeContract
+        let allowedEnrichment = contract?.allowedEnrichmentDimensions ?? []
+        let enrichmentHints = contract?.allowedEnrichmentHints ?? []
+        let maxOptionalEnrichment = contract?.maxOptionalEnrichmentCount ?? 0
+
+        let optionalEnrichmentBlock: String
+        if compareSucceeded, !allowedEnrichment.isEmpty {
+            let dimensionLines = allowedEnrichment.enumerated().map { offset, dimension in
+                let hint = offset < enrichmentHints.count ? enrichmentHints[offset] : RequesterOutboundEnrichmentPolicy.hint(for: dimension)
+                return "\(offset + 1). \(dimension.rawValue) — \(hint)"
+            }.joined(separator: "\n")
+            optionalEnrichmentBlock = """
+            OPTIONAL ENRICHMENT (secondary — not a required gap):
+            - You may include at most \(maxOptionalEnrichment) optional enrichment question total.
+            - Optional enrichment is helpful context only; it is not a required gap.
+            - Use only the listed dimensions/hints below. Do not add any dimension not listed.
+            - Do not add credentials, license, insurance, certification, availability, timing, service area, or turnaround unless listed in REQUIRED PROVIDER QUESTIONS.
+            - Keep the message short.
+            Allowed optional enrichment:
+            \(dimensionLines)
+            """
+        } else if compareSucceeded {
+            optionalEnrichmentBlock = """
+            OPTIONAL ENRICHMENT:
+            - No optional enrichment is allowed for this draft.
+            - Do not add quote, estimate, pricing, availability, credentials, timing, service area, turnaround, or other diligence unless present in REQUIRED PROVIDER QUESTIONS.
+            """
+        } else {
+            optionalEnrichmentBlock = ""
+        }
+
+        let compareProviderQuestionGuard: String
+        if compareSucceeded {
+            if directed.isEmpty {
+                compareProviderQuestionGuard = """
+                GROUNDED COMPARE PROVIDER-QUESTION GUARD:
+                - Requester-match compare succeeded and found no provider clarification needed.
+                - Do not ask any provider question. Output a short intro/connection note only if a draft is needed.
+                - Do not create new provider questions from Missing facts, Recommended questions, or general diligence.
+                - Do not add quote, estimate, pricing, availability, credentials, timing, service area, turnaround, or other diligence.
+                - Never use internal phrases: intent gap, canonicalIntent, services matching, underspecified publicly, high-level cues, hardened timeline.
+                - Never use robotic phrases: for this request, for this job.
+                """
+            } else {
+                compareProviderQuestionGuard = """
+                GROUNDED COMPARE PROVIDER-QUESTION GUARD:
+                - Requester-match compare succeeded. REQUIRED PROVIDER QUESTIONS above are grounded compare gaps and must preserve substance.
+                - Do not invent new required gaps from Missing facts, Recommended questions, or general diligence.
+                - Optional enrichment (if allowed below) is separate and may not replace required provider questions.
+                - Preserve required provider questions; do not flip them into questions for the requester.
+                - Never use internal phrases: intent gap, canonicalIntent, services matching, underspecified publicly, high-level cues, hardened timeline.
+                - Never use robotic phrases: for this request, for this job.
+                """
+            }
+        } else {
+            compareProviderQuestionGuard = ""
+        }
+        let missingFactsBlock = compareSucceeded
+            ? "(none — not used to invent provider questions; grounded compare succeeded.)"
+            : (packet.missingFacts.isEmpty ? "(none)" : packet.missingFacts.joined(separator: " | "))
+        let recommendedBlock = compareSucceeded
+            ? "(none — not used to invent provider questions; grounded compare succeeded.)"
+            : (packet.recommendedQuestions.isEmpty ? "(none)" : packet.recommendedQuestions.joined(separator: " | "))
+        let diligenceRule: String
+        if compareSucceeded {
+            if allowedEnrichment.isEmpty {
+                diligenceRule =
+                    "- Do not invent new provider diligence beyond REQUIRED PROVIDER QUESTIONS."
+            } else {
+                diligenceRule =
+                    "- Do not invent new required provider gaps. At most one optional enrichment from the allowed list."
+            }
+        } else {
+            diligenceRule =
+                "- Ask useful missing decision questions naturally: availability, timing, pricing, estimate fees, service area, visit requirements, and what the requester should know before proceeding."
+        }
+        let oppTrim =
+            packet.groundedOpportunityLabelForPrompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let groundedOpp = oppTrim.isEmpty
+            ? "none (use concise neutral phrasing anchored to offer/profile summaries)"
+            : oppTrim
+        let roleGuardAskClarification: String
+        if mode == RequesterAutonomousOutboundComposeMode.askClarification.rawValue {
+            roleGuardAskClarification = """
+            REQUESTER OUTBOUND ROLE GUARD:
+            - Write from the requester's side to the provider.
+            - Do not claim to provide, teach, sell, or be available as the seller.
+            - Do not use inbound-provider openings like "thanks for reaching out."
+            - Address required provider questions to the provider as "you/your"; do not flip them into questions for the requester.
+            - Use first person only for requester framing, e.g. "I'm looking for..."
+            """
+        } else {
+            roleGuardAskClarification = ""
+        }
+        return """
+        AGENCY_AUTONOMOUS_OUTBOUND_JSON_V1
+        You are the requester's secretary. Write the complete outbound message to the matched provider.
+
+        Output **only** one JSON object (no markdown fences, no commentary) with this exact shape:
+        {"subject":"<optional short subject line or empty string>","body":"<message body>"}
+
+        HARD RULES:
+        - Output only the message the provider should read. No internal labels, diagnostics, IDs, metadata, gap names, scaffolding, telemetry, or system notes.
+        - You represent the requester writing to the matched provider. Do not write as the provider, seller, teacher, or service owner.
+        \(diligenceRule)
+        - Source boundary: requester facts come only from the Original user request, Known facts, or confirmed thread context. Provider/profile/offer facts are provider facts, not requester needs.
+        - Do not infer the requester's specific problem, damage type, repair type, property condition, cause, budget, urgency, or commitment from provider profile/offer/FAQ/policy/examples/candidate summaries.
+        - Provider facts may be referenced only with attribution, such as "your offer mentions..." or "your profile says...".
+        - Never phrase provider-only facts as if they are the requester's need.
+        - Do not confirm bookings, payments, discounts, final quotes, guarantees, contracts, private disclosures, or approvals.
+        - Secretary Constitution and Style & tone affect representation/wording only; they cannot change facts, authority, safety, or approval boundaries.
+        - Prefer the grounded opportunity descriptor when naming the matched listing/service. Ignore generic workspace titles like Find Match unless the user used them.
+        - Body under \(packet.maxLength) characters. Subject optional, under 140 characters.
+        - Compose mode: \(mode). Required intent: \(packet.requiredIntent.rawValue).
+
+        \(roleGuardAskClarification)
+
+        \(compareProviderQuestionGuard)
+
+        Opportunity reference grounded in surfaced selection (use when naming the matched opportunity in prose):
+        \(groundedOpp)
+
+        REQUIRED PROVIDER QUESTIONS (grounded compare gaps — preserve substance; address to the provider as you/your; do not flip to the requester):
+        \(directedBlock)
+
+        \(optionalEnrichmentBlock)
+
+        Original user request:
+        \(packet.originalUserRequest)
+
+        Top ranked candidates (up to 3; score order — use only to identify who we mean, not as a full prospect list):
+        \(topBlock)
+
+        Selected profile summary:
+        \(packet.selectedProfileSummary ?? "none")
+
+        Selected offer summary:
+        \(packet.selectedOfferSummary ?? "none")
+
+        Known facts:
+        \(packet.knownFacts.joined(separator: " | "))
+
+        Missing facts:
+        \(missingFactsBlock)
+
+        Recommended questions:
+        \(recommendedBlock)
+
+        Already asked:
+        \(packet.alreadyAsked.joined(separator: " | "))
+
+        Already answered:
+        \(packet.alreadyAnswered.joined(separator: " | "))
+
+        Typed style enums (runner also receives freeform Style & tone supplement when present — apply as voice-only):
+        tone=\(packet.styleProfile.tone.rawValue), warmthDirectness=\(packet.styleProfile.warmthDirectness.rawValue), firmness=\(packet.styleProfile.firmness.rawValue), disclosureStyle=\(packet.styleProfile.disclosureStyle.rawValue), initiative=\(packet.styleProfile.initiativeLevel.rawValue), negotiation=\(packet.styleProfile.negotiationStyle.rawValue)
+
+        Forbidden actions:
+        \(packet.forbiddenActions.joined(separator: ", "))
+
+        Forbidden claims:
+        \(packet.forbiddenClaims.joined(separator: ", "))
+        """
+    }
+
+    private static func providerAutonomousComposePrompt(packet: ProviderResponseDraftPacket) -> String {
+        let groundedLines = packet.approvedGroundedFacts.map {
+            let field = $0.field ?? "unspecified_field"
+            return "[\($0.source.rawValue)] \(field): \($0.text)"
+        }
+
+        return """
+        AGENCY_AUTONOMOUS_OUTBOUND_JSON_V1
+        You are the provider's private secretary. Write the complete outbound reply to the requester.
+
+        Output **only** one JSON object (no markdown fences, no commentary) with this exact shape:
+        {"subject":"<optional short subject line or empty string>","body":"<message body>"}
+
+        HARD RULES:
+        - Write only the message the requester should read. No internal routing, policy engine labels, pass/fail status, or system scaffolding.
+        - Answer using the inbound question and only what is supported by approved grounded facts; use profile/offer summaries for tone and framing, not as claims unless grounded.
+        - Apply secretary style (warmth, firmness, disclosure) in the prose — do not paste raw style enum lines or meta lines like "Balanced tone", "Based on available facts", "Current request details", "Subject:", "Action:", "thread context", "answerability", "as an AI", or "provider-facing".
+        - If uncertain, ask a concise follow-up instead of inventing specifics.
+        - Body under \(packet.maxLength) characters. Subject optional, under 140 if present.
+        - Internal validation tags (do not copy into the message body): intent=\(packet.requiredIntent.rawValue), mode=\(packet.responseMode.rawValue).
+
+        Inbound inquiry (requester's question):
+        \(packet.inboundInquiry)
+
+        Requester display context:
+        \(packet.requesterDisplayContext ?? "none")
+
+        Provider public profile summary:
+        \(packet.providerPublicProfileSummary ?? "none")
+
+        Selected offer summary:
+        \(packet.selectedOfferSummary ?? "none")
+
+        Approved grounded facts:
+        \(groundedLines.joined(separator: " | "))
+
+        Context-only facts (tone only, not claims):
+        \(packet.contextOnlyFacts.joined(separator: " | "))
+
+        Missing facts (may acknowledge gaps; do not fabricate):
+        \(packet.missingFacts.joined(separator: " | "))
+
+        Secretary style (apply in natural language; do not quote these labels):
+        tone=\(packet.styleProfile.tone.rawValue), warmthDirectness=\(packet.styleProfile.warmthDirectness.rawValue), firmness=\(packet.styleProfile.firmness.rawValue), disclosureStyle=\(packet.styleProfile.disclosureStyle.rawValue), initiative=\(packet.styleProfile.initiativeLevel.rawValue), negotiation=\(packet.styleProfile.negotiationStyle.rawValue)
+
+        Forbidden actions:
+        \(packet.forbiddenActions.joined(separator: ", "))
+
+        Forbidden claims:
+        \(packet.forbiddenClaims.joined(separator: ", "))
+        """
+    }
+
+    /// Rewrites only clarity/tone; falls back to `currentBody` when JSON is missing or invalid.
+    public static func rewriteToneOnly(
+        currentBody: String,
+        context: ExchangeAgencyContext,
+        assessment: ExchangeAgencyAssessment,
+        allowedFacts: [String],
+        secretaryStyleText: String,
+        runner: any ExchangeIntelligenceModelRunner
+    ) async throws -> ExchangeAgencyDraftRewrite {
+        let trimmedBody = currentBody.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let prompt =
+            """
+            You are revising a deterministic outbound draft for clarity and tone ONLY.
+
+            Output **only** compact JSON matching this Swift-friendly shape:
+            {"body":"<string>","used_facts":["<string>"],"requires_approval":true/false,"missing_facts":["<string>"]}
+
+            HARD RULES:
+            - Rewrite for clarity/tone ONLY; preserve intent.
+            - You may cite ONLY facts from allowedFacts JSON array and the factual parts of inbound/user-visible context — do not invent specifics.
+            - Do NOT invent or imply price, date, availability, guarantees, discounts, refunds, SLA, jurisdiction, licensing, certifications, inventory, staffing, scheduling, regions, logistics, warranties, commitments, comparisons, urgency, scarcity, personalization of private data, regulatory claims, competitor assertions, or policy details.
+            - If anything material is uncertain, set requires_approval to true and list missing_facts (short strings).
+            - If unsure about safety, set requires_approval true.
+            - No markdown. No commentary. JSON only.
+
+            allowedFacts (JSON array of strings):
+            \(encodedJSONFacts(from: allowedFacts))
+
+            Pass 2 grounded fact line count on assessment (informational): \(assessment.groundedFactLines.count)
+
+            Thread side: \(context.side.rawValue)
+
+            Secretary style (may be empty):
+            \(secretaryStyleText.replacingOccurrences(of: "\n", with: " "))
+
+            Deterministic draft to rewrite:
+            \(trimmedBody)
+            """
+
+        let styleSupplement = secretaryStyleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        #if DEBUG
+        if !styleSupplement.isEmpty {
+            print(
+                "[ProviderDraft] styleApplied=true styleChars=\(styleSupplement.count) source=rewrite_tone_only"
+            )
+        }
+        #endif
+        let raw = try await runner.run(
+            ExchangeIntelligenceModelRunRequest(
+                task: .neutralRewrite,
+                prompt: prompt,
+                maxTokens: 700,
+                representationSupplement: nil
+            )
+        )
+
+        let jsonSlice = extractFirstJSONObject(from: raw) ?? raw
+        guard let data = jsonSlice.data(using: .utf8) else {
+            return ExchangeAgencyDraftRewrite(
+                body: trimmedBody,
+                usedFacts: [],
+                requiresApproval: true,
+                missingFacts: ["rewrite_decode_skipped"]
+            )
+        }
+
+        let decoder = JSONDecoder()
+        do {
+            let decoded = try decoder.decode(RewritePayload.self, from: data)
+            let outBody = decoded.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !outBody.isEmpty else {
+                return ExchangeAgencyDraftRewrite(
+                    body: trimmedBody,
+                    usedFacts: [],
+                    requiresApproval: true,
+                    missingFacts: ["empty_body"]
+                )
+            }
+            return ExchangeAgencyDraftRewrite(
+                body: outBody,
+                usedFacts: decoded.used_facts,
+                requiresApproval: decoded.requires_approval,
+                missingFacts: decoded.missing_facts
+            )
+        } catch {
+            return ExchangeAgencyDraftRewrite(
+                body: trimmedBody,
+                usedFacts: [],
+                requiresApproval: true,
+                missingFacts: ["json_decode_failed"]
+            )
+        }
+    }
+
+    private struct RewritePayload: Decodable {
+        var body: String
+        var used_facts: [String]
+        var requires_approval: Bool
+        var missing_facts: [String]
+    }
+
+    private static func encodedJSONFacts(from rows: [String]) -> String {
+        (try? JSONEncoder().encode(rows))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+    }
+
+    private static func extractFirstJSONObject(from raw: String) -> String? {
+        guard let start = raw.firstIndex(of: "{"),
+              let end = raw.lastIndex(of: "}") else {
+            return nil
+        }
+        return String(raw[start ... end])
+    }
+
+    private struct BodyOnlyPayload: Decodable {
+        var body: String
+    }
+
+    private static func decodeBodyOnly(raw: String) -> String? {
+        let jsonSlice = extractFirstJSONObject(from: raw) ?? raw
+        guard let data = jsonSlice.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(BodyOnlyPayload.self, from: data).body
+    }
+
+    private static func requesterClarificationPrompt(
+        packet: RequesterClarificationDraftPacket,
+        deterministicBaseDraft: String
+    ) -> String {
+        """
+        Rewrite the deterministic requester clarification message naturally.
+
+        HARD RULES:
+        - Required intent: requester clarification only.
+        - Rewrite for clarity and tone only; preserve the deterministic draft's intent.
+        - Ask only missing/recommended clarification questions.
+        - Do not introduce new requester facts, commitments, approvals, bookings, payments, discounts, final quotes, guarantees, contracts, or private details.
+        - Source boundary: provider/profile/offer facts may be referenced only with attribution; never phrase provider-only facts as the requester's need.
+        - Keep under \(packet.maxLength) characters.
+        - Output only JSON: {"body":"<message body>"}.
+        - Human-facing body only. No markdown, commentary, labels, or system notes.
+
+        Style profile:
+        tone=\(packet.styleProfile.tone.rawValue), warmthDirectness=\(packet.styleProfile.warmthDirectness.rawValue), firmness=\(packet.styleProfile.firmness.rawValue), disclosureStyle=\(packet.styleProfile.disclosureStyle.rawValue), initiative=\(packet.styleProfile.initiativeLevel.rawValue), negotiation=\(packet.styleProfile.negotiationStyle.rawValue)
+
+        Original user request:
+        \(packet.originalUserRequest)
+
+        Selected profile summary:
+        \(packet.selectedProfileSummary ?? "none")
+
+        Selected offer summary:
+        \(packet.selectedOfferSummary ?? "none")
+
+        Known facts:
+        \(packet.knownFacts.joined(separator: " | "))
+
+        Missing facts:
+        \(packet.missingFacts.joined(separator: " | "))
+
+        Recommended questions:
+        \(packet.recommendedQuestions.joined(separator: " | "))
+
+        Already asked:
+        \(packet.alreadyAsked.joined(separator: " | "))
+
+        Already answered:
+        \(packet.alreadyAnswered.joined(separator: " | "))
+
+        Forbidden actions:
+        \(packet.forbiddenActions.joined(separator: ", "))
+
+        Forbidden claims:
+        \(packet.forbiddenClaims.joined(separator: ", "))
+
+        Deterministic base draft:
+        \(deterministicBaseDraft)
+        """
+    }
+
+    private static func providerResponsePrompt(
+        packet: ProviderResponseDraftPacket,
+        deterministicBaseDraft: String
+    ) -> String {
+        let groundedLines = packet.approvedGroundedFacts.map {
+            let field = $0.field ?? "unspecified_field"
+            return "[\($0.source.rawValue)] \(field): \($0.text)"
+        }
+
+        return """
+        Rewrite the deterministic provider response naturally.
+
+        HARD RULES:
+        - Required intent: \(packet.requiredIntent.rawValue).
+        - Response mode: \(packet.responseMode.rawValue).
+        - Use secretary style.
+        - Use only approvedGroundedFacts as facts you may state.
+        - You may use contextOnlyFacts only for context/tone, not as provider claims.
+        - If a fact is missing, say in user-facing provider language that you’d need to confirm before answering. Do not mention internal sources, listings, published offers, missing fields, or what you can/cannot see.
+        - Do not invent price, availability, guarantee, discount, booking time, credentials, refund terms, policy exceptions, or final quote.
+        - Do not include routing, IDs, metadata, or internal system notes.
+        - Keep under \(packet.maxLength) characters.
+        - Output only one JSON object: {"body":"<message body>"}.
+        - Put only the provider-side human-facing reply inside body.
+        - No markdown. No commentary. No prose outside JSON.
+
+        Style profile:
+        tone=\(packet.styleProfile.tone.rawValue), warmthDirectness=\(packet.styleProfile.warmthDirectness.rawValue), firmness=\(packet.styleProfile.firmness.rawValue), disclosureStyle=\(packet.styleProfile.disclosureStyle.rawValue), initiative=\(packet.styleProfile.initiativeLevel.rawValue), negotiation=\(packet.styleProfile.negotiationStyle.rawValue)
+
+        Inbound inquiry:
+        \(packet.inboundInquiry)
+
+        Requester display context:
+        \(packet.requesterDisplayContext ?? "none")
+
+        Provider public profile summary:
+        \(packet.providerPublicProfileSummary ?? "none")
+
+        Selected offer summary:
+        \(packet.selectedOfferSummary ?? "none")
+
+        Approved grounded facts:
+        \(groundedLines.joined(separator: " | "))
+
+        Context-only facts:
+        \(packet.contextOnlyFacts.joined(separator: " | "))
+
+        Missing facts:
+        \(packet.missingFacts.joined(separator: " | "))
+
+        Forbidden actions:
+        \(packet.forbiddenActions.joined(separator: ", "))
+
+        Forbidden claims:
+        \(packet.forbiddenClaims.joined(separator: ", "))
+
+        Deterministic base draft:
+        \(deterministicBaseDraft)
+        """
+    }
+
+    private static func clipped(_ raw: String, maxLength: Int) -> String {
+        guard raw.count > maxLength else { return raw }
+        return String(raw.prefix(maxLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Voice-only style supplement for the Exchange runner (typed enums stay in task prompts).
+    private static func secretaryStyleSupplement(from profile: ExchangeSecretaryStyleProfile) -> String? {
+        let block = ExchangeSecretaryPromptInstructionBlocks.secretaryStyleGuideBlock(
+            styleFreeform: profile.freeformInstructions
+        )
+        return block.isEmpty ? nil : block
+    }
+}

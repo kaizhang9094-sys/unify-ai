@@ -1,0 +1,39 @@
+---
+description: Unify AI architecture guardrails
+alwaysApply: true
+---
+
+You are working on Unify AI, an iOS Swift/Xcode app with local LLM runtime and Secretary/Exchange mode.
+
+Core constraints:
+- Do not replace the architecture unless explicitly asked.
+- Do not create parallel canonical types when existing canonical types exist.
+- Prefer small paste-over patches.
+- Preserve local/offline/on-device assumptions.
+- Preserve privacy-first behavior.
+- Avoid cloud API assumptions.
+- Avoid fake async/background promises.
+- Do not remove existing persistence, runtime, or safety boundaries.
+
+Secretary / Exchange architecture:
+- ExchangeIntent and ExchangeIntentFacets are canonical. Do not create replacement intent/facet files.
+- ExchangeThread is the durable source of truth for thread state.
+- ExchangeFacade is the UI-facing API.
+- ExchangeThreadEngine should own thread lifecycle mutations.
+- ExchangeOrchestrator coordinates thread flow.
+- UI should render from canonical snapshots, not mixed stale fields.
+
+Runtime architecture:
+- Preserve runtime-owned conversation direction.
+- Avoid rebuilding full prompt every turn.
+- Prefer scaffold + warm incremental turns.
+- Keep memory augmentation small, relevant, and late.
+- Do not block real user generation on prewarm.
+- Be careful with iOS background/foreground lifecycle.
+
+Coding style:
+- SwiftUI views should remain readable and compositional.
+- Prefer explicit state ownership over clever callbacks.
+- When changing callbacks, inspect parent and child call sites.
+- Avoid broad renames unless requested.
+- For fixes, provide per-function paste-over blocks when possible.

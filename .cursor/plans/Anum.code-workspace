@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../Projects/unify-federation/federation-server"
+		}
+	],
+	"settings": {}
+}

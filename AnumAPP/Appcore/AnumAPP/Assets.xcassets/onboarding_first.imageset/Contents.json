@@ -1,0 +1,21 @@
+{
+  "images" : [
+    {
+      "filename" : "u1997683948_cinematic_anime-inspired_art_man_staring_at_a_sof_0c654e8e-b60c-4f31-9656-5c2e4c33b1ef_3.png",
+      "idiom" : "universal",
+      "scale" : "1x"
+    },
+    {
+      "idiom" : "universal",
+      "scale" : "2x"
+    },
+    {
+      "idiom" : "universal",
+      "scale" : "3x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

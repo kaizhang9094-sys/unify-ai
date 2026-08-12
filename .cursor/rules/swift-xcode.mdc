@@ -1,0 +1,15 @@
+---
+description: Swift and Xcode rules
+alwaysApply: true
+---
+
+For Swift/Xcode work:
+- Do not assume package names. Inspect imports first.
+- Keep @MainActor boundaries intact.
+- Do not add force unwraps.
+- Do not silently change public model contracts.
+- Preserve Combine/ObservableObject wiring unless the task is specifically about it.
+- Prefer compile-safe minimal edits.
+- If a change affects a callback signature, list every caller that must be updated.
+- If a change affects persistence models, mention migration risk.
+- If a change affects local LLM runtime, mention TTFT, memory, and lifecycle impact.

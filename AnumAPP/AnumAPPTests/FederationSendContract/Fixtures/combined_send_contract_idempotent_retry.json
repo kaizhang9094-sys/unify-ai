@@ -1,0 +1,88 @@
+{
+  "label": "idempotent_same_envelope_twice",
+  "postBody": {
+    "envelopeID": "env-send-contract-idempotent-shared-007",
+    "threadID": "550e8400-e29b-41d4-a716-446655440099",
+    "senderNodeID": "fixture-send-contract-idem-alpha-local",
+    "recipientNodeID": "fixture-send-contract-idem-beta-local",
+    "payload": {
+      "kind": "inquiry",
+      "subject": "User-approved manual send (contract probe)",
+      "body": "Queued via userApproved permit path analogue.",
+      "disclosureLevel": "balanced",
+      "intentTitle": "Fixture manual inquiry",
+      "mode": "conversation",
+      "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+    }
+  },
+  "firstSendResponse": {
+    "ok": true,
+    "envelopeID": "env-send-contract-idempotent-shared-007",
+    "status": "accepted",
+    "acceptedAt": "2026-05-01T21:33:30.823Z",
+    "externalReference": "env-send-contract-idempotent-shared-007",
+    "routeSummary": "federation-relay"
+  },
+  "secondSendResponse": {
+    "ok": true,
+    "envelopeID": "env-send-contract-idempotent-shared-007",
+    "status": "accepted",
+    "acceptedAt": "2026-05-01T21:33:30.823Z",
+    "externalReference": "env-send-contract-idempotent-shared-007",
+    "routeSummary": "federation-relay"
+  },
+  "inboxResponse": {
+    "ok": true,
+    "receipts": [
+      {
+        "receiptID": "936a3791-918c-4fbb-818b-73d46ce9e060",
+        "id": "936a3791-918c-4fbb-818b-73d46ce9e060",
+        "nodeID": "fixture-send-contract-idem-beta-local",
+        "inboxNodeID": "fixture-send-contract-idem-beta-local",
+        "envelopeID": "env-send-contract-idempotent-shared-007",
+        "senderNodeID": "fixture-send-contract-idem-alpha-local",
+        "recipientNodeID": "fixture-send-contract-idem-beta-local",
+        "parentEnvelopeID": null,
+        "threadID": "550e8400-e29b-41d4-a716-446655440099",
+        "protocolVersion": "exchange.v1",
+        "status": "accepted",
+        "payload": {
+          "kind": "inquiry",
+          "subject": "User-approved manual send (contract probe)",
+          "body": "Queued via userApproved permit path analogue.",
+          "disclosureLevel": "balanced",
+          "intentTitle": "Fixture manual inquiry",
+          "mode": "conversation",
+          "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+        },
+        "metadata": {},
+        "receivedAt": "2026-05-01T21:33:30.823Z",
+        "createdAt": "2026-05-01T21:33:30.823Z",
+        "envelope": {
+          "id": "env-send-contract-idempotent-shared-007",
+          "envelopeID": "env-send-contract-idempotent-shared-007",
+          "senderNodeID": "fixture-send-contract-idem-alpha-local",
+          "recipientNodeID": "fixture-send-contract-idem-beta-local",
+          "parentEnvelopeID": null,
+          "threadID": "550e8400-e29b-41d4-a716-446655440099",
+          "protocolVersion": "exchange.v1",
+          "payload": {
+            "kind": "inquiry",
+            "subject": "User-approved manual send (contract probe)",
+            "body": "Queued via userApproved permit path analogue.",
+            "disclosureLevel": "balanced",
+            "intentTitle": "Fixture manual inquiry",
+            "mode": "conversation",
+            "localThreadID": "550e8400-e29b-41d4-a716-446655440099"
+          },
+          "metadata": {},
+          "status": "accepted"
+        }
+      }
+    ],
+    "nextCursor": null,
+    "hasMore": false,
+    "syncedAt": "2026-05-01T21:33:30.824Z",
+    "note": "Inbox sync completed."
+  }
+}
